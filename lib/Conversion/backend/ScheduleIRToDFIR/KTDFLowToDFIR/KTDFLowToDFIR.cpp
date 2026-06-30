@@ -136,6 +136,13 @@ struct KTDFLowToDFIRPass
         return signalPassFailure();
       }
 
+      // Collapse arith over query_map AGAIN: buildLogicalMemoryViews may create
+      // new arith.addi(query_map, constant) patterns (e.g. base_addr + offset)
+      // that did not exist during the first collapse pass above.
+      if (mlir::failed(scheduler::collapseArithOverQueryMaps(func))) {
+        return signalPassFailure();
+      }
+
       // Run operation lowerings after program units have been created
       LLVM_DEBUG(llvm::dbgs() << "Running operation lowerings for "
                               << func.getName() << "\n");
