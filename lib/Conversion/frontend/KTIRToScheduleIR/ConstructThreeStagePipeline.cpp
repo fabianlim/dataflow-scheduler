@@ -2057,6 +2057,25 @@ void ConstructThreeStagePipelinePass::runOnFunc(mlir::func::FuncOp func_op) {
   // Step 3: Create loops from linalg operations
   createLoopsFromLinalg(linalg_ops);
 
+  // For reductions, annotate the outer output-partition loop(s) that
+  // enclose the reduction loop with parallel_loop.  These loops iterate over
+  // the free (output-partition) dimensions of the reduction and must be seen as
+  // parallel by passes 09/11/12 so that corelets are split and LX buffers are
+  // double-buffered.  The elementwise path gets this annotation
+  // automatically from annotateLoopsWithIteratorTypes inside createLoopsFromLinalg;
+  // the reduction path does not go through that annotator, so we patch it here.
+  if (reduction_loop_) {
+    auto parallel_attr = mlir::ktdf::LoopTypeAttr::get(
+        &getContext(), mlir::ktdf::LoopType::ParallelLoop);
+    mlir::scf::ForOp enc =
+        reduction_loop_->getParentOfType<mlir::scf::ForOp>();
+    while (enc) {
+      if (!enc->hasAttr("loop_type"))
+        enc->setAttr("loop_type", parallel_attr);
+      enc = enc->getParentOfType<mlir::scf::ForOp>();
+    }
+  }
+
   DEBUG_WITH_TYPE(VerboseDebug, llvm::dbgs() << "After loops created:\n"
                                              << func_op << "\n\n");
 
