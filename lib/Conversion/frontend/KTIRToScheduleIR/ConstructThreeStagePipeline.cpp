@@ -199,28 +199,24 @@ struct ConstructThreeStagePipelinePass
       mlir::ktdp::StoreOp store_op);
 
   // Compute offset for reinterpret_cast from indices and strides
+  // loop_ivs: indices that are pipeline loop IVs are zeroed out (they go into
+  // the source_map instead, keeping the offset loop-invariant).
   mlir::Value computeReinterpretCastOffset(
       mlir::OpBuilder& builder, mlir::Location loc,
       llvm::SmallVector<mlir::Value>& indices,
-      llvm::SmallVector<int64_t>& strides);
+      llvm::SmallVector<int64_t>& strides,
+      llvm::ArrayRef<mlir::Value> loop_ivs = {});
 
   // Get strides from memref type, computing default row-major strides if needed
   llvm::SmallVector<int64_t> getStridesFromMemRefType(
       mlir::MemRefType memref_type);
 
-  // Returns true when the access tile's memory base address is loop-invariant
-  // (i.e. the address is computed from loop IVs and global strides, rather
-  // than being fully materialized in the memref base by a reinterpret_cast).
-  bool hasInvariantBase(mlir::Value access_tile_value);
-
   // Derive the static sizes for a data_transfer's access-tile operand.
-  // When has_invariant_base is true and source_map is 1-D, returns a 1-D
-  // lane-count vector; otherwise returns the full tile shape.
-  // Falls back to projecting tile_sizes through source_map if no AccessTileType
-  // is available.
+  // Returns the full tile shape (rank-N). Falls back to projecting tile_sizes
+  // through source_map if no AccessTileType is available.
   llvm::SmallVector<int64_t> deriveAccessTileSizes(
       mlir::Value access_tile_value, const mlir::AffineMap& source_map,
-      bool has_invariant_base, llvm::ArrayRef<int64_t> tile_sizes);
+      llvm::ArrayRef<int64_t> tile_sizes);
 
   // Emit the post-loop store pipeline (sibling pipeline) for the accumulated
   // output. Called once per ktdp.store found outside the reduction loop body.
@@ -1096,17 +1092,19 @@ static mlir::LogicalResult projectSizesThroughIndexingMap(
 //
 // Tile-address-baked-in (local tensors: per-core scratchpad, lrfreg): the
 //   reinterpret_cast offset already incorporates the loop IVs via
-//   replaceAccessTilesWithReinterpretCast. The source_map then asks "where
-//   within this cast view is the data?" — always at index 0 per dim. The map
-//   has the same numDims for structural uniformity, but every result is 0
-//   regardless of the loop IV values: (d0,d1) -> (0) for any d0,d1 values.
+// Build the source_map for a data_transfer from an access-tile operation.
 //
-// `has_invariant_base` = true → invariant-base; false → tile-address-baked-in.
+// The invariant (§3 of ADDRESSING_DESIGN_V2.md): every access-tile index
+// contributes to exactly one of {offset, source_map}.
+//   - Loop IVs      → offset=0, source_map dim expr (loop-varying part)
+//   - Non-loop IVs  → offset bakes them in, source_map=0 (loop-invariant part)
+//
+// Result: always rank-N (numResults == memref_rank), no stride multiplication.
+// The strided memref layout in the data_transfer op applies strides.
 static std::optional<mlir::AffineMap> buildSourceMapFromAccessTile(
     mlir::ktdp::ConstructAccessTilesOp access_tile_op,
     llvm::ArrayRef<mlir::Value> loop_ivs,
-    mlir::MLIRContext* ctx,
-    bool has_invariant_base) {
+    mlir::MLIRContext* ctx) {
   mlir::AffineMap base_map = access_tile_op.getBaseMap();
   llvm::SmallVector<mlir::Value> raw_indices = access_tile_op.getIndices();
   unsigned memref_rank = base_map.getNumResults();
@@ -1116,57 +1114,29 @@ static std::optional<mlir::AffineMap> buildSourceMapFromAccessTile(
   for (unsigned k = 0; k < loop_ivs.size(); ++k)
     iv_to_pos[loop_ivs[k]] = k;
 
-  if (!has_invariant_base) {
-    // Tile-address-baked-in: all-zeros map (offset baked into the
-    // reinterpret_cast base address; subscript is constant 0 per dim).
-    llvm::SmallVector<mlir::AffineExpr> zeros(
-        memref_rank, mlir::getAffineConstantExpr(0, ctx));
-    return mlir::AffineMap::get(loop_ivs.size(), 0, zeros, ctx);
-  }
-
-  // Invariant-base: compute flat offset from strides and loop IVs.
-  llvm::SmallVector<int64_t> strides(memref_rank, 1);
-  {
-    mlir::Value mem_view = access_tile_op.getBase();
-    if (auto cmv = mlir::dyn_cast_or_null<mlir::ktdp::ConstructMemoryViewOp>(
-            mem_view.getDefiningOp())) {
-      auto sa = cmv->getAttrOfType<mlir::DenseI64ArrayAttr>("static_strides");
-      if (sa && sa.size() == (int64_t)memref_rank)
-        strides.assign(sa.asArrayRef().begin(), sa.asArrayRef().end());
-    }
-  }
-
-  mlir::AffineExpr offset_expr = mlir::getAffineConstantExpr(0, ctx);
+  // Per-dimension: if this dim's index is a loop IV → dimExpr(pos), else 0.
+  llvm::SmallVector<mlir::AffineExpr> results(memref_rank);
   for (unsigned i = 0; i < memref_rank; ++i) {
     mlir::AffineExpr result_expr = base_map.getResults()[i];
-    mlir::AffineExpr iv_expr;
-
     if (auto dim_expr = mlir::dyn_cast<mlir::AffineDimExpr>(result_expr)) {
       mlir::Value idx = raw_indices[dim_expr.getPosition()];
       auto it = iv_to_pos.find(idx);
       if (it != iv_to_pos.end()) {
-        iv_expr = mlir::getAffineDimExpr(it->second, ctx);
+        // This dim is driven by a loop IV → express it in the source_map.
+        results[i] = mlir::getAffineDimExpr(it->second, ctx);
       } else {
-        if (idx.getDefiningOp<mlir::arith::ConstantIndexOp>()) {
-          iv_expr = mlir::getAffineConstantExpr(0, ctx);
-        } else {
-          return std::nullopt;
-        }
+        // Non-loop-IV → baked into the offset; source_map contributes 0.
+        results[i] = mlir::getAffineConstantExpr(0, ctx);
       }
     } else if (mlir::isa<mlir::AffineConstantExpr>(result_expr)) {
-      iv_expr = mlir::getAffineConstantExpr(0, ctx);
+      // Constant index (e.g. %c0) → always 0 in source_map.
+      results[i] = mlir::getAffineConstantExpr(0, ctx);
     } else {
       return std::nullopt;
     }
-
-    if (strides[i] != 0)
-      offset_expr = offset_expr +
-                    iv_expr * mlir::getAffineConstantExpr(strides[i], ctx);
   }
 
-  return mlir::AffineMap::get(loop_ivs.size(), 0,
-                              llvm::ArrayRef<mlir::AffineExpr>{offset_expr},
-                              ctx);
+  return mlir::AffineMap::get(loop_ivs.size(), 0, results, ctx);
 }
 
 void ConstructThreeStagePipelinePass::createDataTransfers(
@@ -1242,17 +1212,14 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
       err_anchor = store_ops_[i].getOperation();
     }
 
-    // Detect invariant-base vs tile-address-baked-in for this access tile.
-    bool has_invariant_base_tile = hasInvariantBase(access_tile_value);
-
     // Build source_map from the access-tile's index structure.
+    // §3 invariant: loop IVs → dimExpr in source_map, others → 0 in source_map.
     std::optional<mlir::AffineMap> source_map;
     if (auto access_tile_op =
             access_tile_value
                 .getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
       source_map =
-          buildSourceMapFromAccessTile(access_tile_op, loop_ivs,
-                                       &getContext(), has_invariant_base_tile);
+          buildSourceMapFromAccessTile(access_tile_op, loop_ivs, &getContext());
     }
 
     // Fall back to linalg indexing map if access-tile approach fails.
@@ -1277,7 +1244,7 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
 
     // Derive the access-tile sizes for the data_transfer's static sizes.
     auto access_tile_sizes = deriveAccessTileSizes(
-        access_tile_value, *source_map, has_invariant_base_tile, tile_sizes);
+        access_tile_value, *source_map, tile_sizes);
 
     // Get the FIFO slot from ktdf.private results.
     mlir::Value fifo_slot = private_op.getResult(private_result_offset + i);
@@ -1317,28 +1284,9 @@ ConstructThreeStagePipelinePass::getStridesFromMemRefType(
   return strides;
 }
 
-bool ConstructThreeStagePipelinePass::hasInvariantBase(
-    mlir::Value access_tile_value) {
-  if (auto access_tile_op =
-          access_tile_value
-              .getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
-    mlir::Value mem_view_base = access_tile_op.getBase();
-    if (auto cmv = mlir::dyn_cast_or_null<mlir::ktdp::ConstructMemoryViewOp>(
-            mem_view_base.getDefiningOp())) {
-      mlir::Attribute mapped_ms = mapMemorySpace(cmv.getMemorySpaceAttr());
-      if (auto ms_str = mlir::dyn_cast<mlir::StringAttr>(mapped_ms)) {
-        llvm::StringRef ms = ms_str.getValue();
-        return (!isComputeLocalMemorySpace(ms) &&
-                !isPerCoreScratchpadMemorySpace(ms));
-      }
-    }
-  }
-  return false;
-}
-
 llvm::SmallVector<int64_t> ConstructThreeStagePipelinePass::deriveAccessTileSizes(
     mlir::Value access_tile_value, const mlir::AffineMap& source_map,
-    bool has_invariant_base, llvm::ArrayRef<int64_t> tile_sizes) {
+    llvm::ArrayRef<int64_t> tile_sizes) {
   llvm::SmallVector<int64_t> access_tile_sizes;
   bool got_sizes_from_tile = false;
   if (auto access_tile_op =
@@ -1347,12 +1295,9 @@ llvm::SmallVector<int64_t> ConstructThreeStagePipelinePass::deriveAccessTileSize
     auto at_type = mlir::dyn_cast<mlir::ktdp::AccessTileType>(
         access_tile_op.getResult().getType());
     if (at_type) {
-      if (has_invariant_base && source_map.getNumResults() == 1) {
-        access_tile_sizes = {at_type.getShape().back()};
-      } else {
-        access_tile_sizes.assign(at_type.getShape().begin(),
-                                 at_type.getShape().end());
-      }
+      // Always use the full tile shape (rank-N); no rank-1 collapse.
+      access_tile_sizes.assign(at_type.getShape().begin(),
+                               at_type.getShape().end());
       got_sizes_from_tile = true;
     }
   }
@@ -1421,17 +1366,14 @@ void ConstructThreeStagePipelinePass::createPostLoopStorePipeline(
   }
   std::reverse(outer_loop_ivs.begin(), outer_loop_ivs.end());
 
-  // Detect invariant-base vs tile-address-baked-in for this store tile.
-  bool has_invariant_base_post_loop = hasInvariantBase(access_tile_value);
-
   // Build the source_map from the access tile's index structure.
+  // §3 invariant: outer loop IVs → dimExpr, others → 0 in source_map.
   std::optional<mlir::AffineMap> source_map;
   if (auto access_tile_op =
           access_tile_value
               .getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
     source_map =
-        buildSourceMapFromAccessTile(access_tile_op, outer_loop_ivs, ctx,
-                                     has_invariant_base_post_loop);
+        buildSourceMapFromAccessTile(access_tile_op, outer_loop_ivs, ctx);
   }
   if (!source_map) {
     // Fallback: constant 0 map (all dims at offset 0 within the tile).
@@ -1449,7 +1391,7 @@ void ConstructThreeStagePipelinePass::createPostLoopStorePipeline(
 
   // Derive access tile sizes from the access tile type shape.
   auto access_tile_sizes = deriveAccessTileSizes(
-      access_tile_value, *source_map, has_invariant_base_post_loop, {});
+      access_tile_value, *source_map, {});
   if (access_tile_sizes.empty()) {
     for (int64_t d : tensor_type.getShape())
       access_tile_sizes.push_back(d);
@@ -1635,25 +1577,33 @@ void ConstructThreeStagePipelinePass::createComputeOps(
 mlir::Value ConstructThreeStagePipelinePass::computeReinterpretCastOffset(
     mlir::OpBuilder& builder, mlir::Location loc,
     llvm::SmallVector<mlir::Value>& indices,
-    llvm::SmallVector<int64_t>& strides) {
+    llvm::SmallVector<int64_t>& strides,
+    llvm::ArrayRef<mlir::Value> loop_ivs) {
   // Calculate offset from access tile indices and memory view strides.
-  // For an access tile %A_view[%idx0, %idx1, ...] with strides [stride0,
-  // stride1, ...], the offset is: %idx0 * stride0 + %idx1 * stride1 + ...
-  // This is computed using a sequence of arith.muli and arith.addi operations.
+  //
+  // §3 (ADDRESSING_DESIGN_V2): loop IVs are excluded from the offset (zeroed
+  // out here) and expressed in the source_map instead. This keeps the offset
+  // loop-invariant by construction, satisfying the DCC immutable-base rule.
+  //
+  //   offset = Σ_i strides[i] * (index[i] is a loop IV ? 0 : index[i])
+
+  // Build a set of loop IV values for O(1) membership tests.
+  llvm::DenseSet<mlir::Value> iv_set(loop_ivs.begin(), loop_ivs.end());
 
   size_t num_indices = indices.size();
 
   if (num_indices == 0) {
-    // No indices means offset is 0
     return mlir::arith::ConstantIndexOp::create(builder, loc, 0);
   }
 
-  // Compute terms: indices[i] * strides[i] for each dimension
-  // Optimizations:
-  // - Skip multiplication if stride is 1
-  // - Skip addition if index is constant 0
+  // Compute terms: indices[i] * strides[i] for each dimension.
+  // Loop IVs and constant-0 indices both contribute 0 and are skipped.
   llvm::SmallVector<mlir::Value> terms;
   for (size_t i = 0; i < num_indices; ++i) {
+    // Skip loop IV indices (they go into the source_map, not the offset).
+    if (iv_set.count(indices[i])) {
+      continue;
+    }
     if (isTargetConstant(0, indices[i])) {
       continue;
     }
@@ -1671,13 +1621,10 @@ mlir::Value ConstructThreeStagePipelinePass::computeReinterpretCastOffset(
   }
 
   if (terms.empty()) {
-    // All indices were constant 0
     return mlir::arith::ConstantIndexOp::create(builder, loc, 0);
   } else if (terms.size() == 1) {
-    // Only one term, no addition needed
     return terms[0];
   } else {
-    // Add all terms together
     mlir::Value offset = terms[0];
     for (size_t i = 1; i < terms.size(); ++i) {
       offset = mlir::arith::AddIOp::create(builder, loc, offset, terms[i]);
@@ -1918,9 +1865,20 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
       return;
     }
 
-    // Calculate offset from per-dim indices and memory view strides
+    // Collect all enclosing scf.for loop IVs for this access tile.
+    // §3: any of these IVs that appear in the access tile's indices are
+    // excluded from the offset (they go into the source_map instead).
+    llvm::SmallVector<mlir::Value> tile_loop_ivs;
+    for (mlir::Operation* p = access_tile->getParentOfType<mlir::scf::ForOp>();
+         p; p = p->getParentOfType<mlir::scf::ForOp>()) {
+      tile_loop_ivs.push_back(mlir::cast<mlir::scf::ForOp>(p).getInductionVar());
+    }
+
+    // Calculate offset from per-dim indices and memory view strides.
+    // Loop IV indices contribute 0 to the offset (see §3).
     mlir::Value offset =
-        computeReinterpretCastOffset(builder, loc, indices, strides);
+        computeReinterpretCastOffset(builder, loc, indices, strides,
+                                     tile_loop_ivs);
 
     // Create sizes for reinterpret_cast
     llvm::SmallVector<mlir::OpFoldResult> sizes;
@@ -1951,67 +1909,19 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
     auto memory_space_cast = mlir::memref::MemorySpaceCastOp::create(
         builder, loc, cast_source_type, memory_view);
 
-    // Invariant-base: the view start address is loop-invariant; per-tile
-    // displacement goes in the composite subscript.
-    // Tile-address-baked-in: the full tile address is already in the
-    // reinterpret_cast base; subscript is all-zeros.
-    //
-    // Detect by checking whether the mapped memory space is NOT a per-core
-    // scratchpad (LX) or compute-local (lrfreg) space.
-    //
-    // TEMPORARY (pending addressing redesign): gate the model-A rank-1 collapse
-    // on reduction functions only. Elementwise HBM tiles have access-tile
-    // indices that are NOT the pipeline loop IVs, so buildSourceMapFromAccessTile
-    // returns nullopt and the linalg fallback yields a rank-N source_map — which
-    // mismatches a rank-1 collapsed cast. Gating on reduction_loop_ keeps
-    // elementwise on the rank-N model-B path (matches baseline) while the
-    // reduction keeps the coherent rank-1 + 1-result-flat model-A path.
-    bool has_invariant_base_source = false;
-    if (reduction_loop_) {
-      auto mapped_str = mlir::dyn_cast<mlir::StringAttr>(mapped_memory_space);
-      if (mapped_str) {
-        llvm::StringRef ms = mapped_str.getValue();
-        // Invariant-base applies to global (non-local) memory: any space that
-        // is neither compute-local (lrfreg) nor per-core scratchpad (LX).
-        has_invariant_base_source =
-            (!isComputeLocalMemorySpace(ms) &&
-             !isPerCoreScratchpadMemorySpace(ms));
-      }
-    }
-
-    llvm::SmallVector<int64_t> result_shape;
-    llvm::SmallVector<mlir::OpFoldResult> rc_sizes;
-    llvm::SmallVector<mlir::OpFoldResult> rc_strides;
-    if (has_invariant_base_source) {
-      // Invariant-base: 1-D cast → just the lane dim (last dim, stride 1).
-      int64_t lane_count = tile_dims.back();
-      result_shape = {lane_count};
-      rc_sizes = {builder.getIndexAttr(lane_count)};
-      rc_strides = {builder.getIndexAttr(1)};
-    } else {
-      result_shape.assign(tile_dims.begin(), tile_dims.end());
-      rc_sizes = sizes;
-      rc_strides = reinterpret_strides;
-    }
-    mlir::StridedLayoutAttr strided_layout;
-    if (has_invariant_base_source) {
-      strided_layout = mlir::StridedLayoutAttr::get(
-          builder.getContext(), mlir::ShapedType::kDynamic, {1});
-    } else {
-      strided_layout = mlir::StridedLayoutAttr::get(
-          builder.getContext(), mlir::ShapedType::kDynamic, strides);
-    }
+    // §3 (ADDRESSING_DESIGN_V2): always use the full tile shape (rank-N).
+    // The offset is loop-invariant by construction (loop IVs excluded above),
+    // so folding is always safe. No model-A/B split needed.
+    mlir::StridedLayoutAttr strided_layout = mlir::StridedLayoutAttr::get(
+        builder.getContext(), mlir::ShapedType::kDynamic, strides);
     mlir::MemRefType result_type =
-        mlir::MemRefType::get(result_shape, memory_view_type.getElementType(),
+        mlir::MemRefType::get(tile_dims, memory_view_type.getElementType(),
                               strided_layout, mapped_memory_space);
 
     mlir::OpFoldResult offset_fold_result(offset);
     auto cast_op = mlir::memref::ReinterpretCastOp::create(
         builder, loc, result_type, memory_space_cast.getResult(),
-        offset_fold_result, rc_sizes, rc_strides);
-    if (has_invariant_base_source) {
-      cast_op->setAttr(kInvariantBaseAttr, mlir::UnitAttr::get(&getContext()));
-    }
+        offset_fold_result, sizes, reinterpret_strides);
     // Replace access tile with reinterpret_cast
     access_tile.replaceAllUsesWith(cast_op.getResult());
     ops_to_delete_.push_back(access_tile.getOperation());

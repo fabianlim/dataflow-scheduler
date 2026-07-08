@@ -174,25 +174,12 @@ mlir::AffineMap buildLinearizationMap(mlir::MLIRContext* ctx,
   return mlir::AffineMap::get(rank, 0, sum, ctx);
 }
 
-/// Build a 1-D lane-count get_logical_memory_view for invariant-base (HBM)
-/// addressing. The DMA engine requires the view to be a plain contiguous
-/// stick; size-1 leading dims of the tile are collapsed to the lane dim.
-static mlir::dataflow::GetLogicalMemoryViewOp buildInvariantBaseView(
-    mlir::OpBuilder& builder, mlir::Location loc,
-    mlir::MemRefType src_type, mlir::Value from_unit,
-    mlir::Value start_address, mlir::MLIRContext* ctx) {
-  int64_t lane_count = src_type.getShape().back();
-  auto plain_type =
-      mlir::MemRefType::get({lane_count}, src_type.getElementType());
-  auto view_layout = mlir::AffineMap::getMultiDimIdentityMap(1, ctx);
-  return mlir::dataflow::GetLogicalMemoryViewOp::create(
-      builder, loc, plain_type, from_unit, start_address,
-      mlir::AffineMapAttr::get(view_layout));
-}
-
-/// Build an N-D tile get_logical_memory_view for tile-address-baked-in
-/// (LX/lrfreg) addressing. The full tile offset is already in start_address;
-/// the layout uses the N-D linearization map.
+/// Build an N-D tile get_logical_memory_view.
+/// start_address = cmv.getOffset() + reinterpret_offset (always).
+/// The layout uses the N-D linearization map from the memref strides.
+/// §3 (ADDRESSING_DESIGN_V2): offset is always loop-invariant, so there is one
+/// unified view builder. buildInvariantBaseView and buildTileAddressView are
+/// merged into this single function.
 static mlir::dataflow::GetLogicalMemoryViewOp buildTileAddressView(
     mlir::OpBuilder& builder, mlir::Location loc,
     mlir::MemRefType src_type, mlir::Value from_unit,
@@ -207,9 +194,8 @@ static mlir::dataflow::GetLogicalMemoryViewOp buildTileAddressView(
 /// Phase 3b: replace Source A chains with get_logical_memory_view.
 /// Emits the view op and RAUWs the memref.cast result inline; does not
 /// populate `replacements` (Source A handles its own erasure).
-/// Invariant-base vs tile-address-baked-in is determined by reading the
-/// ktdf.invariant_base attribute on the reinterpret_cast op (set by
-/// ConstructThreeStagePipeline pass-02).
+/// §3 (ADDRESSING_DESIGN_V2): always computes start_address = cmv.getOffset()
+/// + reinterpret_offset; uses a single unified N-D tile-address view builder.
 mlir::LogicalResult replaceSourceAChains(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::DenseMap<ResourceType, mlir::Value>& resolved_units,
@@ -266,25 +252,13 @@ mlir::LogicalResult replaceSourceAChains(
     // Build layout map from static strides.
     auto layout_map = buildLinearizationMap(ctx, static_strides);
 
-    // Determine whether this Source-A chain uses invariant-base addressing.
-    // Invariant-base applies to global memory (HBM): the view start address
-    // must be a compile-time constant, and the
-    // per-tile dynamic offset goes into the composite subscript.
-    // Tile-address-baked-in applies to per-core scratchpad (LX/lrfreg): the
-    // full tile offset is baked into the view start address.
-    // The addressing mode was recorded at pass-02 time as a
-    // ktdf.invariant_base UnitAttr on the reinterpret_cast op (see
-    // ConstructThreeStagePipeline.cpp).
-    bool has_invariant_base = rc->hasAttr(kInvariantBaseAttr);
-
-    // Compute start_address:
-    // - Invariant-base: keep the plain constant base address (do NOT add
-    //   reinterpret offset; the offset will appear in the composite subscript).
-    // - Tile-address-baked-in: add the reinterpret_cast offset to the base.
+    // §3 (ADDRESSING_DESIGN_V2): the reinterpret_cast offset is always
+    // loop-invariant (loop IVs were excluded at pass-02 time). Always compute
+    // start_address = cmv.getOffset() + reinterpret_offset and use the single
+    // tile-address view builder. No has_invariant_base split needed.
     mlir::Value start_address = cmv.getOffset();
     builder.setInsertionPointAfter(rc);
-    if (!has_invariant_base) {
-      // Tile-address-baked-in: add the reinterpret_cast's offset to the base.
+    {
       mlir::OpFoldResult reinterpret_offset = rc.getConstifiedMixedOffset();
       if (auto offset_attr =
               llvm::dyn_cast<mlir::Attribute>(reinterpret_offset)) {
@@ -302,7 +276,6 @@ mlir::LogicalResult replaceSourceAChains(
                                                     start_address, offset_val);
       }
     }
-    // Invariant-base: start_address stays as cmv.getOffset() (constant base).
 
     // Get from_unit.
     auto ms = getMemorySpaceAttr(msc.getDest().getType());
@@ -312,16 +285,10 @@ mlir::LogicalResult replaceSourceAChains(
       return cmv.emitError("no resolved unit for memory space");
     mlir::Value from_unit = it->second;
 
-    // Emit get_logical_memory_view via the appropriate addressing helper.
+    // Emit get_logical_memory_view using the unified tile-address view builder.
     auto src_type = mlir::cast<mlir::MemRefType>(rc.getResult().getType());
-    mlir::dataflow::GetLogicalMemoryViewOp view_op;
-    if (has_invariant_base) {
-      view_op = buildInvariantBaseView(builder, cmv.getLoc(), src_type,
-                                       from_unit, start_address, ctx);
-    } else {
-      view_op = buildTileAddressView(builder, cmv.getLoc(), src_type,
-                                     from_unit, start_address, layout_map);
-    }
+    auto view_op = buildTileAddressView(builder, cmv.getLoc(), src_type,
+                                        from_unit, start_address, layout_map);
 
     // Replace all uses of the old chain tail with the new view.
     // The tail is either memref.cast (if present) or reinterpret_cast.

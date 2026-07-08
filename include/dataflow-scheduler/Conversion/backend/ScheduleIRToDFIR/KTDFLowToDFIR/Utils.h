@@ -90,14 +90,6 @@ mlir::IntegerSet buildLaneIntegerSet(mlir::MLIRContext* ctx,
 scheduler::DataTransferType getDataTransferType(bool src_is_fifo,
                                                 bool dst_is_fifo);
 
-/// Attribute name set on memref.reinterpret_cast ops to indicate
-/// invariant-base addressing (HBM/global): the view start address is a
-/// loop-invariant constant; the per-iteration offset goes in the composite
-/// subscript 
-/// The alternative (tile-address-baked-in) bakes the full tile offset into the
-/// view start address and uses an all-zeros subscript.
-constexpr llvm::StringLiteral kInvariantBaseAttr = "ktdf.invariant_base";
-
 /// Returns true if `ms` is a compute-local memory space (e.g. lrfreg).
 /// Compute-local spaces are accessed via get_local_unit rather than a
 /// global memory address; they are not routable through the arch graph.
