@@ -501,12 +501,10 @@ static void emitVectorStore(mlir::OpBuilder& builder, mlir::Location loc,
                                     mlir::ValueRange{c0}, store_set, identity1d);
 }
 
-/// Piece 3, Phase A (before applyPatternsGreedily):
 /// Lower bufferization.materialize_in_destination(%const_tensor, %view)
-///   where source is a dense constant (site #1: the zero-seed) -> agen.vector_store.
-/// Site #2 (to_tensor) is now handled by LinalgLowering (Change 1).
-/// Non-constant materialize_in_destination ops (site #3) are now handled
-/// by LinalgLowering (Change 1) and no longer appear here.
+/// where source is a dense constant (the zero-seed) to agen.vector_store.
+/// Only constant-tensor sources are handled here; non-constant sources
+/// (the per-iteration accumulator write-back) are handled by LowerLinalgGenericPattern.
 static mlir::LogicalResult lowerLrfregBufferizationOpsPhaseA(
     mlir::func::FuncOp func) {
   mlir::OpBuilder builder(func.getContext());
@@ -519,8 +517,8 @@ static mlir::LogicalResult lowerLrfregBufferizationOpsPhaseA(
       materialize_ops.push_back(mid);
   });
 
-  // Lower materialize_in_destination -> vector_store, ONLY when the
-  // source is a dense constant (the zero-seed, site #1).
+  // Lower materialize_in_destination -> vector_store only when the
+  // source is a dense constant (the zero-seed for the lrfreg accumulator).
   for (auto mid : materialize_ops) {
     mlir::Value src = mid.getSource();
     mlir::Value view = mid.getDest();

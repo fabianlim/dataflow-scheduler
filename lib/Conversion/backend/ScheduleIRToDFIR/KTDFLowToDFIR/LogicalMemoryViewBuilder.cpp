@@ -416,7 +416,7 @@ mlir::LogicalResult replaceSourceBCasts(
 /// Also handles bufferization.to_tensor and
 /// bufferization.materialize_in_destination consumers (the lrfreg accumulator
 /// RMW ops emitted by pass 02) — those are lowered to agen.vector_load/store
-/// in runOperationLowerings (Piece 3).
+/// in runOperationLowerings (the operation lowering step).
 mlir::LogicalResult propagateTypes(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::DenseMap<mlir::Value, mlir::Value>& replacements) {

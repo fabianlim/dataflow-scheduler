@@ -324,11 +324,12 @@ static void materializeDependency(mlir::Value val, mlir::IRMapping& mapper,
   builder.clone(*op, mapper);
 }
 
-// A loop nest is a (reduction/matmul) compute group when it contains both a
-// ktdp.load and a ktdp.store that live in *different* blocks of the nest — the
-// per-block straight-line scan pairs a load with a store only within one block,
-// so it cannot capture this shape (loads in the K-loop body, store in the outer
-// loop body). Such a nest is extracted wholesale as its outermost loop.
+// A loop nest is a reduction compute group when it contains both a ktdp.load
+// and a ktdp.store that live in *different* blocks of the nest — the per-block
+// straight-line scan pairs a load with a store only within one block, so it
+// cannot capture this shape (loads in the reduction loop body, store in the
+// outer output-partition loop body). Such a nest is extracted wholesale as its
+// outermost loop.
 static bool loopNestBracketsCrossBlockLoadStore(mlir::scf::ForOp for_op) {
   mlir::ktdp::LoadOp a_load;
   mlir::ktdp::StoreOp a_store;
@@ -607,9 +608,10 @@ void ComputeGroupExtractionPass::processBlockForExtraction(
 }
 
 void ComputeGroupExtractionPass::runOn(mlir::ModuleOp module_op) {
-  // First pass: detect loop-nest compute groups (reduction / matmul). Their
-  // loads and store span different blocks of the nest, so the per-block scan
-  // below cannot pair them; extract the outermost bracketing loop wholesale.
+  // First pass: detect loop-nest reduction compute groups. Their loads and
+  // store span different blocks of the nest (loads in the reduction loop body,
+  // store in the outer output-partition loop body), so the per-block scan below
+  // cannot pair them; extract the outermost bracketing loop wholesale.
   llvm::SmallPtrSet<mlir::Operation*, 4> loop_nest_roots;
   module_op.walk([&](mlir::func::FuncOp func) {
     for (mlir::Block& body_block : func.getBody()) {

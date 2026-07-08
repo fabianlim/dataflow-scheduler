@@ -188,8 +188,8 @@ struct LowerLinalgGenericPattern
 
     // Fused multiply-accumulate:  %m = mulf %a,%b ; %s = addf %m,%c ; yield %s
     // -> single vectorchain.multiply_and_accumulate %a,%b,%c [%mask] {reduction_map}.
-    // A matmul/contraction generalizes to exactly this body; emitting two chained
-    // vectorchain.binary ops instead crashes the backend PE result-forwarding.
+    // A contraction/reduction op generalizes to exactly this body; emitting two
+    // chained vectorchain.binary ops instead crashes the backend PE result-forwarding.
     if (ops_to_lower.size() == 2) {
       auto mulf = llvm::dyn_cast<mlir::arith::MulFOp>(ops_to_lower[0]);
       auto addf = llvm::dyn_cast<mlir::arith::AddFOp>(ops_to_lower[1]);
@@ -207,11 +207,12 @@ struct LowerLinalgGenericPattern
 
           mlir::MLIRContext* ctx = rewriter.getContext();
           // reduction_map: identity over the single (lane) dim — elementwise per
-          // output lane, no cross-lane reduction (matches the matmul target).
+          // output lane, no cross-lane reduction (matches the reduction target).
           mlir::AffineMap reduction_map =
               mlir::AffineMap::getMultiDimIdentityMap(1, ctx);
-          // mask_set: mirror the pristine matmul_ep target's create_affine_mask
-          // (dcc_backend ignores it numerically here; kept for fidelity).
+          // mask_set: mirrors the expected create_affine_mask range for a
+          // 64-lane output-partition stick (dcc_backend ignores it numerically
+          // here; kept for structural fidelity).
           auto d0 = mlir::getAffineDimExpr(0, ctx);
           mlir::IntegerSet mask_set = mlir::IntegerSet::get(
               /*dimCount=*/1, /*symbolCount=*/0,
@@ -232,8 +233,8 @@ struct LowerLinalgGenericPattern
             // Emit vector_store for the accumulator result.
             mlir::Value new_acc = mac.getData();
             emitAccVectorStore(rewriter, generic_op.getLoc(), new_acc, acc_view);
-            // Erase site #3: the materialize_in_destination whose dest is
-            // acc_view and whose source is the generic op's result.
+            // Erase the materialize_in_destination bridge op whose dest is
+            // acc_view (it was emitted by pass 02; the vector_store above takes its role).
             mlir::Value generic_result = generic_op.getResult(0);
             for (mlir::OpOperand& use :
                  llvm::make_early_inc_range(generic_result.getUses())) {
@@ -316,7 +317,7 @@ struct LowerLinalgGenericPattern
     if (is_reduction) {
       // Emit vector_store for the new accumulator.
       emitAccVectorStore(rewriter, generic_op.getLoc(), result, acc_view);
-      // Erase site #3: the materialize_in_destination for the generic result.
+      // Erase the materialize_in_destination bridge op for the generic result.
       mlir::Value generic_result = generic_op.getResult(0);
       for (mlir::OpOperand& use :
            llvm::make_early_inc_range(generic_result.getUses())) {

@@ -76,10 +76,10 @@ namespace {
 //   loop lb → lb + step
 //   [loop body unchanged, runs lb+step..ub]
 //
-// This is the reset fix: an unconditional init-store replaces the prior
-// conditional-store seed, which the hardware ignored (see §9.12 design doc).
-// Only the COMPUTE loop (body has vectorchain.binary) is peeled; transfer loops
-// that share the ktdf.reduction_accumulator attr are left unchanged.
+// The unconditional init-store is required because a conditional store inside
+// scf.if is not honored by hardware. Only the compute loop (body has
+// vectorchain.binary) is peeled; transfer loops that share the
+// ktdf.reduction_accumulator attribute are left unchanged.
 static void peelReductionComputeLoop(mlir::func::FuncOp func) {
   auto* ctx = func.getContext();
   mlir::OpBuilder builder(ctx);

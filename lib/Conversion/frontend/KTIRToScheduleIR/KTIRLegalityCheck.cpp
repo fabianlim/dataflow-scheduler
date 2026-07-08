@@ -44,7 +44,7 @@ namespace {
 
 // A scalar op inside a linalg.generic body is legal iff it is one of the
 // add/mul/sub float arith ops the backend lowers, an fp16<->fp32 ext/trunc
-// (matmul accumulates in fp32), or the yield terminator.
+// (reduction accumulates in fp32), or the yield terminator.
 bool isLegalGenericBodyOp(mlir::Operation* op) {
   return mlir::isa<mlir::arith::AddFOp, mlir::arith::MulFOp,
                    mlir::arith::SubFOp, mlir::arith::ExtFOp,
@@ -53,9 +53,9 @@ bool isLegalGenericBodyOp(mlir::Operation* op) {
 
 // A reduction-accumulation loop is an `scf.for` carrying exactly one tensor
 // iter_arg that a linalg contraction/reduction accumulates into (its `outs`
-// init is the iter_arg) and yields. This is the matmul K-loop shape; it is the
-// only loop-carried form V1 now admits (the accumulator is later materialized
-// into a compute-local memref, not a real loop-carried SSA value).
+// init is the iter_arg) and yields. This is the reduction loop shape; it is
+// the only loop-carried form V1 now admits (the accumulator is later
+// materialized into an lrfreg accumulator buffer, not a loop-carried SSA value).
 bool isReductionAccumulationLoop(mlir::scf::ForOp forOp) {
   if (forOp.getNumRegionIterArgs() != 1) return false;
   mlir::Value iterArg = forOp.getRegionIterArg(0);
@@ -80,9 +80,9 @@ struct KTIRLegalityCheckPass
 
     module.walk<mlir::WalkOrder::PreOrder>([&](mlir::Operation* op)
                                                -> mlir::WalkResult {
-      // Rule 1: loop-carried control flow. Reject iter_args EXCEPT the matmul
-      // K-reduction accumulation loop (one tensor accumulator threaded through
-      // a contraction); that form is lowered to a compute-local accumulator.
+      // Rule 1: loop-carried control flow. Reject iter_args EXCEPT the
+      // reduction accumulation loop (one tensor accumulator threaded through
+      // a contraction); that form is lowered to an lrfreg accumulator.
       if (auto forOp = mlir::dyn_cast<mlir::scf::ForOp>(op)) {
         if (forOp.getNumRegionIterArgs() > 0 &&
             !isReductionAccumulationLoop(forOp)) {

@@ -113,8 +113,9 @@ struct ConstructThreeStagePipelinePass
 
   void getDependentDialects(mlir::DialectRegistry& registry) const override {
     ConstructThreeStagePipelinePassBase::getDependentDialects(registry);
-    // The reduction accumulator rewrite emits memref.alloca and
-    // bufferization.to_tensor / materialize_in_destination ops.
+    // The reduction accumulator rewrite emits the Source-B
+    // unrealized_conversion_cast and bufferization bridge ops
+    // (to_tensor / materialize_in_destination).
     registry.insert<mlir::memref::MemRefDialect,
                     mlir::bufferization::BufferizationDialect>();
   }
@@ -145,10 +146,11 @@ struct ConstructThreeStagePipelinePass
   // Create loops from linalg operations by tiling
   void createLoopsFromLinalg(llvm::ArrayRef<mlir::linalg::LinalgOp> linalg_ops);
 
-  // Rewrite a matmul K-reduction loop's tensor iter_arg accumulator into a
-  // compute-local (LRF) memref RMW with an scf.if first-tile seed. Returns true
-  // if a reduction loop was found and rewritten. The ktdf.pipeline has no
-  // results, so the accumulator cannot be a loop-carried tensor.
+  // Rewrite a reduction loop's tensor iter_arg accumulator into an lrfreg
+  // accumulator buffer (Source-B unrealized_conversion_cast + bufferization
+  // bridge). Returns true if a reduction loop was found and rewritten.
+  // The ktdf.pipeline has no results, so the accumulator cannot be a
+  // loop-carried tensor.
   bool rewriteReductionAccumulator(mlir::func::FuncOp func_op);
 
   // Create a 3-stage pipeline inside innermost_loop, with one stage for loads,
@@ -205,11 +207,11 @@ struct ConstructThreeStagePipelinePass
   llvm::SmallVector<int64_t> getStridesFromMemRefType(
       mlir::MemRefType memref_type);
 
-  // Create a pipeline for a post-reduction-loop store (Gap 5).
-  // Called once per post-loop ktdp.store found outside the reduction loop.
+  // Emit the post-loop store pipeline (sibling pipeline) for the accumulated
+  // output. Called once per ktdp.store found outside the reduction loop body.
   // The pipeline has a compute stage (write_to_fifo) and a store stage
-  // (data_transfer → HBM), mirroring the store stage of the elementwise pipeline
-  // but placed after the K-loop body.
+  // (data_transfer → HBM); it is a sibling of the reduction pipeline under
+  // the outer output-partition loop.
   void createPostLoopStorePipeline(mlir::ktdp::StoreOp store_op,
                                    mlir::scf::ForOp enclosing_n_loop);
 
@@ -229,9 +231,9 @@ struct ConstructThreeStagePipelinePass
   // Tiled loops from linalg tiling (outermost to innermost)
   llvm::SmallVector<mlir::Operation*> tiled_loops_;
 
-  // K-reduction loop detected before the accumulator rewrite (null for
-  // elementwise ops). Used by createLoopsFromLinalg to detect the matmul
-  // without re-running the iter_arg detection after the rewrite changed it.
+  // Reduction loop detected before the accumulator rewrite (null for
+  // elementwise ops). Used by createLoopsFromLinalg to locate the compute op
+  // without re-running iter_arg detection after the rewrite changed it.
   mlir::scf::ForOp reduction_loop_;
 
   // Tile sizes determined from linalg operation
@@ -243,10 +245,10 @@ struct ConstructThreeStagePipelinePass
   // Operations to delete after pipeline creation
   llvm::SmallVector<mlir::Operation*> ops_to_delete_;
 
-  // LRF accumulator buffer (memref.alloca result), set by
-  // rewriteReductionAccumulator when a reduction loop is found. Used by
-  // createComputeOps to emit the in-place LRF read-modify-write (memref load
-  // + linalg.generic + memref store) in the compute stage.
+  // lrfreg accumulator buffer (Source-B unrealized_conversion_cast result),
+  // set by rewriteReductionAccumulator when a reduction loop is found.
+  // Used by createComputeOps to emit the in-place lrfreg read-modify-write
+  // (bufferization bridge + linalg.generic) in the compute stage.
   // Null for elementwise ops.
   mlir::Value lrf_acc_buf_;
 
@@ -513,18 +515,18 @@ bool ConstructThreeStagePipelinePass::rewriteReductionAccumulator(
   mlir::Type elem_type = acc_tensor_type.getElementType();
   mlir::Location loc = k_loop.getLoc();
 
-  // Mark the K-loop so later passes know the accumulator is LRF-resident.
+  // Mark the reduction loop so later passes know the accumulator is lrfreg-resident.
   k_loop->setAttr("ktdf.reduction_accumulator", mlir::UnitAttr::get(ctx));
 
   mlir::OpBuilder pre(k_loop);  // inserts before the reduction loop
 
-  // Emit the accumulator as a Source-B logical-memory-view source: an
-  // unrealized_conversion_cast(offset:index -> memref<NxT,"lrfreg">). Pass-20's
-  // LogicalMemoryViewBuilder::replaceSourceBCasts turns exactly this form into a
-  // dataflow.get_logical_memory_view (backed by get_local_unit "lrfreg" once the
-  // lrfreg resolved-unit branch is added in buildResolvedUnits). A raw
-  // memref.alloca is NOT recognized by that builder, so it must not be used.
-  // Offset 0: a single per-N-stick accumulator in the local register file.
+  // Emit the lrfreg accumulator as Source-B logical-memory-view form: an
+  // unrealized_conversion_cast(offset:index -> memref<NxT,"lrfreg">). Pass 20's
+  // LogicalMemoryViewBuilder::replaceSourceBCasts recognizes exactly this form
+  // and resolves it to a dataflow.get_logical_memory_view backed by
+  // get_local_unit {name="lrfreg"}. Any other form (e.g. memref.alloca) is not
+  // recognized and must not be used.
+  // Offset 0: one lrfreg slot per output-partition group.
   mlir::Attribute lrf_space = mlir::StringAttr::get(ctx, "lrfreg");
   mlir::MemRefType lrf_buf_type = mlir::MemRefType::get(shape, elem_type,
                                                          /*layout=*/mlir::AffineMapAttr{},
@@ -534,18 +536,19 @@ bool ConstructThreeStagePipelinePass::rewriteReductionAccumulator(
       pre, loc, mlir::TypeRange{lrf_buf_type}, mlir::ValueRange{lrf_off0});
   lrf_acc_buf_ = lrf_cast.getResult(0);
 
-  // Delta D-1: the constant zero-seed is REMOVED. The reduction accumulator is
-  // initialised by the peeled first iteration in the DFIR-level peel step
-  // (peelReductionComputeLoop in KTDFLowToDFIR.cpp). Storing a constant zero
-  // to an SFP-local lrfreg at pass-02 fails on HW ("ConstantBitstreamOp
-  // producers are only supported in L3"). Leave the buffer uninitialized here.
+  // The lrfreg accumulator is left uninitialized here. The reset (unconditional
+  // store of the first received row) is emitted by peelReductionComputeLoop
+  // in pass 20, after the per-PU loop split. Emitting a constant-zero store
+  // here fails on hardware ("ConstantBitstreamOp producers are only supported
+  // in L3").
 
-  // Replace uses of k_loop's SSA result (acc_final) with a post-loop memref
-  // load of the alloca buffer.  After dropping the iter_arg the loop has no
-  // results; the post-loop store pipeline (Gap 5) reads the alloca directly.
+  // Replace uses of k_loop's SSA result (acc_final) with a post-loop
+  // bufferization.to_tensor of the lrfreg accumulator buffer. After dropping
+  // the iter_arg the loop has no results; the sibling pipeline reads the
+  // lrfreg accumulator buffer directly.
   mlir::IRRewriter rewriter(ctx);
   rewriter.setInsertionPointAfter(k_loop);
-  // Load the accumulated result from the alloca as a tensor.
+  // Read the accumulated result from the lrfreg accumulator buffer as a tensor.
   auto post_tensor = mlir::bufferization::ToTensorOp::create(
       rewriter, loc, acc_tensor_type, lrf_acc_buf_,
       /*restrict=*/true, /*writable=*/false);
@@ -562,8 +565,9 @@ bool ConstructThreeStagePipelinePass::rewriteReductionAccumulator(
   // Replace IV and iter_arg block args.
   old_body->getArgument(0).replaceAllUsesWith(new_body->getArgument(0));
   // The iter_arg (%acc) — its only remaining in-loop use is as the linalg DPS
-  // init, which createComputeOps will replace with an LRF load in stage 2.
-  // Replace with a dummy tensor.empty so the IR is valid during the rewrite.
+  // init, which createComputeOps will replace with a bufferization bridge
+  // to_tensor of the lrfreg accumulator buffer. Replace with a dummy
+  // tensor.empty so the IR is valid during the rewrite.
   if (!iter_arg.use_empty()) {
     rewriter.setInsertionPoint(&old_body->front());
     auto dummy = mlir::tensor::EmptyOp::create(rewriter, loc, shape, elem_type);
@@ -611,19 +615,19 @@ void ConstructThreeStagePipelinePass::createLoopsFromLinalg(
 
     rewriter.setInsertionPoint(linalg_op);
 
-    // Reduction-accumulation (matmul) case: the compute op is inside the K-loop
-    // we detected before the accumulator rewrite. Reuse the existing loop nest
-    // as the pipeline loops instead of re-tiling.
+    // Reduction case: the compute op is inside the reduction loop detected
+    // before the accumulator rewrite. Reuse the existing loop nest as the
+    // pipeline loops instead of re-tiling.
     bool inside_reduction_nest =
         reduction_loop_ &&
         reduction_loop_->isAncestor(linalg_op);
     if (inside_reduction_nest) {
-      // For the matmul, tile_sizes_ and total_num_elements_ govern the FIFO
-      // slot size. The accumulator output is fp32 (the SIMD feature only
-      // declares fp16 lanes, so determineTileSizes gives 1 for fp32 → wrong).
-      // Use the fp16 SIMD vector length (one stick) as the transfer granularity
-      // instead — the input loads (A/W) are fp16 sticks, and the pipeline
-      // must transfer 64 elements (one stick) per time step.
+      // For the reduction, tile_sizes_ and total_num_elements_ govern the FIFO
+      // slot size. The accumulator type may differ from the input element type
+      // (determineTileSizes may give 1 for a wider type). Use the fp16 SIMD
+      // vector length (one output-partition stick) as the transfer granularity
+      // — the input loads are fp16 sticks and the pipeline transfers one stick
+      // per time step.
       auto simd_feature =
           resource_kinds_->getFeature<mlir::ktdf_arch::feature::SIMD>(
               resource_kinds_->getComputeKind());
@@ -766,7 +770,7 @@ mlir::ktdf::PrivateOp ConstructThreeStagePipelinePass::createPrivateOp(
   }
 
   // Add token types: 3 for load+compute+store pipeline, 2 when there is no
-  // store stage (reduction K-loop: accumulator stays in LRF, no store FIFO).
+  // store stage (reduction loop: accumulator stays in lrfreg, no store FIFO).
   int num_token_types = store_ops_.empty() ? 2 : 3;
   for (int i = 0; i < num_token_types; ++i) {
     private_result_types.push_back(token_type);
@@ -797,8 +801,8 @@ mlir::ktdf::PrivateOp ConstructThreeStagePipelinePass::createPrivateOp(
   }
 
   // Create tokens: one per stage boundary. With a store stage we need 3 tokens
-  // (load→compute, compute→store, store→done); without a store stage (matmul
-  // accumulates into LRF, no pipeline output FIFO) we need only 2 tokens.
+  // (load→compute, compute→store, store→done); without a store stage (reduction
+  // loop accumulates into lrfreg, no pipeline output FIFO) we need only 2.
   int num_tokens = store_ops_.empty() ? 2 : 3;
   for (int i = 0; i < num_tokens; ++i) {
     fifo_results.push_back(
@@ -1297,10 +1301,10 @@ ConstructThreeStagePipelinePass::getStridesFromMemRefType(
 
 void ConstructThreeStagePipelinePass::createPostLoopStorePipeline(
     mlir::ktdp::StoreOp store_op, mlir::scf::ForOp enclosing_n_loop) {
-  // Gap 5: emit a ktdf.pipeline after the reduction loop for the post-loop
-  // ktdp.store.  The pipeline has a compute stage (write_to_fifo of the
-  // accumulated tensor) and a store stage (data_transfer from the FIFO slot to
-  // the HBM output tile).
+  // Emit the sibling pipeline (post-loop store) for the accumulated output.
+  // This pipeline runs once per output group after the reduction loop completes.
+  // It has a compute stage (write_to_fifo of the accumulated tensor) and a
+  // store stage (data_transfer from the FIFO slot to the HBM output tile).
   //
   // The access tile for the store is left as-is here; it will be replaced by
   // memref.reinterpret_cast when replaceAccessTilesWithReinterpretCast runs
@@ -1334,7 +1338,7 @@ void ConstructThreeStagePipelinePass::createPostLoopStorePipeline(
 
   // Build the source_map for the data_transfer: maps the enclosing loop IVs
   // to the access tile's coordinates. Collect the loop IVs from the outer
-  // loops of the post-loop store (i.e. the N-stick loop).
+  // loops of the post-loop store (i.e. the output-partition loop).
   llvm::SmallVector<mlir::Value> outer_loop_ivs;
   for (mlir::Operation* p = store_op->getParentOfType<mlir::scf::ForOp>(); p;
        p = p->getParentOfType<mlir::scf::ForOp>()) {
@@ -1541,16 +1545,16 @@ void ConstructThreeStagePipelinePass::createComputeOps(
   // Elementwise case (no lrf_acc_buf_): map DPS init → tensor.empty so the
   // compute stage has a fresh output buffer.
   //
-  // Reduction case (lrf_acc_buf_ set): convert the LRF alloca buffer to a
-  // tensor (bufferization.to_tensor) and use it as the DPS init
-  // (read-modify-write: read current acc, compute new value, write back).
+  // Reduction case (lrf_acc_buf_ set): use the bufferization bridge
+  // (to_tensor of the lrfreg accumulator buffer) as the DPS init
+  // (read-modify-write: read current accumulator, compute new value, write back).
   auto linalg_op =
       mlir::dyn_cast<mlir::linalg::LinalgOp>(compute_op.getOperation());
   if (linalg_op && linalg_op.getNumDpsInits() > 0) {
     mlir::Value output_operand = linalg_op.getDpsInitOperand(0)->get();
 
     if (lrf_acc_buf_) {
-      // Reduction: read the current accumulator value from the LRF alloca.
+      // Reduction: read the current accumulator value from the lrfreg buffer.
       auto lrf_tensor = mlir::bufferization::ToTensorOp::create(
           builder, loc, tiled_tensor_type, lrf_acc_buf_,
           /*restrict=*/true, /*writable=*/false);
@@ -1566,8 +1570,8 @@ void ConstructThreeStagePipelinePass::createComputeOps(
 
   auto* cloned = builder.clone(*compute_op, mapper);
 
-  // For the reduction case: write the updated accumulator back to the LRF
-  // alloca so the next iteration reads the updated value.
+  // For the reduction case: write the updated accumulator back to the lrfreg
+  // accumulator buffer so the next iteration reads the updated value.
   if (lrf_acc_buf_) {
     mlir::bufferization::MaterializeInDestinationOp::create(
         builder, loc, /*result=*/mlir::Type{}, cloned->getResult(0),
@@ -2003,16 +2007,16 @@ void ConstructThreeStagePipelinePass::runOnFunc(mlir::func::FuncOp func_op) {
   DEBUG_WITH_TYPE(VerboseDebug, llvm::dbgs() << "After fusion:\n"
                                              << func_op << "\n\n");
 
-  // Matmul / reduction path: rewrite the K-loop tensor iter_arg accumulator
-  // into a compute-local (LRF) memref RMW with an scf.if first-tile seed (the
-  // ktdf.pipeline cannot carry a loop-result accumulator). The subsequent
-  // pipeline construction then wraps only the HBM A/W loads and C store; the
-  // LRF accumulator RMW is left in place (pass 20 lowers it to vector_load/
-  // store on the lrfreg unit).
-  // Detect the K-reduction loop BEFORE rewriteReductionAccumulator, while the
-  // original tensor iter_arg still ties the matmul to the K-loop. After the
-  // rewrite the matmul's DPS init is changed to an scf.if result, so the
-  // iter_arg linkage is lost and detection would fail.
+  // Reduction path: rewrite the reduction loop's tensor iter_arg accumulator
+  // into an lrfreg accumulator buffer (Source-B unrealized_conversion_cast +
+  // bufferization bridge). The ktdf.pipeline cannot carry a loop-result
+  // accumulator. The subsequent pipeline construction wraps only the HBM
+  // input loads; the lrfreg accumulator RMW stays in place and is lowered by
+  // pass 20 to agen.vector_load/store on the lrfreg unit.
+  // The reduction loop is detected BEFORE rewriteReductionAccumulator, while
+  // the original tensor iter_arg still links the compute op to the loop. After
+  // the rewrite the DPS init is changed, so the iter_arg linkage is lost and
+  // detection would fail.
   mlir::scf::ForOp reduction_loop;
   func_op.walk([&](mlir::scf::ForOp for_op) {
     if (for_op.getNumRegionIterArgs() == 0) return;
@@ -2026,19 +2030,19 @@ void ConstructThreeStagePipelinePass::runOnFunc(mlir::func::FuncOp func_op) {
   });
   reduction_loop_ = reduction_loop;  // save for createLoopsFromLinalg
 
-  // Now rewrite the accumulator (changes the matmul's DPS init, so must come
-  // after detection above).
+  // Now rewrite the accumulator (changes the compute op's DPS init, so must
+  // come after detection above).
   rewriteReductionAccumulator(func_op);
 
-  // For a reduction (matmul), collect only ops inside the K-loop body:
-  // - HBM loads (A/W) live inside K-loop and feed the compute stage.
-  // - The K-loop matmul is the pipelined compute op.
-  // - The C store / truncf live OUTSIDE the K-loop; they must NOT be collected
-  //   (the C-write is handled as raw ktdp ops that pass-3+ address-assigns).
+  // For a reduction, collect only ops inside the reduction loop body:
+  // - HBM input loads live inside the reduction loop and feed the compute stage.
+  // - The reduction loop compute op is the pipelined linalg op.
+  // - The output store lives OUTSIDE the reduction loop and must NOT be
+  //   collected here (it is handled by createPostLoopStorePipeline).
 
   llvm::SmallVector<mlir::linalg::LinalgOp> linalg_ops;
   // Use reduction_loop scope if found; fall back to func-wide walk otherwise
-  // (covers the elementwise/add case where there is no enclosing K-loop).
+  // (covers the elementwise case where there is no enclosing reduction loop).
   auto collect_scope = reduction_loop_
                            ? static_cast<mlir::Operation*>(reduction_loop_)
                            : static_cast<mlir::Operation*>(func_op);
@@ -2085,16 +2089,16 @@ void ConstructThreeStagePipelinePass::runOnFunc(mlir::func::FuncOp func_op) {
     createPipeline(innermost_loop);
   }
 
-  // Step 4b (Gap 5): For reduction ops, wrap any ktdp.store ops that live
-  // OUTSIDE the reduction loop body in their own ktdf.pipeline (post-loop
-  // store pipeline for the accumulated output).
+  // For reduction ops, wrap any ktdp.store ops that live OUTSIDE the reduction
+  // loop body in their own sibling pipeline (the post-loop store pipeline for
+  // the accumulated output).
   if (reduction_loop_) {
     llvm::SmallVector<std::pair<mlir::ktdp::StoreOp, mlir::scf::ForOp>>
         post_loop_stores;
     func_op.walk([&](mlir::ktdp::StoreOp store_op) {
       // Only collect stores that are NOT inside the reduction loop body.
       if (reduction_loop_->isProperAncestor(store_op)) return;
-      // Find the enclosing N-stick loop (parent scf.for of the store_op).
+      // Find the enclosing output-partition loop (parent scf.for of the store).
       auto enc = store_op->getParentOfType<mlir::scf::ForOp>();
       post_loop_stores.push_back({store_op, enc});
     });
