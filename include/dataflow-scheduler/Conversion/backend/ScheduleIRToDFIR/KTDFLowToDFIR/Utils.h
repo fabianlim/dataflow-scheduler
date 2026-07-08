@@ -107,6 +107,11 @@ bool isComputeLocalMemorySpace(mlir::Attribute ms);
 /// String overload for call sites that hold a StringRef from mapMemorySpace.
 bool isComputeLocalMemorySpace(llvm::StringRef ms);
 
+/// Returns true if `ms` is a per-core scratchpad memory space (e.g. LX).
+/// Per-core scratchpad is shared within a core but not compute-local; it is
+/// accessible via routable datapaths (LXLU/LXSU) unlike lrfreg.
+bool isPerCoreScratchpadMemorySpace(llvm::StringRef ms);
+
 /// Emit agen.vector_load from a 1-D lrfreg memref view at index 0.
 /// Returns the loaded vector value.
 mlir::Value emitLrfregVectorLoad(mlir::OpBuilder& builder, mlir::Location loc,

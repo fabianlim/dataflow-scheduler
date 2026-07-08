@@ -236,6 +236,10 @@ bool scheduler::isComputeLocalMemorySpace(llvm::StringRef ms) {
   return ms == "lrfreg";
 }
 
+bool scheduler::isPerCoreScratchpadMemorySpace(llvm::StringRef ms) {
+  return ms == "LX";
+}
+
 scheduler::DataTransferType scheduler::getDataTransferType(bool src_is_fifo,
                                                            bool dst_is_fifo) {
   // Case 1: Both source and destination are memrefs (memory to memory)
