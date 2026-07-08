@@ -52,8 +52,12 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/IntegerSet.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -109,6 +113,10 @@ struct ConstructThreeStagePipelinePass
 
   void getDependentDialects(mlir::DialectRegistry& registry) const override {
     ConstructThreeStagePipelinePassBase::getDependentDialects(registry);
+    // The reduction accumulator rewrite emits memref.alloca and
+    // bufferization.to_tensor / materialize_in_destination ops.
+    registry.insert<mlir::memref::MemRefDialect,
+                    mlir::bufferization::BufferizationDialect>();
   }
 
   void runOnOperation() final;
@@ -207,6 +215,11 @@ struct ConstructThreeStagePipelinePass
   // Tiled loops from linalg tiling (outermost to innermost)
   llvm::SmallVector<mlir::Operation*> tiled_loops_;
 
+  // K-reduction loop detected before the accumulator rewrite (null for
+  // elementwise ops). Used by createLoopsFromLinalg to detect the matmul
+  // without re-running the iter_arg detection after the rewrite changed it.
+  mlir::scf::ForOp reduction_loop_;
+
   // Tile sizes determined from linalg operation
   llvm::SmallVector<int64_t> tile_sizes_;
 
@@ -215,6 +228,13 @@ struct ConstructThreeStagePipelinePass
 
   // Operations to delete after pipeline creation
   llvm::SmallVector<mlir::Operation*> ops_to_delete_;
+
+  // LRF accumulator buffer (memref.alloca result), set by
+  // rewriteReductionAccumulator when a reduction loop is found. Used by
+  // createComputeOps to emit the in-place LRF read-modify-write (memref load
+  // + linalg.generic + memref store) in the compute stage.
+  // Null for elementwise ops.
+  mlir::Value lrf_acc_buf_;
 
   // Builder for constants at function start
   std::optional<mlir::OpBuilder> const_builder_;
@@ -229,6 +249,8 @@ void ConstructThreeStagePipelinePass::resetState() {
   total_num_elements_ = 0;
   ops_to_delete_.clear();
   const_builder_.reset();
+  reduction_loop_ = {};
+  lrf_acc_buf_ = {};
 }
 
 mlir::LogicalResult
@@ -823,6 +845,85 @@ static mlir::LogicalResult projectSizesThroughIndexingMap(
     return mlir::failure();
   }
   return mlir::success();
+}
+
+// Build the source_map for a data_transfer from an access tile op.
+//
+// Model A (HBM, global memory): 1-D flat-offset map.
+//   source_map has numDims == loop_ivs.size(), numResults == 1.
+//   Result = sum_i(stride_i * iv_expr(i)).
+//   Example: a[%n,  %m, 0] strides [16384,64,1] -> (d0,d1) -> (d0*16384+d1*64)
+//
+// Model B (LX/per-core, lrfreg): all-zeros N-D map (offset already baked
+//   into the reinterpret_cast base; subscript is constant 0 per dim).
+//   source_map has numDims == loop_ivs.size(), numResults == memref_rank.
+//   Example: lx[0,0,0] -> (d0,d1) -> (0,0,0)
+//
+// `is_model_a` = true → model A (HBM); false → model B (LX/lrfreg).
+static std::optional<mlir::AffineMap> buildSourceMapFromAccessTile(
+    mlir::ktdp::ConstructAccessTilesOp access_tile_op,
+    llvm::ArrayRef<mlir::Value> loop_ivs,
+    mlir::MLIRContext* ctx,
+    bool is_model_a) {
+  mlir::AffineMap base_map = access_tile_op.getBaseMap();
+  llvm::SmallVector<mlir::Value> raw_indices = access_tile_op.getIndices();
+  unsigned memref_rank = base_map.getNumResults();
+
+  // Build a quick lookup: loop IV value -> position in loop_ivs.
+  llvm::DenseMap<mlir::Value, unsigned> iv_to_pos;
+  for (unsigned k = 0; k < loop_ivs.size(); ++k)
+    iv_to_pos[loop_ivs[k]] = k;
+
+  if (!is_model_a) {
+    // Model B: all-zeros map (offset baked into the reinterpret_cast offset).
+    llvm::SmallVector<mlir::AffineExpr> zeros(
+        memref_rank, mlir::getAffineConstantExpr(0, ctx));
+    return mlir::AffineMap::get(loop_ivs.size(), 0, zeros, ctx);
+  }
+
+  // Model A: compute flat offset from strides and loop IVs.
+  llvm::SmallVector<int64_t> strides(memref_rank, 1);
+  {
+    mlir::Value mem_view = access_tile_op.getBase();
+    if (auto cmv = mlir::dyn_cast_or_null<mlir::ktdp::ConstructMemoryViewOp>(
+            mem_view.getDefiningOp())) {
+      auto sa = cmv->getAttrOfType<mlir::DenseI64ArrayAttr>("static_strides");
+      if (sa && sa.size() == (int64_t)memref_rank)
+        strides.assign(sa.asArrayRef().begin(), sa.asArrayRef().end());
+    }
+  }
+
+  mlir::AffineExpr offset_expr = mlir::getAffineConstantExpr(0, ctx);
+  for (unsigned i = 0; i < memref_rank; ++i) {
+    mlir::AffineExpr result_expr = base_map.getResults()[i];
+    mlir::AffineExpr iv_expr;
+
+    if (auto dim_expr = mlir::dyn_cast<mlir::AffineDimExpr>(result_expr)) {
+      mlir::Value idx = raw_indices[dim_expr.getPosition()];
+      auto it = iv_to_pos.find(idx);
+      if (it != iv_to_pos.end()) {
+        iv_expr = mlir::getAffineDimExpr(it->second, ctx);
+      } else {
+        if (idx.getDefiningOp<mlir::arith::ConstantIndexOp>()) {
+          iv_expr = mlir::getAffineConstantExpr(0, ctx);
+        } else {
+          return std::nullopt;
+        }
+      }
+    } else if (mlir::isa<mlir::AffineConstantExpr>(result_expr)) {
+      iv_expr = mlir::getAffineConstantExpr(0, ctx);
+    } else {
+      return std::nullopt;
+    }
+
+    if (strides[i] != 0)
+      offset_expr = offset_expr +
+                    iv_expr * mlir::getAffineConstantExpr(strides[i], ctx);
+  }
+
+  return mlir::AffineMap::get(loop_ivs.size(), 0,
+                              llvm::ArrayRef<mlir::AffineExpr>{offset_expr},
+                              ctx);
 }
 
 void ConstructThreeStagePipelinePass::createDataTransfers(
