@@ -145,6 +145,12 @@ struct ConstructThreeStagePipelinePass
   // Create loops from linalg operations by tiling
   void createLoopsFromLinalg(llvm::ArrayRef<mlir::linalg::LinalgOp> linalg_ops);
 
+  // Rewrite a matmul K-reduction loop's tensor iter_arg accumulator into a
+  // compute-local (LRF) memref RMW with an scf.if first-tile seed. Returns true
+  // if a reduction loop was found and rewritten. The ktdf.pipeline has no
+  // results, so the accumulator cannot be a loop-carried tensor.
+  bool rewriteReductionAccumulator(mlir::func::FuncOp func_op);
+
   // Create a 3-stage pipeline inside innermost_loop, with one stage for loads,
   // computes, stores.
   void createPipeline(mlir::scf::ForOp innermost_loop);
@@ -198,6 +204,14 @@ struct ConstructThreeStagePipelinePass
   // Get strides from memref type, computing default row-major strides if needed
   llvm::SmallVector<int64_t> getStridesFromMemRefType(
       mlir::MemRefType memref_type);
+
+  // Create a pipeline for a post-reduction-loop store (Gap 5).
+  // Called once per post-loop ktdp.store found outside the reduction loop.
+  // The pipeline has a compute stage (write_to_fifo) and a store stage
+  // (data_transfer → HBM), mirroring the store stage of the elementwise pipeline
+  // but placed after the K-loop body.
+  void createPostLoopStorePipeline(mlir::ktdp::StoreOp store_op,
+                                   mlir::scf::ForOp enclosing_n_loop);
 
   // Clean up operations after pipeline creation
   void cleanupOperations();
@@ -466,6 +480,117 @@ void ConstructThreeStagePipelinePass::annotateLoopsWithIteratorTypes(
   }
 }
 
+bool ConstructThreeStagePipelinePass::rewriteReductionAccumulator(
+    mlir::func::FuncOp func_op) {
+  mlir::MLIRContext* ctx = &getContext();
+
+  // Find the reduction loop: an scf.for with exactly one tensor iter_arg that
+  // a linalg op accumulates into (its DPS init is the iter_arg).
+  mlir::scf::ForOp k_loop;
+  mlir::linalg::LinalgOp accum_lop;
+  func_op.walk([&](mlir::scf::ForOp for_op) {
+    if (for_op.getNumRegionIterArgs() != 1) return;
+    mlir::Value iter_arg = for_op.getRegionIterArg(0);
+    if (!mlir::isa<mlir::RankedTensorType>(iter_arg.getType())) return;
+    auto yield =
+        mlir::cast<mlir::scf::YieldOp>(for_op.getBody()->getTerminator());
+    auto lop =
+        mlir::dyn_cast_or_null<mlir::linalg::LinalgOp>(
+            yield.getOperand(0).getDefiningOp());
+    if (!lop) return;
+    for (mlir::Value init : lop.getDpsInits())
+      if (init == iter_arg) {
+        k_loop = for_op;
+        accum_lop = lop;
+      }
+  });
+  if (!k_loop) return false;
+
+  mlir::Value iter_arg = k_loop.getRegionIterArg(0);
+  auto acc_tensor_type = mlir::cast<mlir::RankedTensorType>(iter_arg.getType());
+  mlir::Value zero_init = k_loop.getInitArgs()[0];  // zero, dominates the loop
+  llvm::ArrayRef<int64_t> shape = acc_tensor_type.getShape();
+  mlir::Type elem_type = acc_tensor_type.getElementType();
+  mlir::Location loc = k_loop.getLoc();
+
+  // Mark the K-loop so later passes know the accumulator is LRF-resident.
+  k_loop->setAttr("ktdf.reduction_accumulator", mlir::UnitAttr::get(ctx));
+
+  mlir::OpBuilder pre(k_loop);  // inserts before the reduction loop
+
+  // Allocate an LRF accumulator buffer using memref.alloca.
+  // Shape matches the 1-D tensor accumulator (e.g. memref<64xf16>).
+  // This avoids ktdp.construct_memory_view which downstream passes
+  // (LogicalMemoryViewBuilder) cannot handle without a full chain.
+  mlir::MemRefType lrf_buf_type = mlir::MemRefType::get(shape, elem_type);
+  auto lrf_alloca = mlir::memref::AllocaOp::create(pre, loc, lrf_buf_type,
+                                                   mlir::ValueRange{});
+  lrf_acc_buf_ = lrf_alloca.getResult();
+
+  // Zero-seed the accumulator before the reduction loop.
+  // zero_init is the original iter_arg initializer (a zero constant tensor).
+  // Use bufferization.materialize_in_destination to store it into the alloca.
+  // For a memref destination, `writable` must be set (no result type).
+  mlir::bufferization::MaterializeInDestinationOp::create(
+      pre, loc, /*result=*/mlir::Type{}, zero_init, lrf_alloca.getResult(),
+      /*restrict=*/false, /*writable=*/true);
+
+  // Replace uses of k_loop's SSA result (acc_final) with a post-loop memref
+  // load of the alloca buffer.  After dropping the iter_arg the loop has no
+  // results; the post-loop store pipeline (Gap 5) reads the alloca directly.
+  mlir::IRRewriter rewriter(ctx);
+  rewriter.setInsertionPointAfter(k_loop);
+  // Load the accumulated result from the alloca as a tensor.
+  auto post_tensor = mlir::bufferization::ToTensorOp::create(
+      rewriter, loc, acc_tensor_type, lrf_alloca.getResult(),
+      /*restrict=*/true, /*writable=*/false);
+  k_loop->getResult(0).replaceAllUsesWith(post_tensor.getResult());
+
+  // Build a replacement scf.for without the iter_arg.
+  rewriter.setInsertionPoint(k_loop);
+  auto new_loop = mlir::scf::ForOp::create(
+      rewriter, loc, k_loop.getLowerBound(), k_loop.getUpperBound(),
+      k_loop.getStep(), /*iterArgs=*/mlir::ValueRange{});
+
+  mlir::Block* old_body = k_loop.getBody();
+  mlir::Block* new_body = new_loop.getBody();
+  // Replace IV and iter_arg block args.
+  old_body->getArgument(0).replaceAllUsesWith(new_body->getArgument(0));
+  // The iter_arg (%acc) — its only remaining in-loop use is as the linalg DPS
+  // init, which createComputeOps will replace with an LRF load in stage 2.
+  // Replace with a dummy tensor.empty so the IR is valid during the rewrite.
+  if (!iter_arg.use_empty()) {
+    rewriter.setInsertionPoint(&old_body->front());
+    auto dummy = mlir::tensor::EmptyOp::create(rewriter, loc, shape, elem_type);
+    iter_arg.replaceAllUsesWith(dummy.getResult());
+  }
+
+  // Fix the yield: original yield operand is the linalg result; change to
+  // empty (no iter_args).
+  auto yield_op =
+      mlir::cast<mlir::scf::YieldOp>(old_body->getTerminator());
+  rewriter.setInsertionPoint(yield_op);
+  mlir::scf::YieldOp::create(rewriter, yield_op.getLoc(), mlir::ValueRange{});
+  rewriter.eraseOp(yield_op);
+
+  // Remove the default terminator that ForOp::create inserts into new_body
+  // before splicing the old body's ops (which already contain our empty yield).
+  if (!new_body->empty())
+    new_body->back().erase();
+
+  // Splice ops from old_body into new_body.
+  new_body->getOperations().splice(new_body->begin(),
+                                   old_body->getOperations());
+
+  // Copy loop attributes (including ktdf.reduction_accumulator).
+  for (auto attr : k_loop->getAttrs())
+    new_loop->setAttr(attr.getName(), attr.getValue());
+
+  rewriter.eraseOp(k_loop);
+  reduction_loop_ = new_loop;
+  return true;
+}
+
 void ConstructThreeStagePipelinePass::createLoopsFromLinalg(
     llvm::ArrayRef<mlir::linalg::LinalgOp> linalg_ops) {
   LLVM_DEBUG(
@@ -480,6 +605,39 @@ void ConstructThreeStagePipelinePass::createLoopsFromLinalg(
                << "  Processing: " << linalg_op->getName() << "\n");
 
     rewriter.setInsertionPoint(linalg_op);
+
+    // Reduction-accumulation (matmul) case: the compute op is inside the K-loop
+    // we detected before the accumulator rewrite. Reuse the existing loop nest
+    // as the pipeline loops instead of re-tiling.
+    bool inside_reduction_nest =
+        reduction_loop_ &&
+        reduction_loop_->isAncestor(linalg_op);
+    if (inside_reduction_nest) {
+      // For the matmul, tile_sizes_ and total_num_elements_ govern the FIFO
+      // slot size. The accumulator output is fp32 (the SIMD feature only
+      // declares fp16 lanes, so determineTileSizes gives 1 for fp32 → wrong).
+      // Use the fp16 SIMD vector length (one stick) as the transfer granularity
+      // instead — the input loads (A/W) are fp16 sticks, and the pipeline
+      // must transfer 64 elements (one stick) per time step.
+      auto simd_feature =
+          resource_kinds_->getFeature<mlir::ktdf_arch::feature::SIMD>(
+              resource_kinds_->getComputeKind());
+      auto f16_type = mlir::Float16Type::get(&getContext());
+      const int64_t vector_length =
+          std::max(simd_feature.getLanes(f16_type), int64_t(1));
+      tile_sizes_ = {vector_length};
+      total_num_elements_ = vector_length;
+
+      // Collect the enclosing scf.for loops, outermost first.
+      llvm::SmallVector<mlir::Operation*> enclosing;
+      for (mlir::Operation* p = linalg_op->getParentOfType<mlir::scf::ForOp>();
+           p; p = p->getParentOfType<mlir::scf::ForOp>()) {
+        enclosing.push_back(p);
+      }
+      std::reverse(enclosing.begin(), enclosing.end());
+      tiled_loops_.assign(enclosing.begin(), enclosing.end());
+      continue;
+    }
 
     // Determine tile sizes from output operand shape (needed for loop
     // creation)
@@ -602,10 +760,12 @@ mlir::ktdf::PrivateOp ConstructThreeStagePipelinePass::createPrivateOp(
     private_result_types.push_back(fifo_slot_type);
   }
 
-  // Add three token types for the three stages
-  private_result_types.push_back(token_type);
-  private_result_types.push_back(token_type);
-  private_result_types.push_back(token_type);
+  // Add token types: 3 for load+compute+store pipeline, 2 when there is no
+  // store stage (reduction K-loop: accumulator stays in LRF, no store FIFO).
+  int num_token_types = store_ops_.empty() ? 2 : 3;
+  for (int i = 0; i < num_token_types; ++i) {
+    private_result_types.push_back(token_type);
+  }
 
   // Create ktdf.private operation
   auto private_op =
@@ -631,13 +791,14 @@ mlir::ktdf::PrivateOp ConstructThreeStagePipelinePass::createPrivateOp(
     }
   }
 
-  // Create three tokens
-  auto t1 = mlir::ktdf::CreateTokenOp::create(builder, loc, token_type);
-  auto t2 = mlir::ktdf::CreateTokenOp::create(builder, loc, token_type);
-  auto t3 = mlir::ktdf::CreateTokenOp::create(builder, loc, token_type);
-  fifo_results.push_back(t1.getResult());
-  fifo_results.push_back(t2.getResult());
-  fifo_results.push_back(t3.getResult());
+  // Create tokens: one per stage boundary. With a store stage we need 3 tokens
+  // (load→compute, compute→store, store→done); without a store stage (matmul
+  // accumulates into LRF, no pipeline output FIFO) we need only 2 tokens.
+  int num_tokens = store_ops_.empty() ? 2 : 3;
+  for (int i = 0; i < num_tokens; ++i) {
+    fifo_results.push_back(
+        mlir::ktdf::CreateTokenOp::create(builder, loc, token_type).getResult());
+  }
 
   // Yield all results
   mlir::ktdf::PrivateYieldOp::create(builder, loc, fifo_results);
@@ -666,6 +827,13 @@ void ConstructThreeStagePipelinePass::createPipeline(
     if (auto* def_op = operand.getDefiningOp()) {
       ops_to_delete_.push_back(def_op);
     }
+  }
+  // For the reduction case the yield has no operands (iter_arg was dropped),
+  // so the linalg op would not be added above. Explicitly mark all compute
+  // ops for deletion so their use-chains (ktdp.load → tensor.extract_slice →
+  // linalg.generic) get cleaned up by cleanupOperations.
+  for (mlir::linalg::LinalgOp lop : compute_ops_) {
+    ops_to_delete_.push_back(lop.getOperation());
   }
 
   // Fix scf.yield to yield iter_args instead of linalg results. This allows
@@ -730,16 +898,21 @@ void ConstructThreeStagePipelinePass::createPipeline(
             .setApplicableUnitsAttr(
                 builder.getArrayAttr(resource_kinds_->getComputeKind()));
 
-        mlir::ktdf::StageOp::create(
-            builder, loc,
-            /*depends_in=*/{private_op.getResult(fifo_count + 1U)},
-            /*depends_out=*/{private_op.getResult(fifo_count + 2U)},
-            [&](mlir::OpBuilder& builder, mlir::Location loc) {
-              // Add data transfer operations in stage3 for stores
-              createDataTransfers(builder, loc, private_op, tile_sizes_,
-                                  /*is_load=*/false,
-                                  /*private_result_offset=*/load_ops_.size());
-            });
+        // Only emit a store stage if there are store operations to pipeline
+        // (the reduction's output-store is outside the reduction loop pipeline;
+        // skipping the empty store stage prevents pass-12 from failing on a
+        // stage with no applicable_units).
+        if (!store_ops_.empty()) {
+          mlir::ktdf::StageOp::create(
+              builder, loc,
+              /*depends_in=*/{private_op.getResult(fifo_count + 1U)},
+              /*depends_out=*/{private_op.getResult(fifo_count + 2U)},
+              [&](mlir::OpBuilder& builder, mlir::Location loc) {
+                createDataTransfers(builder, loc, private_op, tile_sizes_,
+                                    /*is_load=*/false,
+                                    /*private_result_offset=*/load_ops_.size());
+              });
+        }
       });
 }
 
@@ -988,59 +1161,112 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
 
   // Create data_transfer for each operation
   for (size_t i = 0; i < op_count; ++i) {
-    // Get the access_tile value (operand of load/store op) and the linalg
-    // indexing map for the matching operand.
+    // Get the access_tile value (operand of load/store op).
     mlir::Value access_tile_value;
-    std::optional<mlir::AffineMap> indexing_map;
     mlir::Operation* err_anchor;
     if (is_load) {
-      mlir::ktdp::LoadOp load_op = load_ops_[i];
-      access_tile_value = load_op.getAccessTile();
-      err_anchor = load_op.getOperation();
-      indexing_map =
-          findIndexingMapForLoadResult(linalg_op, load_op.getResult());
+      access_tile_value = load_ops_[i].getAccessTile();
+      err_anchor = load_ops_[i].getOperation();
     } else {
-      mlir::ktdp::StoreOp store_op = store_ops_[i];
-      access_tile_value = store_op.getAccessTile();
-      err_anchor = store_op.getOperation();
-      indexing_map =
-          findIndexingMapForStoreSource(linalg_op, store_op.getDataTile());
+      access_tile_value = store_ops_[i].getAccessTile();
+      err_anchor = store_ops_[i].getOperation();
     }
 
-    if (!indexing_map) {
+    // Detect model-A (HBM) vs model-B (LX/lrfreg) for this access tile.
+    bool is_model_a_tile = false;
+    if (auto access_tile_op =
+            access_tile_value
+                .getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
+      mlir::Value mem_view_base = access_tile_op.getBase();
+      if (auto cmv = mlir::dyn_cast_or_null<mlir::ktdp::ConstructMemoryViewOp>(
+              mem_view_base.getDefiningOp())) {
+        mlir::Attribute mapped_ms = mapMemorySpace(cmv.getMemorySpaceAttr());
+        if (auto ms_str = mlir::dyn_cast<mlir::StringAttr>(mapped_ms)) {
+          llvm::StringRef ms = ms_str.getValue();
+          is_model_a_tile = (ms != "LX" && ms != "lrfreg");
+        }
+      }
+    }
+
+    // Build source_map from the access-tile's index structure.
+    std::optional<mlir::AffineMap> source_map;
+    if (auto access_tile_op =
+            access_tile_value
+                .getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
+      source_map = buildSourceMapFromAccessTile(access_tile_op, loop_ivs,
+                                                &getContext(), is_model_a_tile);
+    }
+
+    // Fall back to linalg indexing map if access-tile approach fails.
+    if (!source_map) {
+      if (is_load) {
+        source_map = findIndexingMapForLoadResult(linalg_op,
+                                                  load_ops_[i].getResult());
+      } else {
+        source_map = findIndexingMapForStoreSource(linalg_op,
+                                                   store_ops_[i].getDataTile());
+      }
+    }
+
+    if (!source_map) {
       err_anchor->emitError(
-          "could not locate matching linalg operand to project loop IVs and "
-          "tile sizes through; the data_transfer rank would not match the "
-          "underlying memref");
+          "could not build source_map for data_transfer; the access-tile "
+          "index structure is not supported and no linalg indexing map "
+          "fallback was found");
       signalPassFailure();
       return;
     }
 
-    // Project tile_sizes through the operand's indexing map.
+    // Derive the access-tile sizes for the data_transfer's static sizes.
+    // Model-A (HBM): 1-D stick → {lane}. Model-B (LX): keep N-D tile shape.
     llvm::SmallVector<int64_t> access_tile_sizes;
-    if (mlir::failed(projectSizesThroughIndexingMap(
-            *indexing_map, tile_sizes, access_tile_sizes,
-            [&]() { return err_anchor->emitError(); }))) {
-      signalPassFailure();
-      return;
+    bool got_sizes_from_tile = false;
+    if (auto access_tile_op =
+            access_tile_value
+                .getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
+      auto at_type = mlir::dyn_cast<mlir::ktdp::AccessTileType>(
+          access_tile_op.getResult().getType());
+      if (at_type) {
+        if (is_model_a_tile && source_map->getNumResults() == 1) {
+          // Model A: 1-D view → just the lane count (last dim of tile).
+          access_tile_sizes = {at_type.getShape().back()};
+        } else {
+          // Model B or LX: keep the full tile shape.
+          access_tile_sizes.assign(at_type.getShape().begin(),
+                                   at_type.getShape().end());
+        }
+        got_sizes_from_tile = true;
+      }
+    }
+    if (!got_sizes_from_tile) {
+      // Fallback: project tile_sizes through source_map (works for identity maps).
+      for (mlir::AffineExpr res_expr : source_map->getResults()) {
+        if (auto dim = mlir::dyn_cast<mlir::AffineDimExpr>(res_expr)) {
+          unsigned pos = dim.getPosition();
+          int64_t sz = (pos < tile_sizes.size()) ? tile_sizes[pos]
+                                                  : tile_sizes.back();
+          access_tile_sizes.push_back(sz);
+        } else {
+          access_tile_sizes.push_back(1);
+        }
+      }
     }
 
     // Get the FIFO slot from ktdf.private results.
     mlir::Value fifo_slot = private_op.getResult(private_result_offset + i);
 
     // The fifo side gets a null AffineMap; the access-tile (memref) side
-    // gets the linalg operand's indexing map directly. loop_ivs feeds the
-    // map's dim inputs.
+    // gets the source_map built above. loop_ivs feeds the map's dim inputs.
     mlir::AffineMap null_map;
     if (is_load) {
       mlir::ktdf::DataTransferOp::create(builder, loc, access_tile_value,
-                                         *indexing_map, loop_ivs,
+                                         *source_map, loop_ivs,
                                          access_tile_sizes, fifo_slot, null_map,
                                          mlir::ValueRange{}, fifo_sizes);
     } else {
       mlir::ktdf::DataTransferOp::create(
           builder, loc, fifo_slot, null_map, mlir::ValueRange{}, fifo_sizes,
-          access_tile_value, *indexing_map, loop_ivs, access_tile_sizes);
+          access_tile_value, *source_map, loop_ivs, access_tile_sizes);
     }
   }
 }
@@ -1062,6 +1288,176 @@ ConstructThreeStagePipelinePass::getStridesFromMemRefType(
     }
   }
   return strides;
+}
+
+void ConstructThreeStagePipelinePass::createPostLoopStorePipeline(
+    mlir::ktdp::StoreOp store_op, mlir::scf::ForOp enclosing_n_loop) {
+  // Gap 5: emit a ktdf.pipeline after the reduction loop for the post-loop
+  // ktdp.store.  The pipeline has a compute stage (write_to_fifo of the
+  // accumulated tensor) and a store stage (data_transfer from the FIFO slot to
+  // the HBM output tile).
+  //
+  // The access tile for the store is left as-is here; it will be replaced by
+  // memref.reinterpret_cast when replaceAccessTilesWithReinterpretCast runs
+  // (after all pipelines have been created), consistent with how the load
+  // pipelines are handled.
+
+  mlir::MLIRContext* ctx = &getContext();
+  mlir::Location loc = store_op.getLoc();
+
+  // The tensor being stored and the access tile receiving it.
+  mlir::Value data_tensor = store_op.getDataTile();  // tensor<1x64xf16>
+  mlir::Value access_tile_value = store_op.getAccessTile();
+
+  auto tensor_type =
+      mlir::dyn_cast<mlir::RankedTensorType>(data_tensor.getType());
+  if (!tensor_type) {
+    store_op.emitError("post-loop store data is not a ranked tensor");
+    signalPassFailure();
+    return;
+  }
+
+  // Determine FIFO slot type: compute unit → memory (same direction as store).
+  auto [store_src_attr, store_dest_attr] = getFifoAttributesForStore(store_op);
+  mlir::Type elem_type = tensor_type.getElementType();
+  // FIFO element count = product of tensor shape (e.g. 1*64 = 64 elements).
+  int64_t fifo_elems = 1;
+  for (int64_t d : tensor_type.getShape()) fifo_elems *= d;
+  auto fifo_slot_type = mlir::ktdf::FifoSlotType::get(
+      ctx, store_src_attr, store_dest_attr, fifo_elems, elem_type);
+  auto token_type = mlir::ktdf::TokenType::get(ctx);
+
+  // Build the source_map for the data_transfer: maps the enclosing loop IVs
+  // to the access tile's coordinates. Collect the loop IVs from the outer
+  // loops of the post-loop store (i.e. the N-stick loop).
+  llvm::SmallVector<mlir::Value> outer_loop_ivs;
+  for (mlir::Operation* p = store_op->getParentOfType<mlir::scf::ForOp>(); p;
+       p = p->getParentOfType<mlir::scf::ForOp>()) {
+    outer_loop_ivs.push_back(
+        mlir::cast<mlir::scf::ForOp>(p).getInductionVar());
+  }
+  std::reverse(outer_loop_ivs.begin(), outer_loop_ivs.end());
+
+  // Detect model-A for this store tile (HBM → model-A).
+  bool is_post_loop_model_a = false;
+  if (auto access_tile_op =
+          access_tile_value
+              .getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
+    mlir::Value mem_view = access_tile_op.getBase();
+    if (auto cmv = mlir::dyn_cast_or_null<mlir::ktdp::ConstructMemoryViewOp>(
+            mem_view.getDefiningOp())) {
+      mlir::Attribute mapped_ms = mapMemorySpace(cmv.getMemorySpaceAttr());
+      if (auto ms_str = mlir::dyn_cast<mlir::StringAttr>(mapped_ms)) {
+        llvm::StringRef ms = ms_str.getValue();
+        is_post_loop_model_a = (ms != "LX" && ms != "lrfreg");
+      }
+    }
+  }
+
+  // Build the source_map from the access tile's index structure.
+  std::optional<mlir::AffineMap> source_map;
+  if (auto access_tile_op =
+          access_tile_value
+              .getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
+    source_map = buildSourceMapFromAccessTile(access_tile_op, outer_loop_ivs,
+                                              ctx, is_post_loop_model_a);
+  }
+  if (!source_map) {
+    // Fallback: constant 0 map (all dims at offset 0 within the tile).
+    unsigned memref_rank =
+        mlir::dyn_cast<mlir::MemRefType>(
+            mlir::dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
+                access_tile_value.getDefiningOp())
+                ->getResult(0)
+                .getType())
+            .getRank();
+    llvm::SmallVector<mlir::AffineExpr> zeros(
+        memref_rank, mlir::getAffineConstantExpr(0, ctx));
+    source_map = mlir::AffineMap::get(outer_loop_ivs.size(), 0, zeros, ctx);
+  }
+
+  // Derive access tile sizes from the access tile type shape.
+  // For model-A (1-result source_map), the dest is a 1-D stick; use just
+  // the lane count (last dim).
+  llvm::SmallVector<int64_t> access_tile_sizes;
+  if (auto access_tile_op =
+          access_tile_value
+              .getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
+    auto at_type = mlir::dyn_cast<mlir::ktdp::AccessTileType>(
+        access_tile_op.getResult().getType());
+    if (at_type) {
+      if (source_map && source_map->getNumResults() == 1) {
+        // Model A: 1-D dest — just the lane count.
+        access_tile_sizes = {at_type.getShape().back()};
+      } else {
+        access_tile_sizes.assign(at_type.getShape().begin(),
+                                 at_type.getShape().end());
+      }
+    }
+  }
+  if (access_tile_sizes.empty()) {
+    for (int64_t d : tensor_type.getShape())
+      access_tile_sizes.push_back(d);
+  }
+  llvm::SmallVector<int64_t> fifo_sizes = {fifo_elems};
+
+  // Insert the post-loop pipeline right before the store_op.
+  mlir::OpBuilder builder(store_op);
+
+  mlir::ktdf::PipelineOp::create(
+      builder, loc,
+      [&](mlir::OpBuilder& builder, mlir::Location loc) {
+        // ktdf.private: 1 FIFO slot + 2 tokens (compute → store).
+        auto private_op = mlir::ktdf::PrivateOp::create(
+            builder, loc,
+            mlir::TypeRange{fifo_slot_type, token_type, token_type});
+        {
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          mlir::Block* pb = &private_op.getRegion().front();
+          builder.setInsertionPointToStart(pb);
+          auto fifo_alloc = mlir::ktdf::FifoAllocateOp::create(
+              builder, loc, mlir::TypeRange{fifo_slot_type},
+              mlir::ValueRange{});
+          auto tok0 = mlir::ktdf::CreateTokenOp::create(
+              builder, loc, token_type);
+          auto tok1 = mlir::ktdf::CreateTokenOp::create(
+              builder, loc, token_type);
+          mlir::ktdf::PrivateYieldOp::create(
+              builder, loc,
+              mlir::ValueRange{fifo_alloc.getResult(0), tok0.getResult(),
+                               tok1.getResult()});
+        }
+        // Indices: private_op result 0 = FIFO slot, 1 = tok0, 2 = tok1.
+        mlir::Value fifo_slot = private_op.getResult(0);
+        mlir::Value tok0 = private_op.getResult(1);
+        mlir::Value tok1 = private_op.getResult(2);
+
+        // Stage 1 (compute): write the accumulated tensor to the FIFO.
+        // This stage acts as the "compute" stage that makes the result
+        // available to the store unit via the FIFO queue.
+        mlir::ktdf::StageOp::create(
+            builder, loc, /*depends_in=*/{}, /*depends_out=*/{tok0},
+            [&](mlir::OpBuilder& builder, mlir::Location loc) {
+              mlir::ktdf::WriteToFifoOp::create(builder, loc, data_tensor,
+                                                fifo_slot);
+            })
+            .setApplicableUnitsAttr(
+                builder.getArrayAttr(resource_kinds_->getComputeKind()));
+
+        // Stage 2 (store): data_transfer from FIFO to the output tile.
+        mlir::ktdf::StageOp::create(
+            builder, loc, /*depends_in=*/{tok0}, /*depends_out=*/{tok1},
+            [&](mlir::OpBuilder& builder, mlir::Location loc) {
+              mlir::AffineMap null_map;
+              mlir::ktdf::DataTransferOp::create(
+                  builder, loc, fifo_slot, null_map, mlir::ValueRange{},
+                  fifo_sizes, access_tile_value, *source_map, outer_loop_ivs,
+                  access_tile_sizes);
+            });
+      });
+
+  // Mark the original store op for deletion.
+  ops_to_delete_.push_back(store_op.getOperation());
 }
 
 }  // namespace
@@ -1135,21 +1531,43 @@ void ConstructThreeStagePipelinePass::createComputeOps(
   LLVM_DEBUG(llvm::dbgs() << "  Cloning compute op: " << compute_op->getName()
                           << "\n");
 
-  // Create a dummy tensor.empty for the output operand with the tiled tensor
-  // type
-  auto empty_tensor =
-      mlir::tensor::EmptyOp::create(builder, loc, tiled_tensor_type.getShape(),
-                                    tiled_tensor_type.getElementType());
-
-  // Map the output extract_slice to the empty tensor
+  // Map the DPS output operand.
+  //
+  // Elementwise case (no lrf_acc_buf_): map DPS init → tensor.empty so the
+  // compute stage has a fresh output buffer.
+  //
+  // Reduction case (lrf_acc_buf_ set): convert the LRF alloca buffer to a
+  // tensor (bufferization.to_tensor) and use it as the DPS init
+  // (read-modify-write: read current acc, compute new value, write back).
   auto linalg_op =
       mlir::dyn_cast<mlir::linalg::LinalgOp>(compute_op.getOperation());
   if (linalg_op && linalg_op.getNumDpsInits() > 0) {
     mlir::Value output_operand = linalg_op.getDpsInitOperand(0)->get();
-    mapper.map(output_operand, empty_tensor.getResult());
+
+    if (lrf_acc_buf_) {
+      // Reduction: read the current accumulator value from the LRF alloca.
+      auto lrf_tensor = mlir::bufferization::ToTensorOp::create(
+          builder, loc, tiled_tensor_type, lrf_acc_buf_,
+          /*restrict=*/true, /*writable=*/false);
+      mapper.map(output_operand, lrf_tensor.getResult());
+    } else {
+      // Elementwise: no accumulator; use a fresh empty tensor.
+      auto empty_tensor = mlir::tensor::EmptyOp::create(
+          builder, loc, tiled_tensor_type.getShape(),
+          tiled_tensor_type.getElementType());
+      mapper.map(output_operand, empty_tensor.getResult());
+    }
   }
 
   auto* cloned = builder.clone(*compute_op, mapper);
+
+  // For the reduction case: write the updated accumulator back to the LRF
+  // alloca so the next iteration reads the updated value.
+  if (lrf_acc_buf_) {
+    mlir::bufferization::MaterializeInDestinationOp::create(
+        builder, loc, /*result=*/mlir::Type{}, cloned->getResult(0),
+        lrf_acc_buf_, /*restrict=*/false, /*writable=*/true);
+  }
 
   // Create ktdf.write_to_fifo for each store operation
   for (size_t i = 0; i < store_ops_.size(); ++i) {
@@ -1358,27 +1776,80 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
     llvm::ArrayRef<int64_t> tile_shape = access_tile_type.getShape();
     llvm::SmallVector<int64_t> tile_dims(tile_shape.begin(), tile_shape.end());
 
-    // Get strides from memory view type
+    // Get strides from the originating ktdp.construct_memory_view's
+    // static_strides attribute.  These are the logical strides as committed
+    // in the KTIR (matching data_dti.json stride_map), which differ from the
+    // row-major default whenever the tensor layout is non-contiguous in the
+    // index space (e.g. a[2x256x64] with strides [64,128,1] vs row-major
+    // [16384,64,1]).  Falling back to the memref type's layout would silently
+    // produce wrong strides in those cases.
     llvm::SmallVector<int64_t> strides;
-    if (auto strided_layout = mlir::dyn_cast<mlir::StridedLayoutAttr>(
-            memory_view_type.getLayout())) {
-      strides.assign(strided_layout.getStrides().begin(),
-                     strided_layout.getStrides().end());
-    } else {
-      // Default strides for row-major layout
-      int64_t stride = 1;
-      for (int i = memory_view_type.getRank() - 1; i >= 0; --i) {
-        strides.insert(strides.begin(), stride);
-        stride *= memory_view_type.getShape()[i];
+    {
+      auto construct_mv_op = mlir::dyn_cast<mlir::ktdp::ConstructMemoryViewOp>(
+          memory_view.getDefiningOp());
+      bool got_strides = false;
+      if (construct_mv_op) {
+        // static_strides is the DenseI64ArrayAttr on the op.
+        auto static_strides_attr =
+            construct_mv_op->getAttrOfType<mlir::DenseI64ArrayAttr>(
+                "static_strides");
+        if (static_strides_attr) {
+          strides.assign(static_strides_attr.asArrayRef().begin(),
+                         static_strides_attr.asArrayRef().end());
+          got_strides = true;
+        }
+      }
+      if (!got_strides) {
+        // Fallback: try the memref type's layout, then row-major.
+        if (auto strided_layout = mlir::dyn_cast<mlir::StridedLayoutAttr>(
+                memory_view_type.getLayout())) {
+          strides.assign(strided_layout.getStrides().begin(),
+                         strided_layout.getStrides().end());
+        } else {
+          int64_t stride = 1;
+          for (int i = memory_view_type.getRank() - 1; i >= 0; --i) {
+            strides.insert(strides.begin(), stride);
+            stride *= memory_view_type.getShape()[i];
+          }
+        }
       }
     }
 
-    builder.setInsertionPoint(insertion_point);
+    // Insert the reinterpret_cast at the very start of the block containing
+    // the access tile.  Placing it here ensures:
+    //   1. All loop IVs used as access-tile indices dominate this point
+    //      (they are block args of the same block or enclosing blocks).
+    //   2. The reinterpret_cast dominates any ktdf.pipeline ops in the same
+    //      block that were inserted at the block's start and hold a
+    //      data_transfer referencing this access tile's result.
+    // Using a single global insertion_point (e.g. tiled_loops_.front()) would
+    // place the offset arithmetic OUTSIDE the loop that defines the IVs.
+    mlir::Block* tile_block = access_tile->getBlock();
+    // Find the first op in the block that has a user of this access tile's
+    // result; insert just before that op so we remain as late as possible while
+    // still dominating all uses.  Fall back to the block's first op.
+    mlir::Operation* best_ip = &tile_block->front();
+    for (mlir::Operation& op : *tile_block) {
+      bool uses_tile = false;
+      for (mlir::Value operand : op.getOperands()) {
+        if (operand == access_tile.getResult()) { uses_tile = true; break; }
+      }
+      // Also check nested regions (e.g. ktdf.pipeline)
+      op.walk([&](mlir::Operation* nested) {
+        for (mlir::Value operand : nested->getOperands()) {
+          if (operand == access_tile.getResult()) uses_tile = true;
+        }
+      });
+      if (uses_tile) { best_ip = &op; break; }
+    }
+    builder.setInsertionPoint(best_ip);
     mlir::Location loc = access_tile.getLoc();
 
-    // Move the memory view operation right before the insertion point to ensure
-    // it dominates the reinterpret_cast
-    memory_view.getDefiningOp()->moveBefore(insertion_point);
+    // Move the memory view operation to the same insertion point if it lives
+    // in the same block (ensures the cast source is textually before the cast).
+    if (memory_view.getDefiningOp()->getBlock() == tile_block) {
+      memory_view.getDefiningOp()->moveBefore(best_ip);
+    }
 
     // Apply base_map to materialize one index per source-memref dimension.
     // Operands to expandAffineMap are dim-values followed by symbol-values; the
@@ -1442,9 +1913,46 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
     auto memory_space_cast = mlir::memref::MemorySpaceCastOp::create(
         builder, loc, cast_source_type, memory_view);
 
-    llvm::SmallVector<int64_t> result_shape(tile_dims.begin(), tile_dims.end());
-    mlir::StridedLayoutAttr strided_layout = mlir::StridedLayoutAttr::get(
-        builder.getContext(), mlir::ShapedType::kDynamic, strides);
+    // Model-A applies only to global (HBM) memory tiles: the L3 view start
+    // address must be a compile-time constant (dcc-l3-model-a-immutable-addr)
+    // and the per-tile dynamic offset goes into the composite subscript.
+    // Per-core (LX) tiles use model-B (offset baked into the view start addr).
+    //
+    // Detect by checking whether the mapped memory space is NOT a per-core
+    // scratchpad (LX) or compute-local (lrfreg) space.
+    bool is_model_a_source = false;
+    {
+      auto mapped_str = mlir::dyn_cast<mlir::StringAttr>(mapped_memory_space);
+      if (mapped_str) {
+        llvm::StringRef ms = mapped_str.getValue();
+        // Per-core: "LX" (local SRAM scratchpad). Compute-local: "lrfreg".
+        // Everything else (e.g., "HBM", "DDR") is global → model A.
+        is_model_a_source = (ms != "LX" && ms != "lrfreg");
+      }
+    }
+
+    llvm::SmallVector<int64_t> result_shape;
+    llvm::SmallVector<mlir::OpFoldResult> rc_sizes;
+    llvm::SmallVector<mlir::OpFoldResult> rc_strides;
+    if (is_model_a_source) {
+      // 1-D cast: just the lane dimension (last dim of tile, stride 1).
+      int64_t lane_count = tile_dims.back();
+      result_shape = {lane_count};
+      rc_sizes = {builder.getIndexAttr(lane_count)};
+      rc_strides = {builder.getIndexAttr(1)};
+    } else {
+      result_shape.assign(tile_dims.begin(), tile_dims.end());
+      rc_sizes = sizes;
+      rc_strides = reinterpret_strides;
+    }
+    mlir::StridedLayoutAttr strided_layout;
+    if (is_model_a_source) {
+      strided_layout = mlir::StridedLayoutAttr::get(
+          builder.getContext(), mlir::ShapedType::kDynamic, {1});
+    } else {
+      strided_layout = mlir::StridedLayoutAttr::get(
+          builder.getContext(), mlir::ShapedType::kDynamic, strides);
+    }
     mlir::MemRefType result_type =
         mlir::MemRefType::get(result_shape, memory_view_type.getElementType(),
                               strided_layout, mapped_memory_space);
@@ -1452,7 +1960,7 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
     mlir::OpFoldResult offset_fold_result(offset);
     auto cast_op = mlir::memref::ReinterpretCastOp::create(
         builder, loc, result_type, memory_space_cast.getResult(),
-        offset_fold_result, sizes, reinterpret_strides);
+        offset_fold_result, rc_sizes, rc_strides);
     // Replace access tile with reinterpret_cast
     access_tile.replaceAllUsesWith(cast_op.getResult());
     ops_to_delete_.push_back(access_tile.getOperation());
@@ -1490,9 +1998,46 @@ void ConstructThreeStagePipelinePass::runOnFunc(mlir::func::FuncOp func_op) {
   DEBUG_WITH_TYPE(VerboseDebug, llvm::dbgs() << "After fusion:\n"
                                              << func_op << "\n\n");
 
-  // Collect ktdp load/store operations and linalg operations
+  // Matmul / reduction path: rewrite the K-loop tensor iter_arg accumulator
+  // into a compute-local (LRF) memref RMW with an scf.if first-tile seed (the
+  // ktdf.pipeline cannot carry a loop-result accumulator). The subsequent
+  // pipeline construction then wraps only the HBM A/W loads and C store; the
+  // LRF accumulator RMW is left in place (pass 20 lowers it to vector_load/
+  // store on the lrfreg unit).
+  // Detect the K-reduction loop BEFORE rewriteReductionAccumulator, while the
+  // original tensor iter_arg still ties the matmul to the K-loop. After the
+  // rewrite the matmul's DPS init is changed to an scf.if result, so the
+  // iter_arg linkage is lost and detection would fail.
+  mlir::scf::ForOp reduction_loop;
+  func_op.walk([&](mlir::scf::ForOp for_op) {
+    if (for_op.getNumRegionIterArgs() == 0) return;
+    mlir::Value iter_arg = for_op.getRegionIterArg(0);
+    if (!mlir::isa<mlir::RankedTensorType>(iter_arg.getType())) return;
+    for_op.getBody()->walk([&](mlir::linalg::LinalgOp lop) {
+      for (mlir::Value init : lop.getDpsInits()) {
+        if (init == iter_arg) reduction_loop = for_op;
+      }
+    });
+  });
+  reduction_loop_ = reduction_loop;  // save for createLoopsFromLinalg
+
+  // Now rewrite the accumulator (changes the matmul's DPS init, so must come
+  // after detection above).
+  rewriteReductionAccumulator(func_op);
+
+  // For a reduction (matmul), collect only ops inside the K-loop body:
+  // - HBM loads (A/W) live inside K-loop and feed the compute stage.
+  // - The K-loop matmul is the pipelined compute op.
+  // - The C store / truncf live OUTSIDE the K-loop; they must NOT be collected
+  //   (the C-write is handled as raw ktdp ops that pass-3+ address-assigns).
+
   llvm::SmallVector<mlir::linalg::LinalgOp> linalg_ops;
-  func_op.walk([&](mlir::Operation* op) {
+  // Use reduction_loop scope if found; fall back to func-wide walk otherwise
+  // (covers the elementwise/add case where there is no enclosing K-loop).
+  auto collect_scope = reduction_loop_
+                           ? static_cast<mlir::Operation*>(reduction_loop_)
+                           : static_cast<mlir::Operation*>(func_op);
+  collect_scope->walk([&](mlir::Operation* op) {
     if (auto load_op = mlir::dyn_cast<mlir::ktdp::LoadOp>(op)) {
       load_ops_.push_back(load_op);
       ops_to_delete_.push_back(op);
@@ -1514,6 +2059,24 @@ void ConstructThreeStagePipelinePass::runOnFunc(mlir::func::FuncOp func_op) {
   if (!tiled_loops_.empty()) {
     auto innermost_loop = llvm::cast<mlir::scf::ForOp>(tiled_loops_.back());
     createPipeline(innermost_loop);
+  }
+
+  // Step 4b (Gap 5): For reduction ops, wrap any ktdp.store ops that live
+  // OUTSIDE the reduction loop body in their own ktdf.pipeline (post-loop
+  // store pipeline for the accumulated output).
+  if (reduction_loop_) {
+    llvm::SmallVector<std::pair<mlir::ktdp::StoreOp, mlir::scf::ForOp>>
+        post_loop_stores;
+    func_op.walk([&](mlir::ktdp::StoreOp store_op) {
+      // Only collect stores that are NOT inside the reduction loop body.
+      if (reduction_loop_->isProperAncestor(store_op)) return;
+      // Find the enclosing N-stick loop (parent scf.for of the store_op).
+      auto enc = store_op->getParentOfType<mlir::scf::ForOp>();
+      post_loop_stores.push_back({store_op, enc});
+    });
+    for (auto& [s, enc_loop] : post_loop_stores) {
+      createPostLoopStorePipeline(s, enc_loop);
+    }
   }
 
   DEBUG_WITH_TYPE(VerboseDebug, llvm::dbgs() << "After pipeline created:\n"

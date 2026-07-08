@@ -27,6 +27,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Pass/Pass.h"
 
 #define PASS_NAME "ktir-legality-check"
@@ -42,10 +43,33 @@ namespace scheduler {
 namespace {
 
 // A scalar op inside a linalg.generic body is legal iff it is one of the
-// add/mul/sub float arith ops the backend lowers, or the yield terminator.
+// add/mul/sub float arith ops the backend lowers, an fp16<->fp32 ext/trunc
+// (matmul accumulates in fp32), or the yield terminator.
 bool isLegalGenericBodyOp(mlir::Operation* op) {
   return mlir::isa<mlir::arith::AddFOp, mlir::arith::MulFOp,
-                   mlir::arith::SubFOp, mlir::linalg::YieldOp>(op);
+                   mlir::arith::SubFOp, mlir::arith::ExtFOp,
+                   mlir::arith::TruncFOp, mlir::linalg::YieldOp>(op);
+}
+
+// A reduction-accumulation loop is an `scf.for` carrying exactly one tensor
+// iter_arg that a linalg contraction/reduction accumulates into (its `outs`
+// init is the iter_arg) and yields. This is the matmul K-loop shape; it is the
+// only loop-carried form V1 now admits (the accumulator is later materialized
+// into a compute-local memref, not a real loop-carried SSA value).
+bool isReductionAccumulationLoop(mlir::scf::ForOp forOp) {
+  if (forOp.getNumRegionIterArgs() != 1) return false;
+  mlir::Value iterArg = forOp.getRegionIterArg(0);
+  if (!mlir::isa<mlir::RankedTensorType>(iterArg.getType())) return false;
+  auto yield =
+      mlir::cast<mlir::scf::YieldOp>(forOp.getBody()->getTerminator());
+  if (yield.getNumOperands() != 1) return false;
+  mlir::Operation* def = yield.getOperand(0).getDefiningOp();
+  if (!def) return false;
+  auto dps = mlir::dyn_cast<mlir::DestinationStyleOpInterface>(def);
+  if (!dps) return false;
+  for (mlir::Value init : dps.getDpsInits())
+    if (init == iterArg) return true;
+  return false;
 }
 
 struct KTIRLegalityCheckPass
@@ -56,12 +80,15 @@ struct KTIRLegalityCheckPass
 
     module.walk<mlir::WalkOrder::PreOrder>([&](mlir::Operation* op)
                                                -> mlir::WalkResult {
-      // Rule 1: loop-carried control flow.
+      // Rule 1: loop-carried control flow. Reject iter_args EXCEPT the matmul
+      // K-reduction accumulation loop (one tensor accumulator threaded through
+      // a contraction); that form is lowered to a compute-local accumulator.
       if (auto forOp = mlir::dyn_cast<mlir::scf::ForOp>(op)) {
-        if (forOp.getNumRegionIterArgs() > 0) {
+        if (forOp.getNumRegionIterArgs() > 0 &&
+            !isReductionAccumulationLoop(forOp)) {
           forOp.emitError(
               "V1 does not support scf.for with loop-carried arguments "
-              "(iter_args)");
+              "(iter_args) unless it is a reduction-accumulation loop");
           failed = true;
           return mlir::WalkResult::interrupt();
         }
@@ -112,7 +139,8 @@ struct KTIRLegalityCheckPass
           return mlir::WalkResult::skip();
         }
         if (mlir::isa<mlir::linalg::AddOp, mlir::linalg::MulOp,
-                      mlir::linalg::SubOp, mlir::linalg::YieldOp>(op)) {
+                      mlir::linalg::SubOp, mlir::linalg::MatmulOp,
+                      mlir::linalg::YieldOp>(op)) {
           return mlir::WalkResult::advance();
         }
         // Any other named linalg op is unsupported.
