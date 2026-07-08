@@ -1958,8 +1958,16 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
     //
     // Detect by checking whether the mapped memory space is NOT a per-core
     // scratchpad (LX) or compute-local (lrfreg) space.
+    //
+    // TEMPORARY (pending addressing redesign): gate the model-A rank-1 collapse
+    // on reduction functions only. Elementwise HBM tiles have access-tile
+    // indices that are NOT the pipeline loop IVs, so buildSourceMapFromAccessTile
+    // returns nullopt and the linalg fallback yields a rank-N source_map — which
+    // mismatches a rank-1 collapsed cast. Gating on reduction_loop_ keeps
+    // elementwise on the rank-N model-B path (matches baseline) while the
+    // reduction keeps the coherent rank-1 + 1-result-flat model-A path.
     bool has_invariant_base_source = false;
-    {
+    if (reduction_loop_) {
       auto mapped_str = mlir::dyn_cast<mlir::StringAttr>(mapped_memory_space);
       if (mapped_str) {
         llvm::StringRef ms = mapped_str.getValue();

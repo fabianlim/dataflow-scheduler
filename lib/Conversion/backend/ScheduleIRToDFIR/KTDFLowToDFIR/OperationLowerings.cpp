@@ -177,7 +177,12 @@ struct LowerWriteToFifoPattern
     // is insert_slice(to_tensor(lrfreg view)) — a tensor that no other pattern
     // vectorizes. Load the accumulator from its view as a vector and bypass the
     // insert_slice (the FIFO/send flattens to the lane count anyway).
-    mlir::Value data = write_op.getData();
+    //
+    // Use the raw operand rather than getData(): by this phase the compute
+    // linalg may already be vectorized, so the operand can be a vector (the
+    // tensor-typed getData() accessor would assert). getFlattenedVectorType
+    // below handles both tensor and vector.
+    mlir::Value data = write_op->getOperand(0);
     if (auto acc_view = getLrfregViewFromInsertSlice(data))
       data = emitLrfregVectorLoad(rewriter, write_op.getLoc(), acc_view);
 
