@@ -43,12 +43,10 @@ namespace scheduler {
 namespace {
 
 // A scalar op inside a linalg.generic body is legal iff it is one of the
-// add/mul/sub float arith ops the backend lowers, an fp16<->fp32 ext/trunc
-// (reduction accumulates in fp32), or the yield terminator.
+// float arith ops the backend lowers, or the yield terminator.
 bool isLegalGenericBodyOp(mlir::Operation* op) {
   return mlir::isa<mlir::arith::AddFOp, mlir::arith::MulFOp,
-                   mlir::arith::SubFOp, mlir::arith::ExtFOp,
-                   mlir::arith::TruncFOp, mlir::linalg::YieldOp>(op);
+                   mlir::arith::SubFOp, mlir::linalg::YieldOp>(op);
 }
 
 // A reduction-accumulation loop is an `scf.for` carrying exactly one tensor
@@ -139,7 +137,7 @@ struct KTIRLegalityCheckPass
           return mlir::WalkResult::skip();
         }
         if (mlir::isa<mlir::linalg::AddOp, mlir::linalg::MulOp,
-                      mlir::linalg::SubOp, mlir::linalg::MatmulOp,
+                      mlir::linalg::SubOp,
                       mlir::linalg::YieldOp>(op)) {
           return mlir::WalkResult::advance();
         }
