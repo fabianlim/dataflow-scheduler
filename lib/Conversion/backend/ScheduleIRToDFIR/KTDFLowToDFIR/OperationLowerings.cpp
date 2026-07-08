@@ -42,7 +42,11 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -52,6 +56,11 @@
 using namespace scheduler;
 
 namespace {
+
+// Defined below; forward-declared so LowerWriteToFifoPattern can vector_load the
+// post-loop reduction accumulator from its lrfreg view.
+static mlir::Value emitVectorLoad(mlir::OpBuilder& builder, mlir::Location loc,
+                                  mlir::Value view);
 
 /// Pattern to lower ktdf.read_from_fifo operations
 struct LowerReadFromFifoPattern
@@ -152,9 +161,29 @@ struct LowerWriteToFifoPattern
     auto fifo_slot_type =
         llvm::cast<mlir::ktdf::FifoSlotType>(write_op.getFifoSlot().getType());
 
+    // Resolve the data to send. Post-loop reduction accumulator store: the data
+    // is insert_slice(to_tensor(lrfreg view)) — a tensor that no other pattern
+    // vectorizes. Load the accumulator from its view as a vector and bypass the
+    // insert_slice (the FIFO/send flattens to the lane count anyway). The lrfreg
+    // view is recognized by its backing get_local_unit {name="lrfreg"}.
+    mlir::Value data = write_op.getData();
+    if (auto ins = data.getDefiningOp<mlir::tensor::InsertSliceOp>()) {
+      if (auto tt =
+              ins.getSource().getDefiningOp<mlir::bufferization::ToTensorOp>()) {
+        if (auto view = tt.getBuffer()
+                            .getDefiningOp<mlir::dataflow::GetLogicalMemoryViewOp>()) {
+          if (auto lu = view.getFromUnit()
+                            .getDefiningOp<mlir::dataflow::GetLocalUnitOp>()) {
+            if (lu.getName() == "lrfreg") {
+              data = emitVectorLoad(rewriter, write_op.getLoc(), tt.getBuffer());
+            }
+          }
+        }
+      }
+    }
+
     // Convert data type (tensor or vector) to flattened vector type
-    auto vector_type =
-        getFlattenedVectorType(write_op.getData().getType(), resource_kinds_);
+    auto vector_type = getFlattenedVectorType(data.getType(), resource_kinds_);
     if (!vector_type) {
       return mlir::failure();
     }
@@ -197,7 +226,7 @@ struct LowerWriteToFifoPattern
 
     // Create dataflow.send operation
     mlir::dataflow::SendOp::create(rewriter, write_op.getLoc(), queried_unit,
-                                   write_op.getData(), /*dir=*/nullptr,
+                                   data, /*dir=*/nullptr,
                                    /*dbgName=*/nullptr);
 
     // Erase the write_to_fifo operation
@@ -432,6 +461,95 @@ struct LowerSignalPattern
   }
 };
 
+/// Build IntegerSet for a 1-D vector-access constraint: d0 in [0, 63].
+static mlir::IntegerSet buildLoadStoreSet1D(mlir::MLIRContext* ctx) {
+  auto d0 = mlir::getAffineDimExpr(0, ctx);
+  // d0 >= 0  &&  -d0 + 63 >= 0
+  return mlir::IntegerSet::get(1, 0, {d0, -d0 + 63}, {/*eq=*/false, /*eq=*/false});
+}
+
+/// Emit agen.vector_load at `view` with index 0.
+/// Returns the loaded vector value.
+static mlir::Value emitVectorLoad(mlir::OpBuilder& builder, mlir::Location loc,
+                                  mlir::Value view) {
+  auto* ctx = builder.getContext();
+  auto memref_type = mlir::cast<mlir::MemRefType>(view.getType());
+  auto shape = memref_type.getShape();
+  assert(shape.size() == 1 && "expected 1-D lrfreg view");
+  int64_t num_elems = shape[0];
+  auto elem_type = memref_type.getElementType();
+  auto vector_type = mlir::VectorType::get({num_elems}, elem_type);
+  auto identity1d = mlir::AffineMap::getMultiDimIdentityMap(1, ctx);
+  auto load_set = buildLoadStoreSet1D(ctx);
+  mlir::Value c0 = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
+  return mlir::agen::VectorLoadOp::create(builder, loc, vector_type, view,
+                                          /*dbgName=*/nullptr, identity1d,
+                                          mlir::ValueRange{c0}, load_set,
+                                          identity1d)
+      .getResult();
+}
+
+/// Emit agen.vector_store of `vec` to `view` at index 0.
+static void emitVectorStore(mlir::OpBuilder& builder, mlir::Location loc,
+                             mlir::Value vec, mlir::Value view) {
+  auto* ctx = builder.getContext();
+  auto identity1d = mlir::AffineMap::getMultiDimIdentityMap(1, ctx);
+  auto store_set = buildLoadStoreSet1D(ctx);
+  mlir::Value c0 = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
+  mlir::agen::VectorStoreOp::create(builder, loc, vec, view,
+                                    /*dbgName=*/nullptr, identity1d,
+                                    mlir::ValueRange{c0}, store_set, identity1d);
+}
+
+/// Piece 3, Phase A (before applyPatternsGreedily):
+/// Lower bufferization.materialize_in_destination(%const_tensor, %view)
+///   where source is a dense constant (site #1: the zero-seed) -> agen.vector_store.
+/// Site #2 (to_tensor) is now handled by LinalgLowering (Change 1).
+/// Non-constant materialize_in_destination ops (site #3) are now handled
+/// by LinalgLowering (Change 1) and no longer appear here.
+static mlir::LogicalResult lowerLrfregBufferizationOpsPhaseA(
+    mlir::func::FuncOp func) {
+  mlir::OpBuilder builder(func.getContext());
+
+  llvm::SmallVector<mlir::bufferization::MaterializeInDestinationOp>
+      materialize_ops;
+
+  func.walk([&](mlir::bufferization::MaterializeInDestinationOp mid) {
+    if (mlir::isa<mlir::MemRefType>(mid.getDest().getType()))
+      materialize_ops.push_back(mid);
+  });
+
+  // Lower materialize_in_destination -> vector_store, ONLY when the
+  // source is a dense constant (the zero-seed, site #1).
+  for (auto mid : materialize_ops) {
+    mlir::Value src = mid.getSource();
+    mlir::Value view = mid.getDest();
+    auto memref_type = mlir::dyn_cast<mlir::MemRefType>(view.getType());
+    if (!memref_type || memref_type.getRank() != 1) continue;
+
+    // Only lower constant-tensor sources here (the zero seed).
+    if (!mlir::isa<mlir::TensorType>(src.getType())) continue;
+    auto const_op = src.getDefiningOp<mlir::arith::ConstantOp>();
+    if (!const_op) continue;
+
+    int64_t num_elems = memref_type.getShape()[0];
+    auto elem_type = memref_type.getElementType();
+    auto vector_type = mlir::VectorType::get({num_elems}, elem_type);
+    auto dense_attr =
+        mlir::cast<mlir::DenseElementsAttr>(const_op.getValue());
+    auto vec_attr = dense_attr.reshape(vector_type);
+
+    builder.setInsertionPoint(mid);
+    mlir::Value vec =
+        mlir::arith::ConstantOp::create(builder, mid.getLoc(), vec_attr)
+            .getResult();
+    emitVectorStore(builder, mid.getLoc(), vec, view);
+    mid.erase();
+  }
+
+  return mlir::success();
+}
+
 }  // namespace
 
 mlir::LogicalResult scheduler::runOperationLowerings(
@@ -451,7 +569,15 @@ mlir::LogicalResult scheduler::runOperationLowerings(
                                    components);
   patterns.add<LowerGetTileSizePattern>(func.getContext(), scheduler_ctx,
                                         components);
-  if (mlir::failed(mlir::applyPatternsGreedily(func, std::move(patterns)))) {
+  // Disable opportunistic folding in this lowering pass: the greedy driver's
+  // fold path hits a use-after-free on the transient reduction IR (bufferization
+  // + partially-lowered linalg) present while patterns are being applied.
+  // Folding is not needed to apply these lowering patterns, and the final
+  // canonicalizeFunc (a separate step) still folds the fully-lowered IR.
+  mlir::GreedyRewriteConfig lowering_cfg;
+  lowering_cfg.enableFolding(false);
+  if (mlir::failed(
+          mlir::applyPatternsGreedily(func, std::move(patterns), lowering_cfg))) {
     return mlir::failure();
   }
 

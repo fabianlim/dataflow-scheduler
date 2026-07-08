@@ -518,22 +518,27 @@ bool ConstructThreeStagePipelinePass::rewriteReductionAccumulator(
 
   mlir::OpBuilder pre(k_loop);  // inserts before the reduction loop
 
-  // Allocate an LRF accumulator buffer using memref.alloca.
-  // Shape matches the 1-D tensor accumulator (e.g. memref<64xf16>).
-  // This avoids ktdp.construct_memory_view which downstream passes
-  // (LogicalMemoryViewBuilder) cannot handle without a full chain.
-  mlir::MemRefType lrf_buf_type = mlir::MemRefType::get(shape, elem_type);
-  auto lrf_alloca = mlir::memref::AllocaOp::create(pre, loc, lrf_buf_type,
-                                                   mlir::ValueRange{});
-  lrf_acc_buf_ = lrf_alloca.getResult();
+  // Emit the accumulator as a Source-B logical-memory-view source: an
+  // unrealized_conversion_cast(offset:index -> memref<NxT,"lrfreg">). Pass-20's
+  // LogicalMemoryViewBuilder::replaceSourceBCasts turns exactly this form into a
+  // dataflow.get_logical_memory_view (backed by get_local_unit "lrfreg" once the
+  // lrfreg resolved-unit branch is added in buildResolvedUnits). A raw
+  // memref.alloca is NOT recognized by that builder, so it must not be used.
+  // Offset 0: a single per-N-stick accumulator in the local register file.
+  mlir::Attribute lrf_space = mlir::StringAttr::get(ctx, "lrfreg");
+  mlir::MemRefType lrf_buf_type = mlir::MemRefType::get(shape, elem_type,
+                                                         /*layout=*/mlir::AffineMapAttr{},
+                                                         lrf_space);
+  mlir::Value lrf_off0 = mlir::arith::ConstantIndexOp::create(pre, loc, 0);
+  auto lrf_cast = mlir::UnrealizedConversionCastOp::create(
+      pre, loc, mlir::TypeRange{lrf_buf_type}, mlir::ValueRange{lrf_off0});
+  lrf_acc_buf_ = lrf_cast.getResult(0);
 
-  // Zero-seed the accumulator before the reduction loop.
-  // zero_init is the original iter_arg initializer (a zero constant tensor).
-  // Use bufferization.materialize_in_destination to store it into the alloca.
-  // For a memref destination, `writable` must be set (no result type).
-  mlir::bufferization::MaterializeInDestinationOp::create(
-      pre, loc, /*result=*/mlir::Type{}, zero_init, lrf_alloca.getResult(),
-      /*restrict=*/false, /*writable=*/true);
+  // Delta D-1: the constant zero-seed is REMOVED. The reduction accumulator is
+  // initialised by the peeled first iteration in the DFIR-level peel step
+  // (peelReductionComputeLoop in KTDFLowToDFIR.cpp). Storing a constant zero
+  // to an SFP-local lrfreg at pass-02 fails on HW ("ConstantBitstreamOp
+  // producers are only supported in L3"). Leave the buffer uninitialized here.
 
   // Replace uses of k_loop's SSA result (acc_final) with a post-loop memref
   // load of the alloca buffer.  After dropping the iter_arg the loop has no
@@ -542,7 +547,7 @@ bool ConstructThreeStagePipelinePass::rewriteReductionAccumulator(
   rewriter.setInsertionPointAfter(k_loop);
   // Load the accumulated result from the alloca as a tensor.
   auto post_tensor = mlir::bufferization::ToTensorOp::create(
-      rewriter, loc, acc_tensor_type, lrf_alloca.getResult(),
+      rewriter, loc, acc_tensor_type, lrf_acc_buf_,
       /*restrict=*/true, /*writable=*/false);
   k_loop->getResult(0).replaceAllUsesWith(post_tensor.getResult());
 

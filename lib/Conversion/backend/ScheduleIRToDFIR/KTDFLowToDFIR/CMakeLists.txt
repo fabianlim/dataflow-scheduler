@@ -43,4 +43,5 @@ mlir_target_link_libraries(DataflowSchedulerKTDFLowToDFIR PUBLIC
   MLIRPass
   MLIRSCFDialect
   MLIRTransformUtils
+  MLIRBufferizationDialect
 )

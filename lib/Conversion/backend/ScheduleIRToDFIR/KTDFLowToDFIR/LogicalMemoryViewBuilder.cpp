@@ -30,6 +30,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
@@ -117,10 +118,17 @@ llvm::SetVector<ResourceType> discoverAndPrune(mlir::func::FuncOp func) {
   return needed;
 }
 
+/// Returns true if ms is the compute-local "lrfreg" memory space.
+bool isLrfregSpace(mlir::Attribute ms) {
+  auto s = mlir::dyn_cast<mlir::StringAttr>(ms);
+  return s && s.getValue() == "lrfreg";
+}
+
 /// Phase 3a: resolve from_unit for each needed memory space inside a
 /// program_unit. Global spaces (DDR) are looked up directly from
 /// memory_unit_ssa. Per-core spaces (L1) get a uniform map + query emitted
-/// inside the body.
+/// inside the body. Compute-local spaces (lrfreg) use get_local_unit on the
+/// PU's instance arg (%arg0).
 mlir::LogicalResult buildResolvedUnits(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::SetVector<ResourceType>& needed_spaces,
@@ -131,7 +139,16 @@ mlir::LogicalResult buildResolvedUnits(
     mlir::OpBuilder& builder) {
   llvm::SetVector<ResourceType> per_core;
   for (auto ms : needed_spaces) {
-    if (memory_tree.isGlobalMemory(ms)) {
+    if (isLrfregSpace(ms)) {
+      // Compute-local: resolve "lrfreg" -> dataflow.get_local_unit %arg0
+      // {name="lrfreg"}. The PU instance arg is %arg0 (the first block arg of
+      // the PU region). The builder is already positioned at the PU body start.
+      mlir::Value inst = pu.getRegion().front().getArgument(0);
+      auto lu = mlir::dataflow::GetLocalUnitOp::create(
+          builder, pu.getLoc(), builder.getIndexType(), inst,
+          builder.getStringAttr("lrfreg"));
+      resolved_units[ms] = lu.getResult();
+    } else if (memory_tree.isGlobalMemory(ms)) {
       auto it = memory_unit_ssa.find({ms, -1});
       if (it == memory_unit_ssa.end())
         return pu.emitError("global memory unit SSA not found");
@@ -165,11 +182,14 @@ mlir::AffineMap buildLinearizationMap(mlir::MLIRContext* ctx,
 /// Phase 3b: replace Source A chains with get_logical_memory_view.
 /// Emits the view op and RAUWs the memref.cast result inline; does not
 /// populate `replacements` (Source A handles its own erasure).
+/// `memory_tree` is used to distinguish global (HBM) from per-core (LX)
+/// memory when selecting model-A vs model-B addressing.
 mlir::LogicalResult replaceSourceAChains(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::DenseMap<ResourceType, mlir::Value>& resolved_units,
     llvm::DenseMap<mlir::Value, mlir::Value>& replacements,
-    mlir::OpBuilder& builder) {
+    mlir::OpBuilder& builder,
+    const scheduler::arch_view::MemoryTree& memory_tree) {
   auto* ctx = pu.getContext();
 
   llvm::SmallVector<mlir::ktdp::ConstructMemoryViewOp> chains;
@@ -221,33 +241,41 @@ mlir::LogicalResult replaceSourceAChains(
     // Build layout map from static strides.
     auto layout_map = buildLinearizationMap(ctx, static_strides);
 
-    // Compute start_address = base_addr + reinterpret_offset, where the
-    // reinterpret offset may be a static constant OR a dynamic SSA value (e.g.
-    // a per-compute-tile offset). getConstifiedMixedOffset() yields an
-    // IntegerAttr for a static offset or the SSA Value for a dynamic one.
+    // Determine whether this Source-A chain uses model-A addressing.
+    // Model A applies to global memory (HBM): the L3 view start address must
+    // be a compile-time constant (dcc-l3-model-a-immutable-addr), and the
+    // per-tile dynamic offset goes into the composite subscript.
+    // Model B applies to per-core scratchpad (LX/lrfreg): the full tile offset
+    // is baked into the view start address.
+    auto view_ms = getMemorySpaceAttr(msc.getDest().getType());
+    bool is_model_a =
+        view_ms && memory_tree.isGlobalMemory(*view_ms);
+
+    // Compute start_address:
+    // - Model A: keep the plain constant base address (do NOT add reinterpret offset).
+    // - Model B: add the reinterpret_cast offset to the base (existing behavior).
     mlir::Value start_address = cmv.getOffset();
-    mlir::OpFoldResult reinterpret_offset = rc.getConstifiedMixedOffset();
     builder.setInsertionPointAfter(rc);
-    if (auto offset_attr =
-            llvm::dyn_cast<mlir::Attribute>(reinterpret_offset)) {
-      // Static offset: add a constant, skipping the no-op zero case.
-      int64_t reinterpret_offset_val =
-          llvm::cast<mlir::IntegerAttr>(offset_attr).getInt();
-      if (reinterpret_offset_val != 0) {
-        mlir::Value offset_cst = mlir::arith::ConstantIndexOp::create(
-            builder, cmv.getLoc(), reinterpret_offset_val);
+    if (!is_model_a) {
+      // Model B: add the reinterpret_cast's offset to the base address.
+      mlir::OpFoldResult reinterpret_offset = rc.getConstifiedMixedOffset();
+      if (auto offset_attr =
+              llvm::dyn_cast<mlir::Attribute>(reinterpret_offset)) {
+        int64_t reinterpret_offset_val =
+            llvm::cast<mlir::IntegerAttr>(offset_attr).getInt();
+        if (reinterpret_offset_val != 0) {
+          mlir::Value offset_cst = mlir::arith::ConstantIndexOp::create(
+              builder, cmv.getLoc(), reinterpret_offset_val);
+          start_address = mlir::arith::AddIOp::create(builder, cmv.getLoc(),
+                                                      start_address, offset_cst);
+        }
+      } else {
+        auto offset_val = llvm::cast<mlir::Value>(reinterpret_offset);
         start_address = mlir::arith::AddIOp::create(builder, cmv.getLoc(),
-                                                    start_address, offset_cst);
+                                                    start_address, offset_val);
       }
-    } else {
-      // Non-constant offset: getConstifiedMixedOffset() returns an SSA Value
-      // only when the offset cannot be folded to a constant (a foldable
-      // operand would have been promoted to an IntegerAttr above). Add the
-      // runtime value directly.
-      auto offset_val = llvm::cast<mlir::Value>(reinterpret_offset);
-      start_address = mlir::arith::AddIOp::create(builder, cmv.getLoc(),
-                                                  start_address, offset_val);
     }
+    // Model A: start_address stays as cmv.getOffset() (constant base).
 
     // Get from_unit.
     auto ms = getMemorySpaceAttr(msc.getDest().getType());
@@ -257,15 +285,26 @@ mlir::LogicalResult replaceSourceAChains(
       return cmv.emitError("no resolved unit for memory space");
     mlir::Value from_unit = it->second;
 
-    // Emit get_logical_memory_view with plain result type (no memory space,
-    // no strided layout). The builder is already positioned after rc (and after
-    // any offset arithmetic just emitted), so no setInsertionPoint needed here.
-    auto src_type = mlir::cast<mlir::MemRefType>(cmv.getResult().getType());
-    auto plain_type =
-        mlir::MemRefType::get(src_type.getShape(), src_type.getElementType());
+    // Emit get_logical_memory_view:
+    // - Model A: 1-D stick view (memref<lane x elem>, identity layout). The DMA
+    //   engine requires the L3 view to be a plain contiguous stick; the leading
+    //   size-1 dims of the tile (e.g. 1x1x64) are collapsed to the lane dim.
+    // - Model B: N-D tile view (reinterpret_cast shape), N-D linearization layout.
+    auto src_type = mlir::cast<mlir::MemRefType>(rc.getResult().getType());
+    mlir::MemRefType plain_type;
+    mlir::AffineMap view_layout;
+    if (is_model_a) {
+      int64_t lane_count = src_type.getShape().back();
+      plain_type = mlir::MemRefType::get({lane_count}, src_type.getElementType());
+      view_layout = mlir::AffineMap::getMultiDimIdentityMap(1, ctx);
+    } else {
+      plain_type =
+          mlir::MemRefType::get(src_type.getShape(), src_type.getElementType());
+      view_layout = layout_map;
+    }
     auto view_op = mlir::dataflow::GetLogicalMemoryViewOp::create(
         builder, cmv.getLoc(), plain_type, from_unit, start_address,
-        mlir::AffineMapAttr::get(layout_map));
+        mlir::AffineMapAttr::get(view_layout));
 
     // Replace all uses of the old chain tail with the new view.
     // The tail is either memref.cast (if present) or reinterpret_cast.
@@ -374,6 +413,10 @@ mlir::LogicalResult replaceSourceBCasts(
 
 /// Phase 3d: RAUW old values with new get_logical_memory_view results and
 /// propagate plain-memref types through select_memref and data_transfer.
+/// Also handles bufferization.to_tensor and
+/// bufferization.materialize_in_destination consumers (the lrfreg accumulator
+/// RMW ops emitted by pass 02) — those are lowered to agen.vector_load/store
+/// in runOperationLowerings (Piece 3).
 mlir::LogicalResult propagateTypes(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::DenseMap<mlir::Value, mlir::Value>& replacements) {
@@ -395,6 +438,13 @@ mlir::LogicalResult propagateTypes(
                 "select_memref result used by unexpected op; expected "
                 "data_transfer");
         }
+      } else if (mlir::isa<mlir::bufferization::ToTensorOp,
+                            mlir::bufferization::MaterializeInDestinationOp>(
+                     user)) {
+        // Accumulator RMW ops: update the memref operand to the plain view.
+        // These are lowered to agen.vector_load/store in runOperationLowerings
+        // before canonicalizeFunc runs.
+        user->replaceUsesOfWith(old_val, new_val);
       } else {
         return pu.emitError(
             "unexpected consumer of memory view; expected "
@@ -439,10 +489,20 @@ mlir::LogicalResult scheduler::buildLogicalMemoryViews(
   else
     builder.setInsertionPointToStart(&entry);
 
+  // Filter out compute-local spaces (lrfreg) before calling
+  // materializeMemoryUnits — those are resolved per program_unit via
+  // get_local_unit (in buildResolvedUnits), not by a global get_unit.
+  llvm::SetVector<ResourceType> materializable_spaces;
+  for (auto ms : needed_spaces) {
+    if (!isLrfregSpace(ms)) materializable_spaces.insert(ms);
+  }
+
   UnitMaterializer materializer(func);
   MemoryUnitSSAMap memory_unit_ssa;
-  if (mlir::failed(materializer.materializeMemoryUnits(
-          needed_spaces, grid_size, memory_tree, memory_unit_ssa, builder)))
+  if (!materializable_spaces.empty() &&
+      mlir::failed(materializer.materializeMemoryUnits(
+          materializable_spaces, grid_size, memory_tree, memory_unit_ssa,
+          builder)))
     return mlir::failure();
 
   // Phase 3: per-program_unit rewrites.
@@ -467,8 +527,8 @@ mlir::LogicalResult scheduler::buildLogicalMemoryViews(
     llvm::DenseMap<mlir::Value, mlir::Value> replacements;
 
     // Phase 3b: Source A chains.
-    if (mlir::failed(
-            replaceSourceAChains(pu, resolved_units, replacements, builder)))
+    if (mlir::failed(replaceSourceAChains(pu, resolved_units, replacements,
+                                          builder, memory_tree)))
       return mlir::failure();
 
     // Phase 3c: Source B casts.
