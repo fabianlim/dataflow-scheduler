@@ -20,6 +20,7 @@
 
 #include "Ktdp/KtdpOps.hpp"
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
+#include "dataflow-scheduler/Dialect/Agen/Agen.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
@@ -28,8 +29,11 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IntegerSet.h"
 
 using namespace scheduler;
 
@@ -215,6 +219,23 @@ mlir::LogicalResult scheduler::replaceComputeTileIdWithCoreQuery(
   return mlir::success();
 }
 
+mlir::IntegerSet scheduler::buildLaneIntegerSet(mlir::MLIRContext* ctx,
+                                                int64_t num_lanes) {
+  auto d0 = mlir::getAffineDimExpr(0, ctx);
+  // d0 >= 0  &&  -d0 + (num_lanes - 1) >= 0
+  return mlir::IntegerSet::get(1, 0, {d0, -d0 + (num_lanes - 1)},
+                               {/*eq=*/false, /*eq=*/false});
+}
+
+bool scheduler::isComputeLocalMemorySpace(mlir::Attribute ms) {
+  auto s = mlir::dyn_cast<mlir::StringAttr>(ms);
+  return s && s.getValue() == "lrfreg";
+}
+
+bool scheduler::isComputeLocalMemorySpace(llvm::StringRef ms) {
+  return ms == "lrfreg";
+}
+
 scheduler::DataTransferType scheduler::getDataTransferType(bool src_is_fifo,
                                                            bool dst_is_fifo) {
   // Case 1: Both source and destination are memrefs (memory to memory)
@@ -235,4 +256,38 @@ scheduler::DataTransferType scheduler::getDataTransferType(bool src_is_fifo,
   // Both source and destination are FIFO slots - unsupported
   llvm::report_fatal_error(
       "Unsupported data transfer: FIFO to FIFO transfers are not allowed");
+}
+
+mlir::Value scheduler::emitLrfregVectorLoad(mlir::OpBuilder& builder,
+                                            mlir::Location loc,
+                                            mlir::Value view) {
+  auto* ctx = builder.getContext();
+  auto memref_type = mlir::cast<mlir::MemRefType>(view.getType());
+  assert(memref_type.getRank() == 1 && "expected 1-D lrfreg view");
+  int64_t num_elems = memref_type.getShape()[0];
+  auto elem_type = memref_type.getElementType();
+  auto vector_type = mlir::VectorType::get({num_elems}, elem_type);
+  auto identity1d = mlir::AffineMap::getMultiDimIdentityMap(1, ctx);
+  auto load_set = buildLaneIntegerSet(ctx, num_elems);
+  mlir::Value c0 = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
+  return mlir::agen::VectorLoadOp::create(builder, loc, vector_type, view,
+                                          /*dbgName=*/nullptr, identity1d,
+                                          mlir::ValueRange{c0}, load_set,
+                                          identity1d)
+      .getResult();
+}
+
+void scheduler::emitLrfregVectorStore(mlir::OpBuilder& builder,
+                                      mlir::Location loc, mlir::Value vec,
+                                      mlir::Value view) {
+  auto* ctx = builder.getContext();
+  auto memref_type = mlir::cast<mlir::MemRefType>(view.getType());
+  assert(memref_type.getRank() == 1 && "expected 1-D lrfreg view");
+  int64_t num_elems = memref_type.getShape()[0];
+  auto identity1d = mlir::AffineMap::getMultiDimIdentityMap(1, ctx);
+  auto store_set = buildLaneIntegerSet(ctx, num_elems);
+  mlir::Value c0 = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
+  mlir::agen::VectorStoreOp::create(builder, loc, vec, view,
+                                    /*dbgName=*/nullptr, identity1d,
+                                    mlir::ValueRange{c0}, store_set, identity1d);
 }

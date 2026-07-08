@@ -25,6 +25,7 @@
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
 #include "dataflow-scheduler/Transforms/Utils/Utils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
@@ -118,12 +119,6 @@ llvm::SetVector<ResourceType> discoverAndPrune(mlir::func::FuncOp func) {
   return needed;
 }
 
-/// Returns true if ms is the compute-local "lrfreg" memory space.
-bool isLrfregSpace(mlir::Attribute ms) {
-  auto s = mlir::dyn_cast<mlir::StringAttr>(ms);
-  return s && s.getValue() == "lrfreg";
-}
-
 /// Phase 3a: resolve from_unit for each needed memory space inside a
 /// program_unit. Global spaces (DDR) are looked up directly from
 /// memory_unit_ssa. Per-core spaces (L1) get a uniform map + query emitted
@@ -139,7 +134,7 @@ mlir::LogicalResult buildResolvedUnits(
     mlir::OpBuilder& builder) {
   llvm::SetVector<ResourceType> per_core;
   for (auto ms : needed_spaces) {
-    if (isLrfregSpace(ms)) {
+    if (isComputeLocalMemorySpace(ms)) {
       // Compute-local: resolve "lrfreg" -> dataflow.get_local_unit %arg0
       // {name="lrfreg"}. The PU instance arg is %arg0 (the first block arg of
       // the PU region). The builder is already positioned at the PU body start.
@@ -179,17 +174,47 @@ mlir::AffineMap buildLinearizationMap(mlir::MLIRContext* ctx,
   return mlir::AffineMap::get(rank, 0, sum, ctx);
 }
 
+/// Build a 1-D lane-count get_logical_memory_view for invariant-base (HBM)
+/// addressing. The DMA engine requires the view to be a plain contiguous
+/// stick; size-1 leading dims of the tile are collapsed to the lane dim.
+static mlir::dataflow::GetLogicalMemoryViewOp buildInvariantBaseView(
+    mlir::OpBuilder& builder, mlir::Location loc,
+    mlir::MemRefType src_type, mlir::Value from_unit,
+    mlir::Value start_address, mlir::MLIRContext* ctx) {
+  int64_t lane_count = src_type.getShape().back();
+  auto plain_type =
+      mlir::MemRefType::get({lane_count}, src_type.getElementType());
+  auto view_layout = mlir::AffineMap::getMultiDimIdentityMap(1, ctx);
+  return mlir::dataflow::GetLogicalMemoryViewOp::create(
+      builder, loc, plain_type, from_unit, start_address,
+      mlir::AffineMapAttr::get(view_layout));
+}
+
+/// Build an N-D tile get_logical_memory_view for tile-address-baked-in
+/// (LX/lrfreg) addressing. The full tile offset is already in start_address;
+/// the layout uses the N-D linearization map.
+static mlir::dataflow::GetLogicalMemoryViewOp buildTileAddressView(
+    mlir::OpBuilder& builder, mlir::Location loc,
+    mlir::MemRefType src_type, mlir::Value from_unit,
+    mlir::Value start_address, mlir::AffineMap layout_map) {
+  auto plain_type =
+      mlir::MemRefType::get(src_type.getShape(), src_type.getElementType());
+  return mlir::dataflow::GetLogicalMemoryViewOp::create(
+      builder, loc, plain_type, from_unit, start_address,
+      mlir::AffineMapAttr::get(layout_map));
+}
+
 /// Phase 3b: replace Source A chains with get_logical_memory_view.
 /// Emits the view op and RAUWs the memref.cast result inline; does not
 /// populate `replacements` (Source A handles its own erasure).
-/// `memory_tree` is used to distinguish global (HBM) from per-core (LX)
-/// memory when selecting model-A vs model-B addressing.
+/// Invariant-base vs tile-address-baked-in is determined by reading the
+/// ktdf.invariant_base attribute on the reinterpret_cast op (set by
+/// ConstructThreeStagePipeline pass-02).
 mlir::LogicalResult replaceSourceAChains(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::DenseMap<ResourceType, mlir::Value>& resolved_units,
     llvm::DenseMap<mlir::Value, mlir::Value>& replacements,
-    mlir::OpBuilder& builder,
-    const scheduler::arch_view::MemoryTree& memory_tree) {
+    mlir::OpBuilder& builder) {
   auto* ctx = pu.getContext();
 
   llvm::SmallVector<mlir::ktdp::ConstructMemoryViewOp> chains;
@@ -241,23 +266,25 @@ mlir::LogicalResult replaceSourceAChains(
     // Build layout map from static strides.
     auto layout_map = buildLinearizationMap(ctx, static_strides);
 
-    // Determine whether this Source-A chain uses model-A addressing.
-    // Model A applies to global memory (HBM): the L3 view start address must
-    // be a compile-time constant (dcc-l3-model-a-immutable-addr), and the
+    // Determine whether this Source-A chain uses invariant-base addressing.
+    // Invariant-base applies to global memory (HBM): the view start address
+    // must be a compile-time constant, and the
     // per-tile dynamic offset goes into the composite subscript.
-    // Model B applies to per-core scratchpad (LX/lrfreg): the full tile offset
-    // is baked into the view start address.
-    auto view_ms = getMemorySpaceAttr(msc.getDest().getType());
-    bool is_model_a =
-        view_ms && memory_tree.isGlobalMemory(*view_ms);
+    // Tile-address-baked-in applies to per-core scratchpad (LX/lrfreg): the
+    // full tile offset is baked into the view start address.
+    // The addressing mode was recorded at pass-02 time as a
+    // ktdf.invariant_base UnitAttr on the reinterpret_cast op (see
+    // ConstructThreeStagePipeline.cpp).
+    bool has_invariant_base = rc->hasAttr(kInvariantBaseAttr);
 
     // Compute start_address:
-    // - Model A: keep the plain constant base address (do NOT add reinterpret offset).
-    // - Model B: add the reinterpret_cast offset to the base (existing behavior).
+    // - Invariant-base: keep the plain constant base address (do NOT add
+    //   reinterpret offset; the offset will appear in the composite subscript).
+    // - Tile-address-baked-in: add the reinterpret_cast offset to the base.
     mlir::Value start_address = cmv.getOffset();
     builder.setInsertionPointAfter(rc);
-    if (!is_model_a) {
-      // Model B: add the reinterpret_cast's offset to the base address.
+    if (!has_invariant_base) {
+      // Tile-address-baked-in: add the reinterpret_cast's offset to the base.
       mlir::OpFoldResult reinterpret_offset = rc.getConstifiedMixedOffset();
       if (auto offset_attr =
               llvm::dyn_cast<mlir::Attribute>(reinterpret_offset)) {
@@ -275,7 +302,7 @@ mlir::LogicalResult replaceSourceAChains(
                                                     start_address, offset_val);
       }
     }
-    // Model A: start_address stays as cmv.getOffset() (constant base).
+    // Invariant-base: start_address stays as cmv.getOffset() (constant base).
 
     // Get from_unit.
     auto ms = getMemorySpaceAttr(msc.getDest().getType());
@@ -285,26 +312,16 @@ mlir::LogicalResult replaceSourceAChains(
       return cmv.emitError("no resolved unit for memory space");
     mlir::Value from_unit = it->second;
 
-    // Emit get_logical_memory_view:
-    // - Model A: 1-D stick view (memref<lane x elem>, identity layout). The DMA
-    //   engine requires the L3 view to be a plain contiguous stick; the leading
-    //   size-1 dims of the tile (e.g. 1x1x64) are collapsed to the lane dim.
-    // - Model B: N-D tile view (reinterpret_cast shape), N-D linearization layout.
+    // Emit get_logical_memory_view via the appropriate addressing helper.
     auto src_type = mlir::cast<mlir::MemRefType>(rc.getResult().getType());
-    mlir::MemRefType plain_type;
-    mlir::AffineMap view_layout;
-    if (is_model_a) {
-      int64_t lane_count = src_type.getShape().back();
-      plain_type = mlir::MemRefType::get({lane_count}, src_type.getElementType());
-      view_layout = mlir::AffineMap::getMultiDimIdentityMap(1, ctx);
+    mlir::dataflow::GetLogicalMemoryViewOp view_op;
+    if (has_invariant_base) {
+      view_op = buildInvariantBaseView(builder, cmv.getLoc(), src_type,
+                                       from_unit, start_address, ctx);
     } else {
-      plain_type =
-          mlir::MemRefType::get(src_type.getShape(), src_type.getElementType());
-      view_layout = layout_map;
+      view_op = buildTileAddressView(builder, cmv.getLoc(), src_type,
+                                     from_unit, start_address, layout_map);
     }
-    auto view_op = mlir::dataflow::GetLogicalMemoryViewOp::create(
-        builder, cmv.getLoc(), plain_type, from_unit, start_address,
-        mlir::AffineMapAttr::get(view_layout));
 
     // Replace all uses of the old chain tail with the new view.
     // The tail is either memref.cast (if present) or reinterpret_cast.
@@ -494,7 +511,7 @@ mlir::LogicalResult scheduler::buildLogicalMemoryViews(
   // get_local_unit (in buildResolvedUnits), not by a global get_unit.
   llvm::SetVector<ResourceType> materializable_spaces;
   for (auto ms : needed_spaces) {
-    if (!isLrfregSpace(ms)) materializable_spaces.insert(ms);
+    if (!isComputeLocalMemorySpace(ms)) materializable_spaces.insert(ms);
   }
 
   UnitMaterializer materializer(func);
@@ -527,8 +544,8 @@ mlir::LogicalResult scheduler::buildLogicalMemoryViews(
     llvm::DenseMap<mlir::Value, mlir::Value> replacements;
 
     // Phase 3b: Source A chains.
-    if (mlir::failed(replaceSourceAChains(pu, resolved_units, replacements,
-                                          builder, memory_tree)))
+    if (mlir::failed(
+        replaceSourceAChains(pu, resolved_units, replacements, builder)))
       return mlir::failure();
 
     // Phase 3c: Source B casts.

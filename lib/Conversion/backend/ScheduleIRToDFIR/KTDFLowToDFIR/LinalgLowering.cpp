@@ -23,8 +23,8 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/LinalgLowering.h"
 
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/ReductionLowering.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
-#include "dataflow-scheduler/Dialect/Agen/Agen.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
@@ -32,10 +32,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
 
@@ -44,44 +42,6 @@
 using namespace scheduler;
 
 namespace {
-
-/// Build IntegerSet: d0 in [0, 63] (all 64 lanes of the lrfreg vector).
-static mlir::IntegerSet buildAccLoadStoreSet(mlir::MLIRContext* ctx) {
-  auto d0 = mlir::getAffineDimExpr(0, ctx);
-  // d0 >= 0  &&  -d0 + 63 >= 0
-  return mlir::IntegerSet::get(1, 0, {d0, -d0 + 63}, {/*eq=*/false, /*eq=*/false});
-}
-
-/// Emit agen.vector_load from a 1-D lrfreg memref view at index 0.
-static mlir::Value emitAccVectorLoad(mlir::OpBuilder& builder,
-                                     mlir::Location loc, mlir::Value view) {
-  auto* ctx = builder.getContext();
-  auto memref_type = mlir::cast<mlir::MemRefType>(view.getType());
-  assert(memref_type.getRank() == 1 && "expected 1-D lrfreg view");
-  int64_t num_elems = memref_type.getShape()[0];
-  auto elem_type = memref_type.getElementType();
-  auto vector_type = mlir::VectorType::get({num_elems}, elem_type);
-  auto identity1d = mlir::AffineMap::getMultiDimIdentityMap(1, ctx);
-  auto load_set = buildAccLoadStoreSet(ctx);
-  mlir::Value c0 = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
-  return mlir::agen::VectorLoadOp::create(builder, loc, vector_type, view,
-                                          /*dbgName=*/nullptr, identity1d,
-                                          mlir::ValueRange{c0}, load_set,
-                                          identity1d)
-      .getResult();
-}
-
-/// Emit agen.vector_store of `vec` to a 1-D lrfreg memref view at index 0.
-static void emitAccVectorStore(mlir::OpBuilder& builder, mlir::Location loc,
-                               mlir::Value vec, mlir::Value view) {
-  auto* ctx = builder.getContext();
-  auto identity1d = mlir::AffineMap::getMultiDimIdentityMap(1, ctx);
-  auto store_set = buildAccLoadStoreSet(ctx);
-  mlir::Value c0 = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
-  mlir::agen::VectorStoreOp::create(builder, loc, vec, view,
-                                    /*dbgName=*/nullptr, identity1d,
-                                    mlir::ValueRange{c0}, store_set, identity1d);
-}
 
 /// Pattern to lower linalg.generic compute operations
 struct LowerLinalgGenericPattern
@@ -157,7 +117,7 @@ struct LowerLinalgGenericPattern
     mlir::Value acc_vec;
     if (is_reduction) {
       rewriter.setInsertionPoint(generic_op);
-      acc_vec = emitAccVectorLoad(rewriter, generic_op.getLoc(), acc_view);
+      acc_vec = emitLrfregVectorLoad(rewriter, generic_op.getLoc(), acc_view);
       // Replace outs block arg with acc_vec.
       body.getArguments()
           .drop_front(num_inputs)
@@ -186,8 +146,6 @@ struct LowerLinalgGenericPattern
     // Process and lower compute operations
     rewriter.setInsertionPoint(generic_op);
 
-    // Plain binary path (single op: addf, mulf, subf).
-    // Lower each body op to vectorchain.binary.
     for (mlir::Operation* op : ops_to_lower) {
       // arith.mulf %lhs, %rhs -> vectorchain.binary {binary_op = mul}
       if (auto mulf_op = llvm::dyn_cast<mlir::arith::MulFOp>(op)) {
@@ -243,24 +201,8 @@ struct LowerLinalgGenericPattern
     mlir::Value result = yield_op.getOperand(0);
 
     if (is_reduction) {
-      // Emit vector_store for the new accumulator.
-      emitAccVectorStore(rewriter, generic_op.getLoc(), result, acc_view);
-      // Erase the materialize_in_destination bridge op for the generic result.
-      mlir::Value generic_result = generic_op.getResult(0);
-      for (mlir::OpOperand& use :
-           llvm::make_early_inc_range(generic_result.getUses())) {
-        if (auto mid = mlir::dyn_cast<
-                mlir::bufferization::MaterializeInDestinationOp>(
-                use.getOwner())) {
-          if (mid.getDest() == acc_view) {
-            rewriter.eraseOp(mid);
-            break;
-          }
-        }
-      }
-      rewriter.eraseOp(generic_op);
-      if (accToTensor.getResult().use_empty())
-        rewriter.eraseOp(accToTensor);
+      emitReductionWriteBack(rewriter, generic_op, accToTensor, result,
+                             acc_view);
     } else {
       // Replace the generic op with the yield operand
       rewriter.replaceOp(generic_op, result);

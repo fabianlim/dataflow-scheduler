@@ -42,6 +42,7 @@
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/Links.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
 #include "dataflow-scheduler/Transforms/Utils/CustomLinalgTiling.h"
 #include "dataflow-scheduler/Transforms/Utils/Utils.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
@@ -538,9 +539,7 @@ bool ConstructThreeStagePipelinePass::rewriteReductionAccumulator(
 
   // The lrfreg accumulator is left uninitialized here. The reset (unconditional
   // store of the first received row) is emitted by peelReductionComputeLoop
-  // in pass 20, after the per-PU loop split. Emitting a constant-zero store
-  // here fails on hardware ("ConstantBitstreamOp producers are only supported
-  // in L3").
+  // in pass 20, after the per-PU loop split. 
 
   // Replace uses of k_loop's SSA result (acc_final) with a post-loop
   // bufferization.to_tensor of the lrfreg accumulator buffer. After dropping
@@ -1031,22 +1030,22 @@ static mlir::LogicalResult projectSizesThroughIndexingMap(
 
 // Build the source_map for a data_transfer from an access tile op.
 //
-// Model A (HBM, global memory): 1-D flat-offset map.
+// Invariant-base (HBM, global memory): 1-D flat-offset map.
 //   source_map has numDims == loop_ivs.size(), numResults == 1.
 //   Result = sum_i(stride_i * iv_expr(i)).
 //   Example: a[%n,  %m, 0] strides [16384,64,1] -> (d0,d1) -> (d0*16384+d1*64)
 //
-// Model B (LX/per-core, lrfreg): all-zeros N-D map (offset already baked
-//   into the reinterpret_cast base; subscript is constant 0 per dim).
+// Tile-address-baked-in (LX/per-core, lrfreg): all-zeros N-D map (offset
+//   already baked into the reinterpret_cast base; subscript is constant 0).
 //   source_map has numDims == loop_ivs.size(), numResults == memref_rank.
 //   Example: lx[0,0,0] -> (d0,d1) -> (0,0,0)
 //
-// `is_model_a` = true → model A (HBM); false → model B (LX/lrfreg).
+// `has_invariant_base` = true → invariant-base (HBM); false → tile-address-baked-in.
 static std::optional<mlir::AffineMap> buildSourceMapFromAccessTile(
     mlir::ktdp::ConstructAccessTilesOp access_tile_op,
     llvm::ArrayRef<mlir::Value> loop_ivs,
     mlir::MLIRContext* ctx,
-    bool is_model_a) {
+    bool has_invariant_base) {
   mlir::AffineMap base_map = access_tile_op.getBaseMap();
   llvm::SmallVector<mlir::Value> raw_indices = access_tile_op.getIndices();
   unsigned memref_rank = base_map.getNumResults();
@@ -1056,14 +1055,15 @@ static std::optional<mlir::AffineMap> buildSourceMapFromAccessTile(
   for (unsigned k = 0; k < loop_ivs.size(); ++k)
     iv_to_pos[loop_ivs[k]] = k;
 
-  if (!is_model_a) {
-    // Model B: all-zeros map (offset baked into the reinterpret_cast offset).
+  if (!has_invariant_base) {
+    // Tile-address-baked-in: all-zeros map (offset baked into the
+    // reinterpret_cast base address; subscript is constant 0 per dim).
     llvm::SmallVector<mlir::AffineExpr> zeros(
         memref_rank, mlir::getAffineConstantExpr(0, ctx));
     return mlir::AffineMap::get(loop_ivs.size(), 0, zeros, ctx);
   }
 
-  // Model A: compute flat offset from strides and loop IVs.
+  // Invariant-base: compute flat offset from strides and loop IVs.
   llvm::SmallVector<int64_t> strides(memref_rank, 1);
   {
     mlir::Value mem_view = access_tile_op.getBase();
@@ -1181,8 +1181,8 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
       err_anchor = store_ops_[i].getOperation();
     }
 
-    // Detect model-A (HBM) vs model-B (LX/lrfreg) for this access tile.
-    bool is_model_a_tile = false;
+    // Detect invariant-base (HBM) vs tile-address-baked-in (LX/lrfreg).
+    bool has_invariant_base_tile = false;
     if (auto access_tile_op =
             access_tile_value
                 .getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
@@ -1192,7 +1192,8 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
         mlir::Attribute mapped_ms = mapMemorySpace(cmv.getMemorySpaceAttr());
         if (auto ms_str = mlir::dyn_cast<mlir::StringAttr>(mapped_ms)) {
           llvm::StringRef ms = ms_str.getValue();
-          is_model_a_tile = (ms != "LX" && ms != "lrfreg");
+          has_invariant_base_tile =
+              (!isComputeLocalMemorySpace(ms) && ms != "LX");
         }
       }
     }
@@ -1202,8 +1203,9 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
     if (auto access_tile_op =
             access_tile_value
                 .getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
-      source_map = buildSourceMapFromAccessTile(access_tile_op, loop_ivs,
-                                                &getContext(), is_model_a_tile);
+      source_map =
+          buildSourceMapFromAccessTile(access_tile_op, loop_ivs,
+                                       &getContext(), has_invariant_base_tile);
     }
 
     // Fall back to linalg indexing map if access-tile approach fails.
@@ -1227,7 +1229,7 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
     }
 
     // Derive the access-tile sizes for the data_transfer's static sizes.
-    // Model-A (HBM): 1-D stick → {lane}. Model-B (LX): keep N-D tile shape.
+    // Invariant-base (HBM): 1-D stick → {lane}. Tile-address-baked-in: N-D.
     llvm::SmallVector<int64_t> access_tile_sizes;
     bool got_sizes_from_tile = false;
     if (auto access_tile_op =
@@ -1236,11 +1238,11 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
       auto at_type = mlir::dyn_cast<mlir::ktdp::AccessTileType>(
           access_tile_op.getResult().getType());
       if (at_type) {
-        if (is_model_a_tile && source_map->getNumResults() == 1) {
-          // Model A: 1-D view → just the lane count (last dim of tile).
+        if (has_invariant_base_tile && source_map->getNumResults() == 1) {
+          // Invariant-base: 1-D view → just the lane count (last dim of tile).
           access_tile_sizes = {at_type.getShape().back()};
         } else {
-          // Model B or LX: keep the full tile shape.
+          // Tile-address-baked-in: keep the full tile shape.
           access_tile_sizes.assign(at_type.getShape().begin(),
                                    at_type.getShape().end());
         }
@@ -1347,8 +1349,8 @@ void ConstructThreeStagePipelinePass::createPostLoopStorePipeline(
   }
   std::reverse(outer_loop_ivs.begin(), outer_loop_ivs.end());
 
-  // Detect model-A for this store tile (HBM → model-A).
-  bool is_post_loop_model_a = false;
+  // Detect invariant-base for this store tile (HBM → invariant-base).
+  bool has_invariant_base_post_loop = false;
   if (auto access_tile_op =
           access_tile_value
               .getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
@@ -1358,7 +1360,8 @@ void ConstructThreeStagePipelinePass::createPostLoopStorePipeline(
       mlir::Attribute mapped_ms = mapMemorySpace(cmv.getMemorySpaceAttr());
       if (auto ms_str = mlir::dyn_cast<mlir::StringAttr>(mapped_ms)) {
         llvm::StringRef ms = ms_str.getValue();
-        is_post_loop_model_a = (ms != "LX" && ms != "lrfreg");
+        has_invariant_base_post_loop =
+            (!isComputeLocalMemorySpace(ms) && ms != "LX");
       }
     }
   }
@@ -1368,8 +1371,9 @@ void ConstructThreeStagePipelinePass::createPostLoopStorePipeline(
   if (auto access_tile_op =
           access_tile_value
               .getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
-    source_map = buildSourceMapFromAccessTile(access_tile_op, outer_loop_ivs,
-                                              ctx, is_post_loop_model_a);
+    source_map =
+        buildSourceMapFromAccessTile(access_tile_op, outer_loop_ivs, ctx,
+                                     has_invariant_base_post_loop);
   }
   if (!source_map) {
     // Fallback: constant 0 map (all dims at offset 0 within the tile).
@@ -1386,8 +1390,7 @@ void ConstructThreeStagePipelinePass::createPostLoopStorePipeline(
   }
 
   // Derive access tile sizes from the access tile type shape.
-  // For model-A (1-result source_map), the dest is a 1-D stick; use just
-  // the lane count (last dim).
+  // The dest is a 1-D stick; use just the lane count (last dim).
   llvm::SmallVector<int64_t> access_tile_sizes;
   if (auto access_tile_op =
           access_tile_value
@@ -1922,29 +1925,31 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
     auto memory_space_cast = mlir::memref::MemorySpaceCastOp::create(
         builder, loc, cast_source_type, memory_view);
 
-    // Model-A applies only to global (HBM) memory tiles: the L3 view start
-    // address must be a compile-time constant (dcc-l3-model-a-immutable-addr)
-    // and the per-tile dynamic offset goes into the composite subscript.
-    // Per-core (LX) tiles use model-B (offset baked into the view start addr).
+    // Invariant-base addressing applies only to global (HBM) memory tiles: the
+    // start address must be a compile-time constant and the per-tile dynamic offset 
+    // goes into the composite subscript.
+    // Tile-address-baked-in applies to per-core (LX) tiles: the full tile
+    // offset is baked into the view start address.
     //
     // Detect by checking whether the mapped memory space is NOT a per-core
     // scratchpad (LX) or compute-local (lrfreg) space.
-    bool is_model_a_source = false;
+    bool has_invariant_base_source = false;
     {
       auto mapped_str = mlir::dyn_cast<mlir::StringAttr>(mapped_memory_space);
       if (mapped_str) {
         llvm::StringRef ms = mapped_str.getValue();
         // Per-core: "LX" (local SRAM scratchpad). Compute-local: "lrfreg".
-        // Everything else (e.g., "HBM", "DDR") is global → model A.
-        is_model_a_source = (ms != "LX" && ms != "lrfreg");
+        // Everything else (e.g., "HBM", "DDR") is global → invariant-base.
+        has_invariant_base_source =
+            (!isComputeLocalMemorySpace(ms) && ms != "LX");
       }
     }
 
     llvm::SmallVector<int64_t> result_shape;
     llvm::SmallVector<mlir::OpFoldResult> rc_sizes;
     llvm::SmallVector<mlir::OpFoldResult> rc_strides;
-    if (is_model_a_source) {
-      // 1-D cast: just the lane dimension (last dim of tile, stride 1).
+    if (has_invariant_base_source) {
+      // Invariant-base: 1-D cast → just the lane dim (last dim, stride 1).
       int64_t lane_count = tile_dims.back();
       result_shape = {lane_count};
       rc_sizes = {builder.getIndexAttr(lane_count)};
@@ -1955,7 +1960,7 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
       rc_strides = reinterpret_strides;
     }
     mlir::StridedLayoutAttr strided_layout;
-    if (is_model_a_source) {
+    if (has_invariant_base_source) {
       strided_layout = mlir::StridedLayoutAttr::get(
           builder.getContext(), mlir::ShapedType::kDynamic, {1});
     } else {
@@ -1970,6 +1975,9 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
     auto cast_op = mlir::memref::ReinterpretCastOp::create(
         builder, loc, result_type, memory_space_cast.getResult(),
         offset_fold_result, rc_sizes, rc_strides);
+    if (has_invariant_base_source) {
+      cast_op->setAttr(kInvariantBaseAttr, mlir::UnitAttr::get(&getContext()));
+    }
     // Replace access tile with reinterpret_cast
     access_tile.replaceAllUsesWith(cast_op.getResult());
     ops_to_delete_.push_back(access_tile.getOperation());
