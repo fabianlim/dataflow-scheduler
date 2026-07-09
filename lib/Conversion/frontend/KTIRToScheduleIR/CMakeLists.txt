@@ -28,6 +28,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTIRToScheduleIR
 mlir_target_link_libraries(DataflowSchedulerKTIRToScheduleIR PUBLIC
   MLIRIR
   MLIRArithDialect
+  MLIRBufferizationDialect
   MLIRLinalgDialect
   MLIRMathDialect
   MLIRPass

@@ -50,6 +50,7 @@
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -135,12 +136,19 @@ struct AddrCtx {
   llvm::SmallVector<mlir::Value> tiledLoopIVs;  // subscript IVs
   llvm::ArrayRef<int64_t> tileSizes;            // tile_sizes_
   mlir::Operation* errAnchor;                   // diagnostic anchor
+  // Reduction path only: the ktdp.construct_access_tile whose indices are the
+  // per-dimension subscripts (%n, %m, %c0) and whose result shape gives the
+  // transfer sizes. Null on the elementwise path.
+  mlir::ktdp::ConstructAccessTilesOp accessTile;
 };
 
 struct AddressParts {
   mlir::AffineMap sourceMap;
   llvm::SmallVector<mlir::Value> subscriptIVs;
   llvm::SmallVector<int64_t> sizes;
+  // The memref the transfer addresses. Seeded by the caller with the raw
+  // access-tile value; a MemrefBuilder may rewrite it (reduction -> full view).
+  mlir::Value sourceMemref;
 };
 
 // Source-map builder: returns nullopt on failure (caller emits the diagnostic
@@ -148,6 +156,9 @@ struct AddressParts {
 struct SourceMapBuilder {
   virtual ~SourceMapBuilder() = default;
   virtual std::optional<mlir::AffineMap> build(AddrCtx&) = 0;
+  // The subscript IVs feeding the map's dim inputs. Elementwise projects the
+  // manufactured tiled-loop IVs; reduction uses the access-tile indices.
+  virtual llvm::SmallVector<mlir::Value> subscripts(AddrCtx& ctx) = 0;
 };
 
 // Sizes builder: fills `out` with the projected sizes; returns failure (and has
@@ -156,6 +167,24 @@ struct SizesBuilder {
   virtual ~SizesBuilder() = default;
   virtual mlir::LogicalResult build(AddrCtx&, mlir::AffineMap,
                                     llvm::SmallVectorImpl<int64_t>&) = 0;
+};
+
+// Memref builder: given the raw access-tile value the caller seeded, returns
+// the memref the transfer should address. Elementwise keeps the access-tile
+// value verbatim (step 5 rewrites it into a reinterpret_cast); reduction swaps
+// in the full memory view. This is what keeps createDataTransfers policy-free.
+struct MemrefBuilder {
+  virtual ~MemrefBuilder() = default;
+  virtual mlir::Value build(mlir::OpBuilder&, mlir::Location, AddrCtx&,
+                            mlir::Value seeded) = 0;
+};
+
+// Elementwise: pass the seeded access-tile value straight through.
+struct MemrefPassthrough : MemrefBuilder {
+  mlir::Value build(mlir::OpBuilder&, mlir::Location, AddrCtx&,
+                    mlir::Value seeded) override {
+    return seeded;
+  }
 };
 
 // Elementwise source map = the linalg operand's indexing map (verbatim lift of
@@ -171,6 +200,9 @@ struct SourceMapFromLinalg : SourceMapBuilder {
     }
     return findIndexingMapForStoreSource(ctx.linalgOp,
                                          ctx.storeOp.getDataTile());
+  }
+  llvm::SmallVector<mlir::Value> subscripts(AddrCtx& ctx) override {
+    return ctx.tiledLoopIVs;
   }
 };
 
@@ -188,6 +220,40 @@ struct SizesByProjection : SizesBuilder {
   }
 };
 
+// Reduction source map = the access-tile order map (identity over the source
+// memref rank), so the data_transfer addresses the FULL memory view directly
+// with one subscript per memref dimension (%n, %m, %c0 for the load; %n, %c0
+// for the store). No reinterpret_cast / tiled-loop projection is involved.
+struct SourceMapFromAccessTile : SourceMapBuilder {
+  std::optional<mlir::AffineMap> build(AddrCtx& ctx) override {
+    LLVM_DEBUG(llvm::dbgs()
+               << "    SourceMapFromAccessTile: identity map over the "
+                  "access-tile order\n");
+    if (!ctx.accessTile) return std::nullopt;
+    return ctx.accessTile.getAccessTileOrder();
+  }
+  llvm::SmallVector<mlir::Value> subscripts(AddrCtx& ctx) override {
+    llvm::SmallVector<mlir::Value> indices = ctx.accessTile.getIndices();
+    return indices;
+  }
+};
+
+// Reduction sizes = the access-tile result shape ([1,1,64] load / [1,64]
+// store), one entry per source-memref dimension.
+struct SizesFromTileShape : SizesBuilder {
+  mlir::LogicalResult build(AddrCtx& ctx, mlir::AffineMap /*sourceMap*/,
+                            llvm::SmallVectorImpl<int64_t>& out) override {
+    LLVM_DEBUG(llvm::dbgs()
+               << "    SizesFromTileShape: pulling sizes from access-tile "
+                  "result shape\n");
+    auto tile_type = mlir::dyn_cast<mlir::ktdp::AccessTileType>(
+        ctx.accessTile.getResult().getType());
+    if (!tile_type) return mlir::failure();
+    out.assign(tile_type.getShape().begin(), tile_type.getShape().end());
+    return mlir::success();
+  }
+};
+
 // Result of planAddress: distinguishes the two baseline failure modes so the
 // caller can reproduce the exact diagnostics.
 enum class AddressStatus { Ok, NoSourceMap, SizesFailed };
@@ -197,8 +263,10 @@ enum class AddressStatus { Ok, NoSourceMap, SizesFailed };
 // tiled-loop IVs. On NoSourceMap the caller emits the "could not locate"
 // diagnostic; on SizesFailed the sizes builder has already emitted its own
 // diagnostic.
-static AddressStatus planAddress(AddrCtx& ctx, SourceMapBuilder& mapB,
-                                 SizesBuilder& sizeB, AddressParts& out) {
+static AddressStatus planAddress(mlir::OpBuilder& builder, mlir::Location loc,
+                                 AddrCtx& ctx, SourceMapBuilder& mapB,
+                                 SizesBuilder& sizeB, MemrefBuilder& memB,
+                                 AddressParts& out) {
   LLVM_DEBUG(llvm::dbgs() << "  planAddress for "
                           << (ctx.is_load ? "load" : "store") << " transfer\n");
   std::optional<mlir::AffineMap> sourceMap = mapB.build(ctx);
@@ -208,12 +276,13 @@ static AddressStatus planAddress(AddrCtx& ctx, SourceMapBuilder& mapB,
   }
 
   out.sourceMap = *sourceMap;
-  out.subscriptIVs = ctx.tiledLoopIVs;
+  out.subscriptIVs = mapB.subscripts(ctx);
   if (mlir::failed(sizeB.build(ctx, out.sourceMap, out.sizes))) {
     LLVM_DEBUG(llvm::dbgs() << "  planAddress: sizes builder failed "
                                "(SizesFailed)\n");
     return AddressStatus::SizesFailed;
   }
+  out.sourceMemref = memB.build(builder, loc, ctx, out.sourceMemref);
   LLVM_DEBUG(llvm::dbgs() << "  planAddress: Ok\n");
   return AddressStatus::Ok;
 }
@@ -234,6 +303,7 @@ struct PipelineSpec {
   mlir::Value accumulatorBuf;  // currently always null (elementwise)
   SourceMapBuilder* mapBuilder;
   SizesBuilder* sizeBuilder;
+  MemrefBuilder* memrefBuilder;
 };
 
 struct PipelineSite {
@@ -241,9 +311,19 @@ struct PipelineSite {
   PipelineSpec spec;
 };
 
+// Carries the per-group reduction shape discovered by findReductionLoop: the
+// reused inner reduction scf.for (%m), its tensor accumulator iter_arg, and the
+// fused linalg whose DPS init is fed by that iter_arg.
+struct ReductionInfo {
+  mlir::scf::ForOp loop;          // the %m reduction loop (reused)
+  mlir::BlockArgument accIterArg; // the tensor iter_arg (%acc)
+  mlir::linalg::LinalgOp linalg;  // the reduction linalg (outs = %acc)
+};
+
 struct StructuralInfo {
   llvm::SmallVector<mlir::scf::ForOp> parallelLoops;   // nest OUTSIDE the pipeline
-  llvm::SmallVector<mlir::scf::ForOp> reductionLoops;  // currently empty
+  llvm::SmallVector<mlir::scf::ForOp> reductionLoops;  // reduction %m loops
+  llvm::SmallVector<ReductionInfo> reductions;         // one per reduction group
 };
 
 // ---------------------------------------------------------------------------
@@ -285,6 +365,9 @@ struct ConstructThreeStagePipelinePass
 
   void getDependentDialects(mlir::DialectRegistry& registry) const override {
     ConstructThreeStagePipelinePassBase::getDependentDialects(registry);
+    // The reduction path emits bufferization.to_tensor /
+    // materialize_in_destination for the accumulator RMW.
+    registry.insert<mlir::bufferization::BufferizationDialect>();
   }
 
   void runOnOperation() final;
@@ -319,6 +402,19 @@ struct ConstructThreeStagePipelinePass
   // pass member state.
   void instantiatePipeline(const PipelineSite& site,
                            const StructuralInfo& structural);
+
+  // Detect a reduction group: an scf.for with a single tensor iter_arg whose
+  // value feeds (as the DPS init) the fused linalg. Returns std::nullopt for
+  // the elementwise path. Populates the reused-loop / iter_arg / linalg handles.
+  std::optional<ReductionInfo> findReductionLoop(mlir::func::FuncOp func_op);
+
+  // Materialize ONE reduction ktdf.pipeline: the OUTER private (accumulator +
+  // store FIFO + 2 tokens), the ACCUMULATE stage (the reused %m loop wrapping
+  // an INNER load+RMW pipeline, then the post-loop write_to_fifo), and the
+  // STORE stage. Reuses createPrivateOp / createDataTransfers / the StageEmit
+  // machinery for the inner pipeline.
+  void instantiateReductionPipeline(const PipelineSite& site,
+                                    const ReductionInfo& reduction);
 
   // Create linalg compute operations in stage 2
   void createComputeOps(mlir::OpBuilder& builder, mlir::Location loc,
@@ -373,6 +469,14 @@ struct ConstructThreeStagePipelinePass
   llvm::SmallVector<int64_t> getStridesFromMemRefType(
       mlir::MemRefType memref_type);
 
+  // Reduction path: materialize (once, memoized) the full-rank
+  // memref.memory_space_cast of an access tile's underlying memory view, in the
+  // device memory space. The reduction data_transfers address this full view
+  // directly (identity map + per-dim subscripts), so no reinterpret_cast is
+  // emitted for these tiles.
+  mlir::Value materializeFullView(mlir::OpBuilder& builder, mlir::Location loc,
+                                  mlir::ktdp::ConstructAccessTilesOp access_tile);
+
   // Clean up operations after pipeline creation
   void cleanupOperations();
 
@@ -400,6 +504,16 @@ struct ConstructThreeStagePipelinePass
 
   // Builder for constants at function start
   std::optional<mlir::OpBuilder> const_builder_;
+
+  // True while emitting a reduction group: data_transfers address the full
+  // memory view (via memory_space_cast) with the access-tile subscripts, and
+  // the tiling / reinterpret_cast steps are skipped.
+  bool is_reduction_ = false;
+
+  // Memoized full-view memory_space_cast per underlying memory-view op (keyed
+  // by the construct_memory_view), so multiple access tiles over the same view
+  // share one cast.
+  llvm::DenseMap<mlir::Operation*, mlir::Value> full_view_cache_;
 };
 
 void ConstructThreeStagePipelinePass::resetState() {
@@ -411,6 +525,8 @@ void ConstructThreeStagePipelinePass::resetState() {
   total_num_elements_ = 0;
   ops_to_delete_.clear();
   const_builder_.reset();
+  is_reduction_ = false;
+  full_view_cache_.clear();
 }
 
 mlir::LogicalResult
@@ -804,6 +920,35 @@ mlir::ktdf::PrivateOp ConstructThreeStagePipelinePass::createPrivateOp(
   return private_op;
 }
 
+std::optional<ReductionInfo>
+ConstructThreeStagePipelinePass::findReductionLoop(mlir::func::FuncOp func_op) {
+  std::optional<ReductionInfo> result;
+  func_op.walk([&](mlir::scf::ForOp for_op) {
+    if (result) return;
+    // A reduction loop carries exactly one tensor iter_arg.
+    if (for_op.getNumRegionIterArgs() != 1) return;
+    mlir::BlockArgument acc = for_op.getRegionIterArgs().front();
+    if (!mlir::isa<mlir::RankedTensorType>(acc.getType())) return;
+
+    // The iter_arg must feed a linalg op's DPS init inside the loop body.
+    for (mlir::Operation* user : acc.getUsers()) {
+      auto linalg = mlir::dyn_cast<mlir::linalg::LinalgOp>(user);
+      if (!linalg) continue;
+      bool is_init = false;
+      for (mlir::Value init : linalg.getDpsInits()) {
+        if (init == acc) is_init = true;
+      }
+      if (!is_init) continue;
+      LLVM_DEBUG(llvm::dbgs()
+                 << "  findReductionLoop: found reduction loop with tensor "
+                    "iter_arg feeding linalg outs\n");
+      result = ReductionInfo{for_op, acc, linalg};
+      return;
+    }
+  });
+  return result;
+}
+
 void ConstructThreeStagePipelinePass::instantiatePipeline(
     const PipelineSite& site, const StructuralInfo& structural) {
   const PipelineSpec& spec = site.spec;
@@ -949,6 +1094,236 @@ void ConstructThreeStagePipelinePass::instantiatePipeline(
           }
         }
       });
+}
+
+namespace {
+// Reduction memref policy: swap the seeded access-tile value for the full
+// memory-view memory_space_cast (materialized by the pass). Holds a callback so
+// it does not need to be a pass member.
+struct MemrefFullView : MemrefBuilder {
+  std::function<mlir::Value(mlir::OpBuilder&, mlir::Location,
+                            mlir::ktdp::ConstructAccessTilesOp)>
+      resolve;
+  mlir::Value build(mlir::OpBuilder& b, mlir::Location loc, AddrCtx& ctx,
+                    mlir::Value /*seeded*/) override {
+    assert(ctx.accessTile && "reduction transfer expects an access tile");
+    return resolve(b, loc, ctx.accessTile);
+  }
+};
+}  // namespace
+
+void ConstructThreeStagePipelinePass::instantiateReductionPipeline(
+    const PipelineSite& site, const ReductionInfo& reduction) {
+  const PipelineSpec& spec = site.spec;
+  mlir::Block* body_block = site.pos.block;  // the outer %n parallel-loop body
+  mlir::scf::ForOp old_loop = reduction.loop;  // reused %m loop (mutable handle)
+  mlir::Location loc = old_loop.getLoc();
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "Creating reduction ktdf.pipeline (outer wrapper)\n");
+
+  // FIFO slot / accumulator granularity = the reduction lane count (product of
+  // the reduction linalg's result shape, e.g. 64).
+  auto acc_tensor_ty =
+      mlir::cast<mlir::RankedTensorType>(reduction.linalg->getResult(0).getType());
+  mlir::Type elem_ty = acc_tensor_ty.getElementType();
+  total_num_elements_ = 1;
+  for (int64_t d : acc_tensor_ty.getShape()) total_num_elements_ *= d;
+
+  // The 2-D accumulator memref shape: 1 x lanes.
+  llvm::SmallVector<int64_t> acc_shape{1, total_num_elements_};
+
+  // FIFO attributes for the (single) load and store.
+  assert(spec.loads.size() == 1 && spec.stores.size() == 1 &&
+         "reduction group expects one load and one store");
+  auto [load_src, load_dst] = getFifoAttributesForLoad(spec.loads.front());
+  auto [store_src, store_dst] = getFifoAttributesForStore(spec.stores.front());
+  auto load_fifo_ty = mlir::ktdf::FifoSlotType::get(
+      &getContext(), load_src, load_dst, total_num_elements_, elem_ty);
+  auto store_fifo_ty = mlir::ktdf::FifoSlotType::get(
+      &getContext(), store_src, store_dst, total_num_elements_, elem_ty);
+  mlir::ktdf::TokenType token_ty = mlir::ktdf::TokenType::get(&getContext());
+
+  // The reduction address policy (map/sizes from the access tile, memref = the
+  // full view). Must outlive the emit below.
+  SourceMapFromAccessTile red_source_map;
+  SizesFromTileShape red_sizes;
+  MemrefFullView red_memref;
+  red_memref.resolve = [this](mlir::OpBuilder& b, mlir::Location l,
+                              mlir::ktdp::ConstructAccessTilesOp at) {
+    return materializeFullView(b, l, at);
+  };
+  PipelineSpec red_spec = spec;
+  red_spec.linalgOp = reduction.linalg;
+  red_spec.mapBuilder = &red_source_map;
+  red_spec.sizeBuilder = &red_sizes;
+  red_spec.memrefBuilder = &red_memref;
+
+  // createDataTransfers asserts a single fused compute op; the reduction linalg
+  // plays that role for its per-operand indexing (the reduction map builder
+  // ignores it, but the assert / spec.linalgOp must stay consistent).
+  compute_ops_.assign({reduction.linalg});
+
+  // Reuse the %m loop: build a fresh iter_arg-free scf.for with the same bounds
+  // at the old loop's position, redirect the old IV to the new one so the load
+  // access-tile subscript picks up the new IV, and schedule the old loop (dead)
+  // for cleanup.
+  //
+  // Build the ktdf.pipeline at the top of the %n body.
+  mlir::OpBuilder builder(body_block, body_block->begin());
+
+  mlir::ktdf::PipelineOp::create(builder, loc, [&](mlir::OpBuilder& b,
+                                                   mlir::Location l) {
+    // OUTER private: acc memref + store FIFO + 2 tokens (t0, t1).
+    auto outer_private = mlir::ktdf::PrivateOp::create(
+        b, l,
+        mlir::TypeRange{mlir::MemRefType::get(acc_shape, elem_ty), store_fifo_ty,
+                        token_ty, token_ty});
+    {
+      mlir::OpBuilder::InsertionGuard g(b);
+      b.setInsertionPointToStart(&outer_private.getRegion().front());
+      auto acc = mlir::memref::AllocOp::create(
+          b, l, mlir::MemRefType::get(acc_shape, elem_ty));
+      auto store_fifo = mlir::ktdf::FifoAllocateOp::create(
+          b, l, mlir::TypeRange{store_fifo_ty}, mlir::ValueRange{});
+      auto t0 = mlir::ktdf::CreateTokenOp::create(b, l, token_ty);
+      auto t1 = mlir::ktdf::CreateTokenOp::create(b, l, token_ty);
+      mlir::ktdf::PrivateYieldOp::create(
+          b, l,
+          mlir::ValueRange{acc.getResult(), store_fifo.getResult(0),
+                           t0.getResult(), t1.getResult()});
+    }
+    mlir::Value acc = outer_private.getResult(0);
+    mlir::Value store_fifo = outer_private.getResult(1);
+    mlir::Value t0 = outer_private.getResult(2);
+    mlir::Value t1 = outer_private.getResult(3);
+
+    // ACCUMULATE stage: depends_out(t0), UNIT-LESS. Body = reused %m loop +
+    // post-loop drain of the settled accumulator into the store FIFO.
+    mlir::ktdf::StageOp::create(
+        b, l, mlir::ValueRange{}, mlir::ValueRange{t0},
+        [&](mlir::OpBuilder& sb, mlir::Location sl) {
+          // Fresh iter_arg-free %m loop.
+          auto new_loop = mlir::scf::ForOp::create(
+              sb, sl, old_loop.getLowerBound(), old_loop.getUpperBound(),
+              old_loop.getStep());
+          new_loop->setAttr(
+              "loop_type",
+              mlir::ktdf::LoopTypeAttr::get(&getContext(),
+                                            mlir::ktdf::LoopType::ReductionLoop));
+          // Redirect old IV -> new IV so the load access-tile subscript is the
+          // new loop's induction variable.
+          old_loop.getInductionVar().replaceAllUsesWith(
+              new_loop.getInductionVar());
+
+          mlir::OpBuilder lb(new_loop.getBody(), new_loop.getBody()->begin());
+          // INNER pipeline: inner private (load FIFO + 2 tokens) + inner load
+          // stage + inner compute RMW stage.
+          mlir::ktdf::PipelineOp::create(
+              lb, sl, [&](mlir::OpBuilder& ib, mlir::Location il) {
+                auto inner_private = mlir::ktdf::PrivateOp::create(
+                    ib, il, mlir::TypeRange{load_fifo_ty, token_ty, token_ty});
+                {
+                  mlir::OpBuilder::InsertionGuard g(ib);
+                  ib.setInsertionPointToStart(
+                      &inner_private.getRegion().front());
+                  auto load_fifo = mlir::ktdf::FifoAllocateOp::create(
+                      ib, il, mlir::TypeRange{load_fifo_ty}, mlir::ValueRange{});
+                  auto it0 = mlir::ktdf::CreateTokenOp::create(ib, il, token_ty);
+                  auto it1 = mlir::ktdf::CreateTokenOp::create(ib, il, token_ty);
+                  mlir::ktdf::PrivateYieldOp::create(
+                      ib, il,
+                      mlir::ValueRange{load_fifo.getResult(0), it0.getResult(),
+                                       it1.getResult()});
+                }
+                mlir::Value load_fifo = inner_private.getResult(0);
+                mlir::Value it0 = inner_private.getResult(1);
+                mlir::Value it1 = inner_private.getResult(2);
+
+                // Inner LOAD stage: depends_out(it0), UNIT-LESS. Reuses the
+                // policy-free createDataTransfers with the reduction address
+                // spec (rank-3 source_map, sizes [1,1,64], subscripts %n,%m,%c0).
+                mlir::ktdf::StageOp::create(
+                    ib, il, mlir::ValueRange{}, mlir::ValueRange{it0},
+                    [&](mlir::OpBuilder& stb, mlir::Location stl) {
+                      createDataTransfers(stb, stl, inner_private, red_spec,
+                                          tile_sizes_, /*is_load=*/true,
+                                          /*private_result_offset=*/0);
+                    });
+
+                // Inner COMPUTE RMW stage: depends_in(it0), depends_out(it1),
+                // applicable_units=["SFP"]. Rebuild the linalg at 2-D 1xlanes.
+                auto compute_stage = mlir::ktdf::StageOp::create(
+                    ib, il, mlir::ValueRange{it0}, mlir::ValueRange{it1},
+                    [&](mlir::OpBuilder& cb, mlir::Location cl) {
+                      auto read = mlir::ktdf::ReadFromFifoOp::create(
+                          cb, cl,
+                          mlir::RankedTensorType::get(acc_shape, elem_ty),
+                          load_fifo);
+                      auto cur = mlir::bufferization::ToTensorOp::create(
+                          cb, cl,
+                          mlir::RankedTensorType::get(acc_shape, elem_ty), acc,
+                          /*restrict=*/true, /*writable=*/false);
+                      // 2-D identity maps, both operands parallel.
+                      mlir::AffineMap id2 = mlir::AffineMap::getMultiDimIdentityMap(
+                          2, &getContext());
+                      llvm::SmallVector<mlir::AffineMap> maps{id2, id2};
+                      llvm::SmallVector<mlir::utils::IteratorType> iters{
+                          mlir::utils::IteratorType::parallel,
+                          mlir::utils::IteratorType::parallel};
+                      auto generic = mlir::linalg::GenericOp::create(
+                          cb, cl,
+                          mlir::TypeRange{
+                              mlir::RankedTensorType::get(acc_shape, elem_ty)},
+                          mlir::ValueRange{read.getResult()},
+                          mlir::ValueRange{cur.getResult()}, maps, iters);
+                      mlir::Block* body = cb.createBlock(
+                          &generic.getRegion(), generic.getRegion().end(),
+                          mlir::TypeRange{elem_ty, elem_ty},
+                          llvm::SmallVector<mlir::Location>{cl, cl});
+                      {
+                        mlir::OpBuilder::InsertionGuard g(cb);
+                        cb.setInsertionPointToStart(body);
+                        auto sum = mlir::arith::AddFOp::create(
+                            cb, cl, body->getArgument(0), body->getArgument(1));
+                        mlir::linalg::YieldOp::create(cb, cl,
+                                                      sum.getResult());
+                      }
+                      mlir::bufferization::MaterializeInDestinationOp::create(
+                          cb, cl, /*result=*/mlir::Type(), generic.getResult(0),
+                          acc, /*restrict=*/false, /*writable=*/true);
+                    });
+                compute_stage.setApplicableUnitsAttr(
+                    ib.getArrayAttr(resource_kinds_->getComputeKind()));
+              });
+          // scf.for auto-terminator (no results) already inserted.
+
+          // After the %m loop: read the settled accumulator and write it once
+          // into the store FIFO.
+          sb.setInsertionPointAfter(new_loop);
+          auto settled = mlir::bufferization::ToTensorOp::create(
+              sb, sl, mlir::RankedTensorType::get(acc_shape, elem_ty), acc,
+              /*restrict=*/true, /*writable=*/false);
+          mlir::ktdf::WriteToFifoOp::create(sb, sl, settled.getResult(),
+                                            store_fifo);
+        });
+
+    // STORE stage: depends_in(t0), depends_out(t1), UNIT-LESS. Reuses
+    // createDataTransfers for the rank-2 FIFO->view store.
+    mlir::ktdf::StageOp::create(
+        b, l, mlir::ValueRange{t0}, mlir::ValueRange{t1},
+        [&](mlir::OpBuilder& stb, mlir::Location stl) {
+          // The store FIFO sits at outer_private result index loads.size()
+          // (== 1), exactly where createDataTransfers looks for it.
+          createDataTransfers(stb, stl, outer_private, red_spec, tile_sizes_,
+                              /*is_load=*/false,
+                              /*private_result_offset=*/spec.loads.size());
+        });
+  });
+
+  // The reused old loop is now dead; schedule it (and its access tiles / store)
+  // for cleanup.
+  ops_to_delete_.push_back(old_loop.getOperation());
 }
 
 void ConstructThreeStagePipelinePass::deleteOpAndUnusedChainOfOperands(
@@ -1138,11 +1513,18 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
       ctx.storeOp = store_op;
       ctx.errAnchor = store_op.getOperation();
     }
+    ctx.accessTile =
+        access_tile_value.getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>();
 
-    // Resolve source_map + subscript IVs + sizes through the injected blocks.
+    // Resolve source_map + subscript IVs + sizes + the memref value through the
+    // injected address policy. Elementwise yields the raw access tile (step 5
+    // rewrites it into a reinterpret_cast); reduction yields the full memory
+    // view. createDataTransfers itself is policy-free.
     AddressParts address;
+    address.sourceMemref = access_tile_value;
     AddressStatus status =
-        planAddress(ctx, *spec.mapBuilder, *spec.sizeBuilder, address);
+        planAddress(builder, loc, ctx, *spec.mapBuilder, *spec.sizeBuilder,
+                    *spec.memrefBuilder, address);
     if (status == AddressStatus::NoSourceMap) {
       // Same diagnostic/anchor as baseline.
       ctx.errAnchor->emitError(
@@ -1166,16 +1548,46 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
     mlir::AffineMap null_map;
     if (is_load) {
       mlir::ktdf::DataTransferOp::create(
-          builder, loc, access_tile_value, address.sourceMap,
+          builder, loc, address.sourceMemref, address.sourceMap,
           address.subscriptIVs, address.sizes, fifo_slot, null_map,
           mlir::ValueRange{}, fifo_sizes);
     } else {
       mlir::ktdf::DataTransferOp::create(
           builder, loc, fifo_slot, null_map, mlir::ValueRange{}, fifo_sizes,
-          access_tile_value, address.sourceMap, address.subscriptIVs,
+          address.sourceMemref, address.sourceMap, address.subscriptIVs,
           address.sizes);
     }
   }
+}
+
+mlir::Value ConstructThreeStagePipelinePass::materializeFullView(
+    mlir::OpBuilder& builder, mlir::Location loc,
+    mlir::ktdp::ConstructAccessTilesOp access_tile) {
+  mlir::Value memory_view = access_tile.getBase();
+  mlir::Operation* view_op = memory_view.getDefiningOp();
+  assert(view_op && "access tile base must have a defining op");
+
+  auto cached = full_view_cache_.find(view_op);
+  if (cached != full_view_cache_.end()) return cached->second;
+
+  auto view_type = mlir::cast<mlir::MemRefType>(memory_view.getType());
+  auto construct_mem_view =
+      mlir::cast<mlir::ktdp::ConstructMemoryViewOp>(view_op);
+  mlir::Attribute mapped_memory_space =
+      mapMemorySpace(construct_mem_view.getMemorySpaceAttr());
+
+  // Insert the cast at the function-constant point so it dominates every
+  // enclosing loop, right after the view op (which the const builder keeps at
+  // the function head).
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointAfter(view_op);
+  mlir::MemRefType cast_type = mlir::MemRefType::get(
+      view_type.getShape(), view_type.getElementType(), view_type.getLayout(),
+      mapped_memory_space);
+  auto cast = mlir::memref::MemorySpaceCastOp::create(builder, loc, cast_type,
+                                                      memory_view);
+  full_view_cache_[view_op] = cast.getResult();
+  return cast.getResult();
 }
 
 llvm::SmallVector<int64_t>
@@ -1637,6 +2049,39 @@ void ConstructThreeStagePipelinePass::runOnFunc(mlir::func::FuncOp func_op) {
     }
   });
 
+  // Single top-level dispatch: a reduction group reuses the pre-existing loop
+  // nest (no tiling) and emits the nested reduction pipeline; the elementwise
+  // path is 100% unchanged below.
+  std::optional<ReductionInfo> reduction = findReductionLoop(func_op);
+  is_reduction_ = static_cast<bool>(reduction);
+
+  if (is_reduction_) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "  dispatch: reduction group (reusing loop nest, no tiling)\n");
+    PipelineSite site;
+    // The site sits in the block that holds the reused %m loop (the outer
+    // parallel-loop body).
+    site.pos.block = reduction->loop->getBlock();
+    site.spec.loads = load_ops_;
+    site.spec.stores = store_ops_;
+    site.spec.linalgOp = reduction->linalg;
+    site.spec.accumulatorBuf = {};
+    instantiateReductionPipeline(site, *reduction);
+
+    DEBUG_WITH_TYPE(VerboseDebug,
+                    llvm::dbgs() << "After accumulator collapse / pipeline "
+                                    "creation:\n"
+                                 << func_op << "\n\n");
+
+    // Reduction access tiles are addressed via the full view, not
+    // reinterpret_cast; they are cleaned up as dead below.
+    cleanupOperations();
+
+    DEBUG_WITH_TYPE(VerboseDebug, llvm::dbgs() << "After cleanup:\n"
+                                               << func_op << "\n\n");
+    return;
+  }
+
   // Step 3: Create loops from linalg operations
   createLoopsFromLinalg(linalg_ops);
 
@@ -1656,6 +2101,7 @@ void ConstructThreeStagePipelinePass::runOnFunc(mlir::func::FuncOp func_op) {
     // Elementwise composable address blocks (must outlive instantiatePipeline).
     SourceMapFromLinalg elementwiseSourceMap;
     SizesByProjection elementwiseSizes;
+    MemrefPassthrough elementwiseMemref;
 
     // The loop-nest half of the func plan: the manufactured tiling nest are the
     // parallel loops; there are no reduction loops on the elementwise path.
@@ -1676,6 +2122,7 @@ void ConstructThreeStagePipelinePass::runOnFunc(mlir::func::FuncOp func_op) {
     site.spec.accumulatorBuf = {};
     site.spec.mapBuilder = &elementwiseSourceMap;
     site.spec.sizeBuilder = &elementwiseSizes;
+    site.spec.memrefBuilder = &elementwiseMemref;
     sites.push_back(site);
 
     LLVM_DEBUG(llvm::dbgs()
