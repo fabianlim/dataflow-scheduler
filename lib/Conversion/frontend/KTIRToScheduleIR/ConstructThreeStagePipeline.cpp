@@ -32,6 +32,8 @@
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/Support/LogicalResult.h>
 
+#include <functional>
+
 #include "Ktdp/KtdpAttrs.hpp"
 #include "Ktdp/KtdpOps.hpp"
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
@@ -224,6 +226,11 @@ struct PipelineSpec {
   llvm::SmallVector<mlir::ktdp::LoadOp> loads;
   llvm::SmallVector<mlir::ktdp::StoreOp> stores;
   mlir::linalg::LinalgOp linalgOp;
+  // The reduction accumulator buffer (lrfreg), or null for elementwise. This is
+  // the sole discriminator between the elementwise and reduction stage layouts.
+  // For now we model a SINGLE accumulator buffer per reduction (one output
+  // group); the multi-buffer extension (e.g. multiple concurrently-live
+  // accumulators) is deferred.
   mlir::Value accumulatorBuf;  // currently always null (elementwise)
   SourceMapBuilder* mapBuilder;
   SizesBuilder* sizeBuilder;
@@ -237,6 +244,37 @@ struct PipelineSite {
 struct StructuralInfo {
   llvm::SmallVector<mlir::scf::ForOp> parallelLoops;   // nest OUTSIDE the pipeline
   llvm::SmallVector<mlir::scf::ForOp> reductionLoops;  // currently empty
+};
+
+// ---------------------------------------------------------------------------
+// Internal stage-list model (implementation detail; NOT part of the
+// PipelineSite/PipelineSpec/StructuralInfo interface).
+//
+// A ktdf.pipeline is a LINEAR chain of stages. instantiatePipeline derives the
+// chain locally from the spec and emits it with one uniform loop, so the number
+// of stages -- and hence the number of stage-linking tokens -- is data, never a
+// hardcoded constant and never an `is_reduction` fork:
+//
+//   #tokens == #stages     (stage i's depends_out == stage i+1's depends_in)
+//
+// The two shapes this pass produces, both expressed as a list of StageEmit:
+//   - elementwise (accumulatorBuf == null): [ Load, Compute, Store ]  (3 stages)
+//   - reduction   (accumulatorBuf  set):    [ Load+Compute, Store ]   (2 stages)
+//       where the first stage fuses the load transfer with the compute RMW and
+//       nests structural.reductionLoops around them, because the reduction load
+//       is addressed by the reduction IV and must sit inside that loop (the HBM
+//       immutable-base rule keeps the IV in the data_transfer source_map, not
+//       the reinterpret_cast offset, so the transfer op references the IV as an
+//       SSA operand and must be in its scope). Only the reduction stage carries
+//       a loop; every stage's body is otherwise the same work emitters.
+//
+// `isCompute` selects the stage that carries applicable_units=["SFP"] (the
+// compute-role stage; §4.4 cross-pass invariant). `body` emits the stage's work
+// given the private op providing the FIFO slots.
+struct StageEmit {
+  bool isCompute = false;
+  std::function<void(mlir::OpBuilder&, mlir::Location, mlir::ktdf::PrivateOp)>
+      body;
 };
 
 struct ConstructThreeStagePipelinePass
@@ -298,9 +336,11 @@ struct ConstructThreeStagePipelinePass
                            size_t private_result_offset);
 
   // Create ktdf.private operation with FIFO slots and tokens
-  // Returns the created private operation
+  // Returns the created private operation. `num_tokens` is the number of
+  // stage-linking tokens to allocate (one per stage in the linear chain);
+  // the elementwise pipeline has 3 stages -> 3 tokens.
   mlir::ktdf::PrivateOp createPrivateOp(mlir::OpBuilder& builder,
-                                        mlir::Location loc);
+                                        mlir::Location loc, size_t num_tokens);
 
   // Annotate loops with loop_type attributes based on linalg iterator types
   void annotateLoopsWithIteratorTypes(llvm::ArrayRef<mlir::Operation*> loops,
@@ -669,7 +709,7 @@ void ConstructThreeStagePipelinePass::createLoopsFromLinalg(
 }
 
 mlir::ktdf::PrivateOp ConstructThreeStagePipelinePass::createPrivateOp(
-    mlir::OpBuilder& builder, mlir::Location loc) {
+    mlir::OpBuilder& builder, mlir::Location loc, size_t num_tokens) {
   mlir::ktdf::TokenType token_type = mlir::ktdf::TokenType::get(&getContext());
   llvm::SmallVector<mlir::Type> private_result_types;
 
@@ -722,10 +762,11 @@ mlir::ktdf::PrivateOp ConstructThreeStagePipelinePass::createPrivateOp(
     private_result_types.push_back(fifo_slot_type);
   }
 
-  // Add three token types for the three stages
-  private_result_types.push_back(token_type);
-  private_result_types.push_back(token_type);
-  private_result_types.push_back(token_type);
+  // Add one token type per stage (the linear stage chain links stage i's
+  // depends_out to stage i+1's depends_in).
+  for (size_t i = 0; i < num_tokens; ++i) {
+    private_result_types.push_back(token_type);
+  }
 
   // Create ktdf.private operation
   auto private_op =
@@ -751,13 +792,11 @@ mlir::ktdf::PrivateOp ConstructThreeStagePipelinePass::createPrivateOp(
     }
   }
 
-  // Create three tokens
-  auto t1 = mlir::ktdf::CreateTokenOp::create(builder, loc, token_type);
-  auto t2 = mlir::ktdf::CreateTokenOp::create(builder, loc, token_type);
-  auto t3 = mlir::ktdf::CreateTokenOp::create(builder, loc, token_type);
-  fifo_results.push_back(t1.getResult());
-  fifo_results.push_back(t2.getResult());
-  fifo_results.push_back(t3.getResult());
+  // Create one token per stage.
+  for (size_t i = 0; i < num_tokens; ++i) {
+    auto token = mlir::ktdf::CreateTokenOp::create(builder, loc, token_type);
+    fifo_results.push_back(token.getResult());
+  }
 
   // Yield all results
   mlir::ktdf::PrivateYieldOp::create(builder, loc, fifo_results);
@@ -767,9 +806,11 @@ mlir::ktdf::PrivateOp ConstructThreeStagePipelinePass::createPrivateOp(
 
 void ConstructThreeStagePipelinePass::instantiatePipeline(
     const PipelineSite& site, const StructuralInfo& structural) {
-  LLVM_DEBUG(llvm::dbgs() << "Creating ktdf.pipeline with three stages\n");
-
   const PipelineSpec& spec = site.spec;
+  const bool is_reduction = static_cast<bool>(spec.accumulatorBuf);
+  LLVM_DEBUG(llvm::dbgs() << "Creating ktdf.pipeline with three stages "
+                          << "(accumulatorBuf "
+                          << (is_reduction ? "set" : "null") << ")\n");
 
   // The loop body block where the pipeline is materialized, and its enclosing
   // scf.for (the innermost parallel loop).
@@ -826,48 +867,87 @@ void ConstructThreeStagePipelinePass::instantiatePipeline(
     return;
   }
 
+  // Derive the linear stage chain from the spec. The load/compute/store work
+  // emitters are the same in both cases; only their PARTITION into stages (and
+  // whether a stage nests the reduction loop) differs, and it is derived here
+  // from accumulatorBuf -- no is_reduction fork in the emit loop below.
+  //
+  // Work emitters (shared, capture-by-value of the per-stage inputs):
+  auto emit_loads = [this, &spec](mlir::OpBuilder& b, mlir::Location loc,
+                                  mlir::ktdf::PrivateOp private_op) {
+    createDataTransfers(b, loc, private_op, spec, tile_sizes_,
+                        /*is_load=*/true, /*private_result_offset=*/0);
+  };
+  auto emit_compute = [this](mlir::OpBuilder& b, mlir::Location loc,
+                             mlir::ktdf::PrivateOp private_op) {
+    createComputeOps(b, loc, private_op);
+  };
+  auto emit_stores = [this, &spec](mlir::OpBuilder& b, mlir::Location loc,
+                                   mlir::ktdf::PrivateOp private_op) {
+    createDataTransfers(b, loc, private_op, spec, tile_sizes_,
+                        /*is_load=*/false,
+                        /*private_result_offset=*/spec.loads.size());
+  };
+
+  llvm::SmallVector<StageEmit> stages;
+  if (!is_reduction) {
+    // Elementwise: three flat stages -- Load, Compute, Store.
+    stages.push_back({/*isCompute=*/false, emit_loads});
+    stages.push_back({/*isCompute=*/true, emit_compute});
+    stages.push_back({/*isCompute=*/false, emit_stores});
+  } else {
+    // Reduction (compiled but not yet reached -- site derivation still leaves
+    // accumulatorBuf null): two stages. The first FUSES the load transfer and
+    // the compute RMW inside the reduction loop nest; the load is addressed by
+    // the reduction IV, so its data_transfer must sit inside that loop. The
+    // second stage drains the settled accumulator. The reduction *mechanics*
+    // (accumulator rewrite, lrfreg RMW, nesting structural.reductionLoops and
+    // the post-loop write_to_fifo) are added in the following commit; this
+    // arm only records the 2-stage layout so the token/stage count derivation
+    // and the reviewer's mental model are complete.
+    LLVM_DEBUG(llvm::dbgs()
+               << "  reduction layout: fusing load+compute over "
+               << structural.reductionLoops.size() << " reduction loop(s)\n");
+    stages.push_back({/*isCompute=*/true,
+                      [&](mlir::OpBuilder& b, mlir::Location loc,
+                          mlir::ktdf::PrivateOp private_op) {
+                        emit_loads(b, loc, private_op);
+                        emit_compute(b, loc, private_op);
+                      }});
+    stages.push_back({/*isCompute=*/false, emit_stores});
+  }
+
+  LLVM_DEBUG(llvm::dbgs() << "  pipeline has " << stages.size()
+                          << " stage(s) / token(s)\n");
+
   mlir::ktdf::PipelineOp::create(
       builder, innermost_loop.getLoc(),
       [&](mlir::OpBuilder& builder, mlir::Location loc) {
-        // Create ktdf.private operation with FIFO slots and tokens
-        auto private_op = createPrivateOp(builder, loc);
-
-        // Tokens are at the end: fifo_count + 0, fifo_count + 1, fifo_count + 2
+        // One stage-linking token per stage; FIFO slots come first in the
+        // private results, then the tokens.
+        auto private_op = createPrivateOp(builder, loc, stages.size());
         size_t fifo_count = spec.loads.size() + spec.stores.size();
 
-        mlir::ktdf::StageOp::create(
-            builder, loc,
-            /*depends_in=*/{},
-            /*depends_out=*/{private_op.getResult(fifo_count + 0U)},
-            [&](mlir::OpBuilder& builder, mlir::Location loc) {
-              // Add data transfer operations in stage1 for loads
-              createDataTransfers(builder, loc, private_op, spec, tile_sizes_,
-                                  /*is_load=*/true,
-                                  /*private_result_offset=*/0);
-            });
+        // Emit the linear chain uniformly: stage i consumes token i-1 (none for
+        // the first) and produces token i.
+        for (size_t i = 0; i < stages.size(); ++i) {
+          const StageEmit& stage = stages[i];
+          llvm::SmallVector<mlir::Value> depends_in;
+          if (i > 0) {
+            depends_in.push_back(private_op.getResult(fifo_count + i - 1));
+          }
+          mlir::Value depends_out = private_op.getResult(fifo_count + i);
 
-        mlir::ktdf::StageOp::create(
-            builder, loc,
-            /*depends_in=*/{private_op.getResult(fifo_count + 0U)},
-            /*depends_out=*/{private_op.getResult(fifo_count + 1U)},
-            [&](mlir::OpBuilder& builder, mlir::Location loc) {
-              // Create read_from_fifos, compute operations, write_to_fifos in
-              // stage 2 (elementwise arm; accumulatorBuf is null).
-              createComputeOps(builder, loc, private_op);
-            })
-            .setApplicableUnitsAttr(
+          auto stage_op = mlir::ktdf::StageOp::create(
+              builder, loc, depends_in, /*depends_out=*/{depends_out},
+              [&](mlir::OpBuilder& builder, mlir::Location loc) {
+                stage.body(builder, loc, private_op);
+              });
+          if (stage.isCompute) {
+            stage_op.setApplicableUnitsAttr(
                 builder.getArrayAttr(resource_kinds_->getComputeKind()));
-
-        mlir::ktdf::StageOp::create(
-            builder, loc,
-            /*depends_in=*/{private_op.getResult(fifo_count + 1U)},
-            /*depends_out=*/{private_op.getResult(fifo_count + 2U)},
-            [&](mlir::OpBuilder& builder, mlir::Location loc) {
-              // Add data transfer operations in stage3 for stores
-              createDataTransfers(builder, loc, private_op, spec, tile_sizes_,
-                                  /*is_load=*/false,
-                                  /*private_result_offset=*/spec.loads.size());
-            });
+          }
+        }
       });
 }
 
