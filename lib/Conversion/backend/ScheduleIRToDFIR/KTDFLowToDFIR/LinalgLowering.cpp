@@ -23,13 +23,17 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/LinalgLowering.h"
 
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/ReductionLowering.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
+#include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/AffineMap.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
 
@@ -63,12 +67,70 @@ struct LowerLinalgGenericPattern
       return mlir::failure();
     }
 
+    // Detect the reduction accumulator: the op has exactly one DPS init defined
+    // by a bufferization.to_tensor of the lrfreg accumulator view.
+    // NOTE: by the time this pattern runs, buildLogicalMemoryViews (earlier in
+    // this same pass) has already replaced the "lrfreg"-space
+    // unrealized_conversion_cast with a dataflow.get_logical_memory_view of PLAIN
+    // memref type (the memory space is stripped). So we cannot test the memref's
+    // memory space; instead we recognize the accumulator by its backing unit:
+    // to_tensor(get_logical_memory_view(get_local_unit {name="lrfreg"}, ...)).
+    mlir::bufferization::ToTensorOp accToTensor;
+    mlir::Value acc_view;
+    if (generic_op.getNumDpsInits() == 1) {
+      mlir::Value init_val = generic_op.getDpsInits()[0];
+      if (auto tt =
+              init_val.getDefiningOp<mlir::bufferization::ToTensorOp>()) {
+        mlir::Value buf = tt.getBuffer();
+        if (auto view =
+                buf.getDefiningOp<mlir::dataflow::GetLogicalMemoryViewOp>()) {
+          if (auto lu = view.getFromUnit()
+                            .getDefiningOp<mlir::dataflow::GetLocalUnitOp>()) {
+            if (lu.getName() == "lrfreg") {
+              accToTensor = tt;
+              acc_view = buf;
+            }
+          }
+        }
+      }
+    }
+
+    bool is_reduction = static_cast<bool>(accToTensor);
+
     // Replace block arguments with generic inputs
     unsigned num_inputs = generic_op.getNumDpsInputs();
     for (auto [block_arg, input] :
          llvm::zip(body.getArguments().take_front(num_inputs),
                    generic_op.getDpsInputs())) {
       block_arg.replaceAllUsesWith(input);
+    }
+
+    // Replace the outs (DPS init) block args.
+    // For a reduction: load the accumulator from lrfreg and use that as the
+    // outs block arg replacement (the acc_vec from agen.vector_load).
+    // For elementwise: use the DPS init value directly (outs block arg is
+    // unused, so this is a no-op).
+    unsigned num_outputs = generic_op.getNumDpsInits();
+
+    // For the reduction case we emit the vector_load before the block-arg
+    // replacement so we can use it as the outs replacement.
+    mlir::Value acc_vec;
+    if (is_reduction) {
+      rewriter.setInsertionPoint(generic_op);
+      acc_vec = emitLrfregVectorLoad(rewriter, generic_op.getLoc(), acc_view);
+      // Replace outs block arg with acc_vec.
+      body.getArguments()
+          .drop_front(num_inputs)
+          .take_front(num_outputs)[0]
+          .replaceAllUsesWith(acc_vec);
+    } else {
+      for (auto [block_arg, init] :
+           llvm::zip(
+               body.getArguments().drop_front(num_inputs).take_front(
+                   num_outputs),
+               generic_op.getDpsInits())) {
+        block_arg.replaceAllUsesWith(init);
+      }
     }
 
     // Identity affine map used as op_specific_map for binary ops.
@@ -83,6 +145,7 @@ struct LowerLinalgGenericPattern
 
     // Process and lower compute operations
     rewriter.setInsertionPoint(generic_op);
+
     for (mlir::Operation* op : ops_to_lower) {
       // arith.mulf %lhs, %rhs -> vectorchain.binary {binary_op = mul}
       if (auto mulf_op = llvm::dyn_cast<mlir::arith::MulFOp>(op)) {
@@ -133,8 +196,17 @@ struct LowerLinalgGenericPattern
       }
     }
 
-    // Replace the generic op with the yield operand
-    rewriter.replaceOp(generic_op, yield_op.getOperand(0));
+    // After the binary body ops are lowered, the yield operand is now a
+    // vectorchain result (or the original value for elementwise no-body cases).
+    mlir::Value result = yield_op.getOperand(0);
+
+    if (is_reduction) {
+      emitReductionWriteBack(rewriter, generic_op, accToTensor, result,
+                             acc_view);
+    } else {
+      // Replace the generic op with the yield operand
+      rewriter.replaceOp(generic_op, result);
+    }
     return mlir::success();
   }
 

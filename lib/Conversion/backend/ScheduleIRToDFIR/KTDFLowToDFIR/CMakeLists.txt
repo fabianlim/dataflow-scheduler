@@ -6,6 +6,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFLowToDFIR
     PreludeWorkPartition.cpp
     ProgramUnitBuilder.cpp
     QueryMapArithCollapse.cpp
+    ReductionLowering.cpp
     UnitTypeDiscovery.cpp
     Utils.cpp
     BufferPhaseLowering.cpp
@@ -43,4 +44,5 @@ mlir_target_link_libraries(DataflowSchedulerKTDFLowToDFIR PUBLIC
   MLIRPass
   MLIRSCFDialect
   MLIRTransformUtils
+  MLIRBufferizationDialect
 )

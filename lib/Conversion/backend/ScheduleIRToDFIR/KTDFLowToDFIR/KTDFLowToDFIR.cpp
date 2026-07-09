@@ -29,6 +29,8 @@
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/LogicalMemoryViewBuilder.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/OperationLowerings.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/ReductionLowering.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/PreludeWorkPartition.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/ProgramUnitBuilder.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/QueryMapArithCollapse.h"
@@ -40,10 +42,14 @@
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLowering.h"
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
+#include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "llvm/Support/Debug.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Rewrite/FrozenRewritePatternSet.h"
@@ -150,6 +156,13 @@ struct KTDFLowToDFIRPass
                                              components, resource_kinds))) {
         return signalPassFailure();
       }
+
+      // Peel the first iteration of each compute reduction loop so the
+      // lrfreg accumulator is initialised by an unconditional store (the
+      // reset).  Must run after runOperationLowerings (which produces the
+      // final receive / vector_load / binary / vector_store ops) and before
+      // canonicalizeFunc (which may fold the new lb arithmetic).
+      peelReductionComputeLoop(func);
 
       // Final cleanup: canonicalize + DCE the fully-lowered function so the
       // emitted DFIR has no dead/duplicate/foldable leftovers (duplicate

@@ -42,7 +42,11 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -52,6 +56,23 @@
 using namespace scheduler;
 
 namespace {
+
+/// Returns the lrfreg view if `val` is insert_slice(to_tensor(lrfreg_view)),
+/// otherwise returns nullptr. The lrfreg view is recognized by its backing
+/// get_local_unit {name="lrfreg"}.
+static mlir::Value getLrfregViewFromInsertSlice(mlir::Value val) {
+  auto ins = val.getDefiningOp<mlir::tensor::InsertSliceOp>();
+  if (!ins) return nullptr;
+  auto tt = ins.getSource().getDefiningOp<mlir::bufferization::ToTensorOp>();
+  if (!tt) return nullptr;
+  auto view =
+      tt.getBuffer().getDefiningOp<mlir::dataflow::GetLogicalMemoryViewOp>();
+  if (!view) return nullptr;
+  auto lu =
+      view.getFromUnit().getDefiningOp<mlir::dataflow::GetLocalUnitOp>();
+  if (!lu || lu.getName() != "lrfreg") return nullptr;
+  return tt.getBuffer();
+}
 
 /// Pattern to lower ktdf.read_from_fifo operations
 struct LowerReadFromFifoPattern
@@ -152,9 +173,21 @@ struct LowerWriteToFifoPattern
     auto fifo_slot_type =
         llvm::cast<mlir::ktdf::FifoSlotType>(write_op.getFifoSlot().getType());
 
+    // Resolve the data to send. Post-loop reduction accumulator store: the data
+    // is insert_slice(to_tensor(lrfreg view)) — a tensor that no other pattern
+    // vectorizes. Load the accumulator from its view as a vector and bypass the
+    // insert_slice (the FIFO/send flattens to the lane count anyway).
+    //
+    // Use the raw operand rather than getData(): by this phase the compute
+    // linalg may already be vectorized, so the operand can be a vector (the
+    // tensor-typed getData() accessor would assert). getFlattenedVectorType
+    // below handles both tensor and vector.
+    mlir::Value data = write_op->getOperand(0);
+    if (auto acc_view = getLrfregViewFromInsertSlice(data))
+      data = emitLrfregVectorLoad(rewriter, write_op.getLoc(), acc_view);
+
     // Convert data type (tensor or vector) to flattened vector type
-    auto vector_type =
-        getFlattenedVectorType(write_op.getData().getType(), resource_kinds_);
+    auto vector_type = getFlattenedVectorType(data.getType(), resource_kinds_);
     if (!vector_type) {
       return mlir::failure();
     }
@@ -197,7 +230,7 @@ struct LowerWriteToFifoPattern
 
     // Create dataflow.send operation
     mlir::dataflow::SendOp::create(rewriter, write_op.getLoc(), queried_unit,
-                                   write_op.getData(), /*dir=*/nullptr,
+                                   data, /*dir=*/nullptr,
                                    /*dbgName=*/nullptr);
 
     // Erase the write_to_fifo operation
@@ -439,19 +472,35 @@ mlir::LogicalResult scheduler::runOperationLowerings(
     const scheduler::SchedulerExtContext& scheduler_ctx,
     const ResourceToUnits& components,
     arch_view::ResourceKinds& resource_kinds) {
-  // Lower linalg.generic compute operations and FIFO operations
-  mlir::RewritePatternSet patterns(func.getContext());
-  populateLinalgLoweringPatterns(patterns, scheduler_ctx, resource_kinds);
-  patterns.add<LowerReadFromFifoPattern>(func.getContext(), scheduler_ctx,
-                                         resource_kinds, components);
-  patterns.add<LowerWriteToFifoPattern>(func.getContext(), scheduler_ctx,
-                                        resource_kinds, components);
-  populateDataTransferLoweringPatterns(patterns, scheduler_ctx, components);
-  patterns.add<LowerSignalPattern>(func.getContext(), scheduler_ctx,
-                                   components);
-  patterns.add<LowerGetTileSizePattern>(func.getContext(), scheduler_ctx,
-                                        components);
-  if (mlir::failed(mlir::applyPatternsGreedily(func, std::move(patterns)))) {
+  // Run linalg lowering first in its own pass so that the transient
+  // bufferization bridge ops (bufferization.to_tensor /
+  // bufferization.materialize_in_destination) introduced by the reduction
+  // accumulator path are fully erased before the main driver runs.  This lets
+  // the main driver use the default folding-enabled config safely.
+  mlir::RewritePatternSet linalg_patterns(func.getContext());
+  populateLinalgLoweringPatterns(linalg_patterns, scheduler_ctx, resource_kinds);
+  if (mlir::failed(
+          mlir::applyPatternsGreedily(func, std::move(linalg_patterns)))) {
+    return mlir::failure();
+  }
+
+  // Lower FIFO, data-transfer, signal, and tile-size operations with folding
+  // re-enabled (the default); the transient bridge ops are gone by this point.
+  mlir::RewritePatternSet remaining_patterns(func.getContext());
+  remaining_patterns.add<LowerReadFromFifoPattern>(func.getContext(),
+                                                   scheduler_ctx,
+                                                   resource_kinds, components);
+  remaining_patterns.add<LowerWriteToFifoPattern>(func.getContext(),
+                                                  scheduler_ctx,
+                                                  resource_kinds, components);
+  populateDataTransferLoweringPatterns(remaining_patterns, scheduler_ctx,
+                                       components);
+  remaining_patterns.add<LowerSignalPattern>(func.getContext(), scheduler_ctx,
+                                             components);
+  remaining_patterns.add<LowerGetTileSizePattern>(func.getContext(),
+                                                  scheduler_ctx, components);
+  if (mlir::failed(
+          mlir::applyPatternsGreedily(func, std::move(remaining_patterns)))) {
     return mlir::failure();
   }
 

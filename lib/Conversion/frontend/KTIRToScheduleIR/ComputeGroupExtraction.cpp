@@ -324,6 +324,23 @@ static void materializeDependency(mlir::Value val, mlir::IRMapping& mapper,
   builder.clone(*op, mapper);
 }
 
+// A loop nest is a reduction compute group when it contains both a ktdp.load
+// and a ktdp.store that live in *different* blocks of the nest — the per-block
+// straight-line scan pairs a load with a store only within one block, so it
+// cannot capture this shape (loads in the reduction loop body, store in the
+// outer output-partition loop body). Such a nest is extracted wholesale as its
+// outermost loop.
+static bool loopNestBracketsCrossBlockLoadStore(mlir::scf::ForOp for_op) {
+  mlir::ktdp::LoadOp a_load;
+  mlir::ktdp::StoreOp a_store;
+  for_op.walk([&](mlir::Operation* op) {
+    if (auto l = mlir::dyn_cast<mlir::ktdp::LoadOp>(op)) a_load = l;
+    if (auto s = mlir::dyn_cast<mlir::ktdp::StoreOp>(op)) a_store = s;
+  });
+  if (!a_load || !a_store) return false;
+  return a_load->getBlock() != a_store->getBlock();
+}
+
 void ComputeGroupExtractionPass::extractComputeGroup(
     mlir::ModuleOp top_level_module, mlir::ModuleOp original_module,
     const ComputeGroup& group) {
@@ -354,13 +371,26 @@ void ComputeGroupExtractionPass::extractComputeGroup(
     }
   }
 
+  // Values used by the range but defined outside it: each op's operands, plus
+  // the free variables of any nested regions (so a whole loop nest extracted as
+  // one op pulls in the memory views / constants its body references).
+  llvm::SmallVector<mlir::Value> external_values;
+  for (mlir::Operation* op : ops_to_move) {
+    for (mlir::Value operand : op->getOperands()) {
+      external_values.push_back(operand);
+    }
+    for (mlir::Region& region : op->getRegions()) {
+      llvm::SetVector<mlir::Value> free_vals;
+      mlir::getUsedValuesDefinedAbove(region, free_vals);
+      for (mlir::Value v : free_vals) external_values.push_back(v);
+    }
+  }
+
   // Collect args (block arguments) needed by the extracted function
   llvm::SmallVector<mlir::Value> args;
   llvm::DenseSet<mlir::Operation*> visited;
-  for (mlir::Operation* op : ops_to_move) {
-    for (mlir::Value operand : op->getOperands()) {
-      collectArgsUsed(operand, visited, args);
-    }
+  for (mlir::Value ext : external_values) {
+    collectArgsUsed(ext, visited, args);
   }
 
   // Build function type with args as parameters
@@ -429,11 +459,10 @@ void ComputeGroupExtractionPass::extractComputeGroup(
   }
 
   // Step 1: Materialize all dependencies for the entire range.
-  // (e.g. arith.constants, construct_memory_views, construct_access_tiles)
-  for (mlir::Operation* op : ops_to_move) {
-    for (mlir::Value operand : op->getOperands()) {
-      materializeDependency(operand, mapper, builder);
-    }
+  // (e.g. arith.constants, construct_memory_views, construct_access_tiles),
+  // including the free variables of nested regions collected above.
+  for (mlir::Value ext : external_values) {
+    materializeDependency(ext, mapper, builder);
   }
 
   // Step 2: Clone the actual range
@@ -579,8 +608,32 @@ void ComputeGroupExtractionPass::processBlockForExtraction(
 }
 
 void ComputeGroupExtractionPass::runOn(mlir::ModuleOp module_op) {
-  // Walk all blocks and collect compute groups to extract
+  // First pass: detect loop-nest reduction compute groups. Their loads and
+  // store span different blocks of the nest (loads in the reduction loop body,
+  // store in the outer output-partition loop body), so the per-block scan below
+  // cannot pair them; extract the outermost bracketing loop wholesale.
+  llvm::SmallPtrSet<mlir::Operation*, 4> loop_nest_roots;
+  module_op.walk([&](mlir::func::FuncOp func) {
+    for (mlir::Block& body_block : func.getBody()) {
+      for (mlir::Operation& op : body_block) {
+        auto for_op = mlir::dyn_cast<mlir::scf::ForOp>(&op);
+        if (for_op && loopNestBracketsCrossBlockLoadStore(for_op)) {
+          groups_to_extract_.push_back({for_op, for_op});
+          loop_nest_roots.insert(for_op);
+        }
+      }
+    }
+  });
+
+  // Walk all blocks and collect (straight-line) compute groups to extract.
   module_op.walk([&](mlir::Block* block) {
+    // Skip blocks that live inside an already-claimed loop-nest group.
+    for (mlir::Operation* root : loop_nest_roots) {
+      if (root->isAncestor(block->getParentOp())) {
+        return mlir::WalkResult::advance();
+      }
+    }
+
     llvm::EquivalenceClasses<mlir::Value> access_tile_eq_classes;
 
     buildAccessTileEqClasses(block, access_tile_eq_classes);

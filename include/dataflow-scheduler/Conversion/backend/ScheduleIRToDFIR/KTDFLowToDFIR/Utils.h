@@ -26,8 +26,11 @@
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/Location.h"
+#include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 
@@ -73,6 +76,12 @@ mlir::LogicalResult replaceComputeTileIdWithCoreQuery(
     llvm::DenseMap<int64_t, mlir::Value>& core_id_consts,
     mlir::OpBuilder& const_builder);
 
+/// Build IntegerSet: d0 in [0, num_lanes - 1].
+/// Used for lrfreg vector-access constraints (load/store on all lanes).
+/// `num_lanes` is the SFP SIMD width
+mlir::IntegerSet buildLaneIntegerSet(mlir::MLIRContext* ctx,
+                                     int64_t num_lanes);
+
 /// Determine the data transfer type based on source and destination types.
 /// @param src_is_fifo True if source is a FIFO slot, false if memref
 /// @param dst_is_fifo True if destination is a FIFO slot, false if memref
@@ -80,6 +89,29 @@ mlir::LogicalResult replaceComputeTileIdWithCoreQuery(
 /// ReceiveAndStore)
 scheduler::DataTransferType getDataTransferType(bool src_is_fifo,
                                                 bool dst_is_fifo);
+
+/// Returns true if `ms` is a compute-local memory space (e.g. lrfreg).
+/// Compute-local spaces are accessed via get_local_unit rather than a
+/// global memory address; they are not routable through the arch graph.
+bool isComputeLocalMemorySpace(mlir::Attribute ms);
+
+/// Returns true if `ms` is a compute-local memory space (e.g. lrfreg).
+/// String overload for call sites that hold a StringRef from mapMemorySpace.
+bool isComputeLocalMemorySpace(llvm::StringRef ms);
+
+/// Returns true if `ms` is a per-core scratchpad memory space (e.g. LX).
+/// Per-core scratchpad is shared within a core but not compute-local; it is
+/// accessible via routable datapaths (LXLU/LXSU) unlike lrfreg.
+bool isPerCoreScratchpadMemorySpace(llvm::StringRef ms);
+
+/// Emit agen.vector_load from a 1-D lrfreg memref view at index 0.
+/// Returns the loaded vector value.
+mlir::Value emitLrfregVectorLoad(mlir::OpBuilder& builder, mlir::Location loc,
+                                 mlir::Value view);
+
+/// Emit agen.vector_store of `vec` to a 1-D lrfreg memref view at index 0.
+void emitLrfregVectorStore(mlir::OpBuilder& builder, mlir::Location loc,
+                           mlir::Value vec, mlir::Value view);
 
 }  // namespace scheduler
 

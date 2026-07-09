@@ -21,6 +21,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/PipelineScope.h"
+#include "dataflow-scheduler/Dialect/KTDF/Analysis/Utils.h"
 
 using namespace mlir;
 using namespace mlir::ktdf;
@@ -62,7 +63,10 @@ auto mlir::ktdf::getPipelineEnclosingScope(PipelineOp pipeline)
       break;
     }
     auto for_op = cast<scf::ForOp>(parent);
-    if (!loopHasNoPeerPipeline(for_op, current)) {
+    // A loop annotated parallel_loop replicates its entire body per instance,
+    // so multiple enclosed pipelines legitimately share that scope.  Bypass the
+    // peer-pipeline gate for such loops; keep the gate for all other loops.
+    if (!isParallelLoop(for_op) && !loopHasNoPeerPipeline(for_op, current)) {
       break;
     }
     scope.loops.push_back(for_op);
