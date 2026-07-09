@@ -101,6 +101,144 @@ auto maxOrDefault(llvm::ArrayRef<T> items) -> T {
 
 namespace {
 
+// ---------------------------------------------------------------------------
+// Site-based pipeline construction scaffolding.
+//
+// A func's plan is a StructuralInfo (the loop-nest half) plus a list of
+// PipelineSite (one per compute group). instantiatePipeline materializes one
+// ktdf.pipeline per site. Currently only the elementwise path is exercised:
+// accumulatorBuf is always null and reductionLoops is always empty, so there is
+// no is_reduction branch anywhere in the emitter.
+// ---------------------------------------------------------------------------
+
+// Forward declarations of the baseline address helpers (defined later in this
+// file). The elementwise composable blocks are verbatim lifts that delegate to
+// these.
+static std::optional<mlir::AffineMap> findIndexingMapForLoadResult(
+    mlir::linalg::LinalgOp linalg_op, mlir::Value tensor_value);
+static std::optional<mlir::AffineMap> findIndexingMapForStoreSource(
+    mlir::linalg::LinalgOp linalg_op, mlir::Value tensor_value);
+static mlir::LogicalResult projectSizesThroughIndexingMap(
+    mlir::AffineMap indexing_map, llvm::ArrayRef<int64_t> tile_sizes,
+    llvm::SmallVectorImpl<int64_t>& projected_sizes,
+    mlir::function_ref<mlir::InFlightDiagnostic()> emit_error);
+
+// The context injected into the composable address blocks. Minimal: only what
+// the two elementwise blocks read.
+struct AddrCtx {
+  mlir::linalg::LinalgOp linalgOp;  // the fused generic (compute_ops_[0])
+  mlir::ktdp::LoadOp loadOp;        // valid iff is_load
+  mlir::ktdp::StoreOp storeOp;      // valid iff !is_load
+  bool is_load;
+  llvm::SmallVector<mlir::Value> tiledLoopIVs;  // subscript IVs
+  llvm::ArrayRef<int64_t> tileSizes;            // tile_sizes_
+  mlir::Operation* errAnchor;                   // diagnostic anchor
+};
+
+struct AddressParts {
+  mlir::AffineMap sourceMap;
+  llvm::SmallVector<mlir::Value> subscriptIVs;
+  llvm::SmallVector<int64_t> sizes;
+};
+
+// Source-map builder: returns nullopt on failure (caller emits the diagnostic
+// on errAnchor, exactly as the baseline did).
+struct SourceMapBuilder {
+  virtual ~SourceMapBuilder() = default;
+  virtual std::optional<mlir::AffineMap> build(AddrCtx&) = 0;
+};
+
+// Sizes builder: fills `out` with the projected sizes; returns failure (and has
+// emitted its own diagnostic) on an unsupported map, matching the baseline.
+struct SizesBuilder {
+  virtual ~SizesBuilder() = default;
+  virtual mlir::LogicalResult build(AddrCtx&, mlir::AffineMap,
+                                    llvm::SmallVectorImpl<int64_t>&) = 0;
+};
+
+// Elementwise source map = the linalg operand's indexing map (verbatim lift of
+// findIndexingMapForLoadResult / findIndexingMapForStoreSource selection).
+struct SourceMapFromLinalg : SourceMapBuilder {
+  std::optional<mlir::AffineMap> build(AddrCtx& ctx) override {
+    LLVM_DEBUG(llvm::dbgs()
+               << "    SourceMapFromLinalg: building "
+               << (ctx.is_load ? "load" : "store") << " source_map\n");
+    if (ctx.is_load) {
+      return findIndexingMapForLoadResult(ctx.linalgOp,
+                                          ctx.loadOp.getResult());
+    }
+    return findIndexingMapForStoreSource(ctx.linalgOp,
+                                         ctx.storeOp.getDataTile());
+  }
+};
+
+// Elementwise sizes = tile_sizes projected through the indexing map (verbatim
+// lift of the projectSizesThroughIndexingMap call).
+struct SizesByProjection : SizesBuilder {
+  mlir::LogicalResult build(AddrCtx& ctx, mlir::AffineMap sourceMap,
+                            llvm::SmallVectorImpl<int64_t>& out) override {
+    LLVM_DEBUG(llvm::dbgs()
+               << "    SizesByProjection: projecting tile sizes through the "
+                  "indexing map\n");
+    return projectSizesThroughIndexingMap(
+        sourceMap, ctx.tileSizes, out,
+        [&]() { return ctx.errAnchor->emitError(); });
+  }
+};
+
+// Result of planAddress: distinguishes the two baseline failure modes so the
+// caller can reproduce the exact diagnostics.
+enum class AddressStatus { Ok, NoSourceMap, SizesFailed };
+
+// The single per-transfer address entry point. The offset is NOT computed here
+// (it stays in computeReinterpretCastOffset). subscriptIVs are always the
+// tiled-loop IVs. On NoSourceMap the caller emits the "could not locate"
+// diagnostic; on SizesFailed the sizes builder has already emitted its own
+// diagnostic.
+static AddressStatus planAddress(AddrCtx& ctx, SourceMapBuilder& mapB,
+                                 SizesBuilder& sizeB, AddressParts& out) {
+  LLVM_DEBUG(llvm::dbgs() << "  planAddress for "
+                          << (ctx.is_load ? "load" : "store") << " transfer\n");
+  std::optional<mlir::AffineMap> sourceMap = mapB.build(ctx);
+  if (!sourceMap) {
+    LLVM_DEBUG(llvm::dbgs() << "  planAddress: no source_map (NoSourceMap)\n");
+    return AddressStatus::NoSourceMap;
+  }
+
+  out.sourceMap = *sourceMap;
+  out.subscriptIVs = ctx.tiledLoopIVs;
+  if (mlir::failed(sizeB.build(ctx, out.sourceMap, out.sizes))) {
+    LLVM_DEBUG(llvm::dbgs() << "  planAddress: sizes builder failed "
+                               "(SizesFailed)\n");
+    return AddressStatus::SizesFailed;
+  }
+  LLVM_DEBUG(llvm::dbgs() << "  planAddress: Ok\n");
+  return AddressStatus::Ok;
+}
+
+struct SitePosition {
+  mlir::Block* block;  // the loop body block to insert the pipeline into
+};
+
+struct PipelineSpec {
+  llvm::SmallVector<mlir::ktdp::LoadOp> loads;
+  llvm::SmallVector<mlir::ktdp::StoreOp> stores;
+  mlir::linalg::LinalgOp linalgOp;
+  mlir::Value accumulatorBuf;  // currently always null (elementwise)
+  SourceMapBuilder* mapBuilder;
+  SizesBuilder* sizeBuilder;
+};
+
+struct PipelineSite {
+  SitePosition pos;
+  PipelineSpec spec;
+};
+
+struct StructuralInfo {
+  llvm::SmallVector<mlir::scf::ForOp> parallelLoops;   // nest OUTSIDE the pipeline
+  llvm::SmallVector<mlir::scf::ForOp> reductionLoops;  // currently empty
+};
+
 struct ConstructThreeStagePipelinePass
     : public impl::ConstructThreeStagePipelinePassBase<
           ConstructThreeStagePipelinePass> {
@@ -137,9 +275,12 @@ struct ConstructThreeStagePipelinePass
   // Create loops from linalg operations by tiling
   void createLoopsFromLinalg(llvm::ArrayRef<mlir::linalg::LinalgOp> linalg_ops);
 
-  // Create a 3-stage pipeline inside innermost_loop, with one stage for loads,
-  // computes, stores.
-  void createPipeline(mlir::scf::ForOp innermost_loop);
+  // Materialize ONE ktdf.pipeline for `site`. The single uniform body: build
+  // ktdf.private, then load/compute/store stages. Currently handles only the
+  // elementwise arm. Reads from a PipelineSite + StructuralInfo rather than
+  // pass member state.
+  void instantiatePipeline(const PipelineSite& site,
+                           const StructuralInfo& structural);
 
   // Create linalg compute operations in stage 2
   void createComputeOps(mlir::OpBuilder& builder, mlir::Location loc,
@@ -152,6 +293,7 @@ struct ConstructThreeStagePipelinePass
   //   this transfer start.
   void createDataTransfers(mlir::OpBuilder& builder, mlir::Location loc,
                            mlir::ktdf::PrivateOp private_op,
+                           const PipelineSpec& spec,
                            llvm::ArrayRef<int64_t> tile_sizes, bool is_load,
                            size_t private_result_offset);
 
@@ -623,12 +765,20 @@ mlir::ktdf::PrivateOp ConstructThreeStagePipelinePass::createPrivateOp(
   return private_op;
 }
 
-void ConstructThreeStagePipelinePass::createPipeline(
-    mlir::scf::ForOp innermost_loop) {
+void ConstructThreeStagePipelinePass::instantiatePipeline(
+    const PipelineSite& site, const StructuralInfo& structural) {
   LLVM_DEBUG(llvm::dbgs() << "Creating ktdf.pipeline with three stages\n");
 
+  const PipelineSpec& spec = site.spec;
+
+  // The loop body block where the pipeline is materialized, and its enclosing
+  // scf.for (the innermost parallel loop).
+  mlir::Block* body_block = site.pos.block;
+  auto innermost_loop =
+      mlir::cast<mlir::scf::ForOp>(body_block->getParentOp());
+
   compute_ops_.clear();
-  innermost_loop.getBody()->walk([&](mlir::linalg::LinalgOp linalg_op) {
+  body_block->walk([&](mlir::linalg::LinalgOp linalg_op) {
     compute_ops_.push_back(linalg_op);
   });
 
@@ -639,7 +789,7 @@ void ConstructThreeStagePipelinePass::createPipeline(
   // yield. This ensures tensor.insert_slice and linalg.generic get cleaned up
   // later.
   auto yield_op =
-      mlir::cast<mlir::scf::YieldOp>(innermost_loop.getBody()->getTerminator());
+      mlir::cast<mlir::scf::YieldOp>(body_block->getTerminator());
   for (mlir::Value operand : yield_op.getOperands()) {
     if (auto* def_op = operand.getDefiningOp()) {
       ops_to_delete_.push_back(def_op);
@@ -683,7 +833,7 @@ void ConstructThreeStagePipelinePass::createPipeline(
         auto private_op = createPrivateOp(builder, loc);
 
         // Tokens are at the end: fifo_count + 0, fifo_count + 1, fifo_count + 2
-        size_t fifo_count = load_ops_.size() + store_ops_.size();
+        size_t fifo_count = spec.loads.size() + spec.stores.size();
 
         mlir::ktdf::StageOp::create(
             builder, loc,
@@ -691,7 +841,7 @@ void ConstructThreeStagePipelinePass::createPipeline(
             /*depends_out=*/{private_op.getResult(fifo_count + 0U)},
             [&](mlir::OpBuilder& builder, mlir::Location loc) {
               // Add data transfer operations in stage1 for loads
-              createDataTransfers(builder, loc, private_op, tile_sizes_,
+              createDataTransfers(builder, loc, private_op, spec, tile_sizes_,
                                   /*is_load=*/true,
                                   /*private_result_offset=*/0);
             });
@@ -702,7 +852,7 @@ void ConstructThreeStagePipelinePass::createPipeline(
             /*depends_out=*/{private_op.getResult(fifo_count + 1U)},
             [&](mlir::OpBuilder& builder, mlir::Location loc) {
               // Create read_from_fifos, compute operations, write_to_fifos in
-              // stage 2
+              // stage 2 (elementwise arm; accumulatorBuf is null).
               createComputeOps(builder, loc, private_op);
             })
             .setApplicableUnitsAttr(
@@ -714,9 +864,9 @@ void ConstructThreeStagePipelinePass::createPipeline(
             /*depends_out=*/{private_op.getResult(fifo_count + 2U)},
             [&](mlir::OpBuilder& builder, mlir::Location loc) {
               // Add data transfer operations in stage3 for stores
-              createDataTransfers(builder, loc, private_op, tile_sizes_,
+              createDataTransfers(builder, loc, private_op, spec, tile_sizes_,
                                   /*is_load=*/false,
-                                  /*private_result_offset=*/load_ops_.size());
+                                  /*private_result_offset=*/spec.loads.size());
             });
       });
 }
@@ -827,8 +977,9 @@ static mlir::LogicalResult projectSizesThroughIndexingMap(
 
 void ConstructThreeStagePipelinePass::createDataTransfers(
     mlir::OpBuilder& builder, mlir::Location loc,
-    mlir::ktdf::PrivateOp private_op, llvm::ArrayRef<int64_t> tile_sizes,
-    bool is_load, size_t private_result_offset) {
+    mlir::ktdf::PrivateOp private_op, const PipelineSpec& spec,
+    llvm::ArrayRef<int64_t> tile_sizes, bool is_load,
+    size_t private_result_offset) {
   // Collect loop induction variables from tiled loops
   llvm::SmallVector<mlir::Value> loop_ivs;
   for (auto* loop_op : tiled_loops_) {
@@ -842,7 +993,7 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
   });
 
   // Get the appropriate operation list
-  size_t op_count = is_load ? load_ops_.size() : store_ops_.size();
+  size_t op_count = is_load ? spec.loads.size() : spec.stores.size();
 
   // FIFO slot size is the product of tile_sizes (i.e. total_num_elements_)
   llvm::SmallVector<int64_t> fifo_sizes = {total_num_elements_};
@@ -883,43 +1034,46 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
   // load/store operand maps onto the iteration space.
   assert(compute_ops_.size() == 1 &&
          "expected exactly one linalg compute op after fusion");
-  mlir::linalg::LinalgOp linalg_op = compute_ops_[0];
+  mlir::linalg::LinalgOp linalg_op = spec.linalgOp;
 
   // Create data_transfer for each operation
   for (size_t i = 0; i < op_count; ++i) {
-    // Get the access_tile value (operand of load/store op) and the linalg
-    // indexing map for the matching operand.
+    // Build the address context for this transfer and resolve the source_map,
+    // subscript IVs, and sizes through the injected composable blocks. The
+    // offset is NOT computed here (stays in computeReinterpretCastOffset).
     mlir::Value access_tile_value;
-    std::optional<mlir::AffineMap> indexing_map;
-    mlir::Operation* err_anchor;
+    AddrCtx ctx;
+    ctx.linalgOp = linalg_op;
+    ctx.is_load = is_load;
+    ctx.tiledLoopIVs = loop_ivs;
+    ctx.tileSizes = tile_sizes;
     if (is_load) {
-      mlir::ktdp::LoadOp load_op = load_ops_[i];
+      mlir::ktdp::LoadOp load_op = spec.loads[i];
       access_tile_value = load_op.getAccessTile();
-      err_anchor = load_op.getOperation();
-      indexing_map =
-          findIndexingMapForLoadResult(linalg_op, load_op.getResult());
+      ctx.loadOp = load_op;
+      ctx.errAnchor = load_op.getOperation();
     } else {
-      mlir::ktdp::StoreOp store_op = store_ops_[i];
+      mlir::ktdp::StoreOp store_op = spec.stores[i];
       access_tile_value = store_op.getAccessTile();
-      err_anchor = store_op.getOperation();
-      indexing_map =
-          findIndexingMapForStoreSource(linalg_op, store_op.getDataTile());
+      ctx.storeOp = store_op;
+      ctx.errAnchor = store_op.getOperation();
     }
 
-    if (!indexing_map) {
-      err_anchor->emitError(
+    // Resolve source_map + subscript IVs + sizes through the injected blocks.
+    AddressParts address;
+    AddressStatus status =
+        planAddress(ctx, *spec.mapBuilder, *spec.sizeBuilder, address);
+    if (status == AddressStatus::NoSourceMap) {
+      // Same diagnostic/anchor as baseline.
+      ctx.errAnchor->emitError(
           "could not locate matching linalg operand to project loop IVs and "
           "tile sizes through; the data_transfer rank would not match the "
           "underlying memref");
       signalPassFailure();
       return;
     }
-
-    // Project tile_sizes through the operand's indexing map.
-    llvm::SmallVector<int64_t> access_tile_sizes;
-    if (mlir::failed(projectSizesThroughIndexingMap(
-            *indexing_map, tile_sizes, access_tile_sizes,
-            [&]() { return err_anchor->emitError(); }))) {
+    if (status == AddressStatus::SizesFailed) {
+      // The sizes builder already emitted its diagnostic.
       signalPassFailure();
       return;
     }
@@ -928,18 +1082,18 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
     mlir::Value fifo_slot = private_op.getResult(private_result_offset + i);
 
     // The fifo side gets a null AffineMap; the access-tile (memref) side
-    // gets the linalg operand's indexing map directly. loop_ivs feeds the
-    // map's dim inputs.
+    // gets the resolved source_map. subscriptIVs feed the map's dim inputs.
     mlir::AffineMap null_map;
     if (is_load) {
-      mlir::ktdf::DataTransferOp::create(builder, loc, access_tile_value,
-                                         *indexing_map, loop_ivs,
-                                         access_tile_sizes, fifo_slot, null_map,
-                                         mlir::ValueRange{}, fifo_sizes);
+      mlir::ktdf::DataTransferOp::create(
+          builder, loc, access_tile_value, address.sourceMap,
+          address.subscriptIVs, address.sizes, fifo_slot, null_map,
+          mlir::ValueRange{}, fifo_sizes);
     } else {
       mlir::ktdf::DataTransferOp::create(
           builder, loc, fifo_slot, null_map, mlir::ValueRange{}, fifo_sizes,
-          access_tile_value, *indexing_map, loop_ivs, access_tile_sizes);
+          access_tile_value, address.sourceMap, address.subscriptIVs,
+          address.sizes);
     }
   }
 }
@@ -1409,10 +1563,47 @@ void ConstructThreeStagePipelinePass::runOnFunc(mlir::func::FuncOp func_op) {
   DEBUG_WITH_TYPE(VerboseDebug, llvm::dbgs() << "After loops created:\n"
                                              << func_op << "\n\n");
 
-  // Step 4: Create pipeline if we have tiled loops
+  // Step 4: Derive the pipeline site(s) and instantiate them uniformly.
   if (!tiled_loops_.empty()) {
     auto innermost_loop = llvm::cast<mlir::scf::ForOp>(tiled_loops_.back());
-    createPipeline(innermost_loop);
+
+    // The fused compute op whose indexing maps describe each transfer.
+    mlir::linalg::LinalgOp fused_generic;
+    innermost_loop.getBody()->walk([&](mlir::linalg::LinalgOp linalg_op) {
+      fused_generic = linalg_op;
+    });
+
+    // Elementwise composable address blocks (must outlive instantiatePipeline).
+    SourceMapFromLinalg elementwiseSourceMap;
+    SizesByProjection elementwiseSizes;
+
+    // The loop-nest half of the func plan: the manufactured tiling nest are the
+    // parallel loops; there are no reduction loops on the elementwise path.
+    StructuralInfo structural;
+    for (auto* loop_op : tiled_loops_) {
+      structural.parallelLoops.push_back(
+          llvm::cast<mlir::scf::ForOp>(loop_op));
+    }
+
+    // One site per compute group. Elementwise: pos = innermost tiled loop body,
+    // accumulatorBuf null, reductionLoops empty.
+    llvm::SmallVector<PipelineSite> sites;
+    PipelineSite site;
+    site.pos.block = innermost_loop.getBody();
+    site.spec.loads = load_ops_;
+    site.spec.stores = store_ops_;
+    site.spec.linalgOp = fused_generic;
+    site.spec.accumulatorBuf = {};
+    site.spec.mapBuilder = &elementwiseSourceMap;
+    site.spec.sizeBuilder = &elementwiseSizes;
+    sites.push_back(site);
+
+    LLVM_DEBUG(llvm::dbgs()
+               << "Derived " << sites.size() << " pipeline site(s); "
+               << structural.parallelLoops.size() << " parallel loop(s), "
+               << structural.reductionLoops.size() << " reduction loop(s)\n");
+
+    for (const PipelineSite& s : sites) instantiatePipeline(s, structural);
   }
 
   DEBUG_WITH_TYPE(VerboseDebug, llvm::dbgs() << "After pipeline created:\n"
