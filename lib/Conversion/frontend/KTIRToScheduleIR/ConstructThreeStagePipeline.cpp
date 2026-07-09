@@ -1094,7 +1094,7 @@ static mlir::LogicalResult projectSizesThroughIndexingMap(
 //   reinterpret_cast offset already incorporates the loop IVs via
 // Build the source_map for a data_transfer from an access-tile operation.
 //
-// The invariant (§3 of ADDRESSING_DESIGN_V2.md): every access-tile index
+// The invariant: every access-tile index
 // contributes to exactly one of {offset, source_map}.
 //   - Loop IVs      → offset=0, source_map dim expr (loop-varying part)
 //   - Non-loop IVs  → offset bakes them in, source_map=0 (loop-invariant part)
@@ -1581,7 +1581,7 @@ mlir::Value ConstructThreeStagePipelinePass::computeReinterpretCastOffset(
     llvm::ArrayRef<mlir::Value> loop_ivs) {
   // Calculate offset from access tile indices and memory view strides.
   //
-  // §3 (ADDRESSING_DESIGN_V2): loop IVs are excluded from the offset (zeroed
+  // loop IVs are excluded from the offset (zeroed
   // out here) and expressed in the source_map instead. This keeps the offset
   // loop-invariant by construction, satisfying the DCC immutable-base rule.
   //
@@ -1597,6 +1597,9 @@ mlir::Value ConstructThreeStagePipelinePass::computeReinterpretCastOffset(
   }
 
   // Compute terms: indices[i] * strides[i] for each dimension.
+  // Optimizations:
+  // - Skip multiplication if stride is 1
+  // - Skip addition if index is constant 0
   // Loop IVs and constant-0 indices both contribute 0 and are skipped.
   llvm::SmallVector<mlir::Value> terms;
   for (size_t i = 0; i < num_indices; ++i) {
@@ -1621,10 +1624,13 @@ mlir::Value ConstructThreeStagePipelinePass::computeReinterpretCastOffset(
   }
 
   if (terms.empty()) {
+    // All indices were constant 0
     return mlir::arith::ConstantIndexOp::create(builder, loc, 0);
   } else if (terms.size() == 1) {
+    // Only one term, no addition needed
     return terms[0];
   } else {
+    // Add all terms together
     mlir::Value offset = terms[0];
     for (size_t i = 1; i < terms.size(); ++i) {
       offset = mlir::arith::AddIOp::create(builder, loc, offset, terms[i]);
@@ -1800,40 +1806,47 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
     }
     llvm::SmallVector<int64_t> strides(static_strides_attr.asArrayRef());
 
-    // Insert the reinterpret_cast at the very start of the block containing
-    // the access tile.  Placing it here ensures:
-    //   1. All loop IVs used as access-tile indices dominate this point
-    //      (they are block args of the same block or enclosing blocks).
-    //   2. The reinterpret_cast dominates any ktdf.pipeline ops in the same
-    //      block that were inserted at the block's start and hold a
-    //      data_transfer referencing this access tile's result.
-    // Using a single global insertion_point (e.g. tiled_loops_.front()) would
-    // place the offset arithmetic OUTSIDE the loop that defines the IVs.
-    mlir::Block* tile_block = access_tile->getBlock();
-    // Find the first op in the block that has a user of this access tile's
-    // result; insert just before that op so we remain as late as possible while
-    // still dominating all uses.  Fall back to the block's first op.
-    mlir::Operation* best_ip = &tile_block->front();
-    for (mlir::Operation& op : *tile_block) {
-      bool uses_tile = false;
-      for (mlir::Value operand : op.getOperands()) {
-        if (operand == access_tile.getResult()) { uses_tile = true; break; }
-      }
-      // Also check nested regions (e.g. ktdf.pipeline)
-      op.walk([&](mlir::Operation* nested) {
-        for (mlir::Value operand : nested->getOperands()) {
-          if (operand == access_tile.getResult()) uses_tile = true;
-        }
-      });
-      if (uses_tile) { best_ip = &op; break; }
-    }
-    builder.setInsertionPoint(best_ip);
     mlir::Location loc = access_tile.getLoc();
 
-    // Move the memory view operation to the same insertion point if it lives
-    // in the same block (ensures the cast source is textually before the cast).
-    if (memory_view.getDefiningOp()->getBlock() == tile_block) {
-      memory_view.getDefiningOp()->moveBefore(best_ip);
+    // Choosing the insertion point for the reinterpret_cast.
+    //
+    // Only the reduction path needs a per-tile late insertion: there the offset
+    // arithmetic references the reduction loop IV, so the cast must be placed
+    // inside the block that defines that IV. A single global insertion point
+    // would hoist the offset arithmetic OUTSIDE that loop.
+    //
+    // For every other (elementwise) tile the offset is loop-invariant, so the
+    // global insertion point already dominates all uses; using it keeps the
+    // emitted op order identical to the non-reduction baseline.
+    bool tile_in_reduction =
+        reduction_loop_ && reduction_loop_->isAncestor(access_tile);
+    if (tile_in_reduction) {
+      mlir::Block* tile_block = access_tile->getBlock();
+      // Find the first op in the block that has a user of this access tile's
+      // result; insert just before it so we stay as late as possible while
+      // still dominating all uses. Fall back to the block's first op.
+      mlir::Operation* best_ip = &tile_block->front();
+      for (mlir::Operation& op : *tile_block) {
+        bool uses_tile = false;
+        for (mlir::Value operand : op.getOperands()) {
+          if (operand == access_tile.getResult()) { uses_tile = true; break; }
+        }
+        // Also check nested regions (e.g. ktdf.pipeline)
+        op.walk([&](mlir::Operation* nested) {
+          for (mlir::Value operand : nested->getOperands()) {
+            if (operand == access_tile.getResult()) uses_tile = true;
+          }
+        });
+        if (uses_tile) { best_ip = &op; break; }
+      }
+      builder.setInsertionPoint(best_ip);
+      // Move the memory view op to the same point if it lives in the same block
+      // (ensures the cast source is textually before the cast).
+      if (memory_view.getDefiningOp()->getBlock() == tile_block) {
+        memory_view.getDefiningOp()->moveBefore(best_ip);
+      }
+    } else {
+      builder.setInsertionPoint(insertion_point);
     }
 
     // Apply base_map to materialize one index per source-memref dimension.
@@ -1909,7 +1922,7 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
     auto memory_space_cast = mlir::memref::MemorySpaceCastOp::create(
         builder, loc, cast_source_type, memory_view);
 
-    // §3 (ADDRESSING_DESIGN_V2): always use the full tile shape (rank-N).
+    // always use the full tile shape (rank-N).
     // The offset is loop-invariant by construction (loop IVs excluded above),
     // so folding is always safe. No model-A/B split needed.
     mlir::StridedLayoutAttr strided_layout = mlir::StridedLayoutAttr::get(

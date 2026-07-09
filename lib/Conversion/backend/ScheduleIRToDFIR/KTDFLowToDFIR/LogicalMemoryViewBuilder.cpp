@@ -512,7 +512,7 @@ mlir::LogicalResult scheduler::buildLogicalMemoryViews(
 
     // Phase 3b: Source A chains.
     if (mlir::failed(
-        replaceSourceAChains(pu, resolved_units, replacements, builder)))
+            replaceSourceAChains(pu, resolved_units, replacements, builder)))
       return mlir::failure();
 
     // Phase 3c: Source B casts.

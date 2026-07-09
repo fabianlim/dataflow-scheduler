@@ -1,8 +1,9 @@
 // RUN: dataflow-scheduler-opt --construct-three-stage-pipeline %s | FileCheck %s
 
-
 // CHECK: #[[$ATTR_0:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 // CHECK: #[[$ATTR_1:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 95 >= 0, d1 >= 0, -d1 + 3 >= 0, d2 >= 0, -d2 + 31 >= 0)>
+// CHECK-LABEL:   ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.spyre_memory_space<HBM> = "DDR", #ktdp.spyre_memory_space<LX> = "L1">} import("../../../../Dialect/KTDFArch/sample_device.mlir")
+
 // CHECK-LABEL:   func.func @local_schedule_1(
 // CHECK-SAME:      %[[ARG0:.*]]: index) {
 // CHECK-NEXT:     %[[CONSTANT_0:.*]] = arith.constant 1 : index
@@ -15,6 +16,9 @@
 // CHECK-NEXT:     %[[CONSTANT_7:.*]] = arith.constant 18432 : index
 // CHECK-NEXT:     %[[GET_COMPUTE_TILE_ID_0:.*]] = ktdp.get_compute_tile_id : index
 // CHECK-NEXT:     %[[MULI_0:.*]] = arith.muli %[[GET_COMPUTE_TILE_ID_0]], %[[CONSTANT_4]] : index
+// CHECK-NEXT:     %[[CONSTRUCT_MEMORY_VIEW_0:.*]] = ktdp.construct_memory_view %[[CONSTANT_5]], sizes: [96, 4, 32], strides: [128, 32, 1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<96x4x32xf16>
+// CHECK-NEXT:     %[[CONSTRUCT_MEMORY_VIEW_1:.*]] = ktdp.construct_memory_view %[[CONSTANT_6]], sizes: [96, 4, 32], strides: [128, 32, 1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<96x4x32xf16>
+// CHECK-NEXT:     %[[CONSTRUCT_MEMORY_VIEW_2:.*]] = ktdp.construct_memory_view %[[CONSTANT_7]], sizes: [96, 4, 32], strides: [128, 32, 1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<96x4x32xf16>
 // CHECK-NEXT:     %[[ADDI_0:.*]] = arith.addi %[[MULI_0]], %[[ARG0]] : index
 // CHECK-NEXT:     %[[CONSTANT_8:.*]] = arith.constant 0 : index
 // CHECK-NEXT:     %[[CONSTANT_9:.*]] = arith.constant 2 : index
@@ -25,19 +29,16 @@
 // CHECK-NEXT:     %[[CONSTANT_14:.*]] = arith.constant 0 : index
 // CHECK-NEXT:     %[[CONSTANT_15:.*]] = arith.constant 32 : index
 // CHECK-NEXT:     %[[CONSTANT_16:.*]] = arith.constant 32 : index
-// CHECK-NEXT:     %[[CONSTRUCT_MEMORY_VIEW_0:.*]] = ktdp.construct_memory_view %[[CONSTANT_5]], sizes: [96, 4, 32], strides: [128, 32, 1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<96x4x32xf16>
 // CHECK-NEXT:     %[[CONSTANT_17:.*]] = arith.constant 128 : index
 // CHECK-NEXT:     %[[MULI_1:.*]] = arith.muli %[[ADDI_0]], %[[CONSTANT_17]] : index
 // CHECK-NEXT:     %[[ADDI_1:.*]] = arith.addi %[[MULI_1]], %[[CONSTANT_3]] : index
 // CHECK-NEXT:     %[[MEMORY_SPACE_CAST_0:.*]] = memref.memory_space_cast %[[CONSTRUCT_MEMORY_VIEW_0]] : memref<96x4x32xf16> to memref<96x4x32xf16, "DDR">
 // CHECK-NEXT:     %[[REINTERPRET_CAST_0:.*]] = memref.reinterpret_cast %[[MEMORY_SPACE_CAST_0]] to offset: {{\[}}%[[ADDI_1]]], sizes: [2, 4, 32], strides: [128, 32, 1] : memref<96x4x32xf16, "DDR"> to memref<2x4x32xf16, strided<[128, 32, 1], offset: ?>, "DDR">
-// CHECK-NEXT:     %[[CONSTRUCT_MEMORY_VIEW_1:.*]] = ktdp.construct_memory_view %[[CONSTANT_6]], sizes: [96, 4, 32], strides: [128, 32, 1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<96x4x32xf16>
 // CHECK-NEXT:     %[[CONSTANT_18:.*]] = arith.constant 128 : index
 // CHECK-NEXT:     %[[MULI_2:.*]] = arith.muli %[[ADDI_0]], %[[CONSTANT_18]] : index
 // CHECK-NEXT:     %[[ADDI_2:.*]] = arith.addi %[[MULI_2]], %[[CONSTANT_3]] : index
 // CHECK-NEXT:     %[[MEMORY_SPACE_CAST_1:.*]] = memref.memory_space_cast %[[CONSTRUCT_MEMORY_VIEW_1]] : memref<96x4x32xf16> to memref<96x4x32xf16, "DDR">
 // CHECK-NEXT:     %[[REINTERPRET_CAST_1:.*]] = memref.reinterpret_cast %[[MEMORY_SPACE_CAST_1]] to offset: {{\[}}%[[ADDI_2]]], sizes: [2, 4, 32], strides: [128, 32, 1] : memref<96x4x32xf16, "DDR"> to memref<2x4x32xf16, strided<[128, 32, 1], offset: ?>, "DDR">
-// CHECK-NEXT:     %[[CONSTRUCT_MEMORY_VIEW_2:.*]] = ktdp.construct_memory_view %[[CONSTANT_7]], sizes: [96, 4, 32], strides: [128, 32, 1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<96x4x32xf16>
 // CHECK-NEXT:     %[[CONSTANT_19:.*]] = arith.constant 128 : index
 // CHECK-NEXT:     %[[MULI_3:.*]] = arith.muli %[[ADDI_0]], %[[CONSTANT_19]] : index
 // CHECK-NEXT:     %[[ADDI_3:.*]] = arith.addi %[[MULI_3]], %[[CONSTANT_3]] : index
@@ -55,23 +56,23 @@
 // CHECK-NEXT:               %[[CREATE_TOKEN_2:.*]] = ktdf.create_token : !ktdf.token
 // CHECK-NEXT:               ktdf.private_yield %[[FIFO_0]]#0, %[[FIFO_0]]#1, %[[FIFO_1]], %[[CREATE_TOKEN_0]], %[[CREATE_TOKEN_1]], %[[CREATE_TOKEN_2]] : !ktdf.fifo.slot<"DDR" -> "SFU", 64xf16>, !ktdf.fifo.slot<"DDR" -> "SFU", 64xf16>, !ktdf.fifo.slot<"SFU" -> "DDR", 64xf16>, !ktdf.token, !ktdf.token, !ktdf.token
 // CHECK-NEXT:             }
-// CHECK-NEXT:             ktdf.stage depends_in(none) depends_out(%[[PRIVATE_0]]#3) {
-// CHECK-NEXT:               ktdf.data_transfer from %[[REINTERPRET_CAST_0]]{{\[}}%[[VAL_0]], %[[VAL_1]], %[[VAL_2]]] size [1, 2, 32] to %[[PRIVATE_0]]#0 size [64] : memref<2x4x32xf16, strided<[128, 32, 1], offset: ?>, "DDR">, !ktdf.fifo.slot<"DDR" -> "SFU", 64xf16>
-// CHECK-NEXT:               ktdf.data_transfer from %[[REINTERPRET_CAST_1]]{{\[}}%[[VAL_0]], %[[VAL_1]], %[[VAL_2]]] size [1, 2, 32] to %[[PRIVATE_0]]#1 size [64] : memref<2x4x32xf16, strided<[128, 32, 1], offset: ?>, "DDR">, !ktdf.fifo.slot<"DDR" -> "SFU", 64xf16>
+// CHECK-NEXT:             ktdf.stage depends_in(none) depends_out(%[[VAL_3:.*]]#3) {
+// CHECK-NEXT:               ktdf.data_transfer from %[[REINTERPRET_CAST_0]][0, 0, 0] size [2, 4, 32] to %[[VAL_3]]#0 size [64] : memref<2x4x32xf16, strided<[128, 32, 1], offset: ?>, "DDR">, !ktdf.fifo.slot<"DDR" -> "SFU", 64xf16>
+// CHECK-NEXT:               ktdf.data_transfer from %[[REINTERPRET_CAST_1]][0, 0, 0] size [2, 4, 32] to %[[VAL_3]]#1 size [64] : memref<2x4x32xf16, strided<[128, 32, 1], offset: ?>, "DDR">, !ktdf.fifo.slot<"DDR" -> "SFU", 64xf16>
 // CHECK-NEXT:             }
-// CHECK-NEXT:             ktdf.stage depends_in(%[[PRIVATE_0]]#3) depends_out(%[[PRIVATE_0]]#4) {
-// CHECK-NEXT:               %[[READ_FROM_FIFO_0:.*]] = ktdf.read_from_fifo %[[PRIVATE_0]]#0 : <"DDR" -> "SFU", 64xf16> -> tensor<1x2x32xf16>
-// CHECK-NEXT:               %[[READ_FROM_FIFO_1:.*]] = ktdf.read_from_fifo %[[PRIVATE_0]]#1 : <"DDR" -> "SFU", 64xf16> -> tensor<1x2x32xf16>
+// CHECK-NEXT:             ktdf.stage depends_in(%[[VAL_4:.*]]#3) depends_out(%[[VAL_4]]#4) {
+// CHECK-NEXT:               %[[READ_FROM_FIFO_0:.*]] = ktdf.read_from_fifo %[[VAL_4]]#0 : <"DDR" -> "SFU", 64xf16> -> tensor<1x2x32xf16>
+// CHECK-NEXT:               %[[READ_FROM_FIFO_1:.*]] = ktdf.read_from_fifo %[[VAL_4]]#1 : <"DDR" -> "SFU", 64xf16> -> tensor<1x2x32xf16>
 // CHECK-NEXT:               %[[EMPTY_0:.*]] = tensor.empty() : tensor<1x2x32xf16>
 // CHECK-NEXT:               %[[GENERIC_0:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_0]], #[[$ATTR_0]]], iterator_types = ["parallel", "parallel", "parallel"]} ins(%[[READ_FROM_FIFO_0]], %[[READ_FROM_FIFO_1]] : tensor<1x2x32xf16>, tensor<1x2x32xf16>) outs(%[[EMPTY_0]] : tensor<1x2x32xf16>) {
 // CHECK-NEXT:               ^bb0(%[[VAL_5:.*]]: f16, %[[VAL_6:.*]]: f16, %[[VAL_7:.*]]: f16):
 // CHECK-NEXT:                 %[[ADDF_0:.*]] = arith.addf %[[VAL_5]], %[[VAL_6]] : f16
 // CHECK-NEXT:                 linalg.yield %[[ADDF_0]] : f16
 // CHECK-NEXT:               } -> tensor<1x2x32xf16>
-// CHECK-NEXT:               ktdf.write_to_fifo %[[GENERIC_0]], %[[PRIVATE_0]]#2 : tensor<1x2x32xf16>, <"SFU" -> "DDR", 64xf16>
+// CHECK-NEXT:               ktdf.write_to_fifo %[[GENERIC_0]], %[[VAL_4]]#2 : tensor<1x2x32xf16>, <"SFU" -> "DDR", 64xf16>
 // CHECK-NEXT:             } {applicable_units = ["SFU"]}
-// CHECK-NEXT:             ktdf.stage depends_in(%[[PRIVATE_0]]#4) depends_out(%[[PRIVATE_0]]#5) {
-// CHECK-NEXT:               ktdf.data_transfer from %[[PRIVATE_0]]#2 size [64] to %[[REINTERPRET_CAST_2]]{{\[}}%[[VAL_0]], %[[VAL_1]], %[[VAL_2]]] size [1, 2, 32] : !ktdf.fifo.slot<"SFU" -> "DDR", 64xf16>, memref<2x4x32xf16, strided<[128, 32, 1], offset: ?>, "DDR">
+// CHECK-NEXT:             ktdf.stage depends_in(%[[VAL_8:.*]]#4) depends_out(%[[VAL_8]]#5) {
+// CHECK-NEXT:               ktdf.data_transfer from %[[VAL_8]]#2 size [64] to %[[REINTERPRET_CAST_2]][0, 0, 0] size [2, 4, 32] : !ktdf.fifo.slot<"SFU" -> "DDR", 64xf16>, memref<2x4x32xf16, strided<[128, 32, 1], offset: ?>, "DDR">
 // CHECK-NEXT:             }
 // CHECK-NEXT:           }
 // CHECK-NEXT:         } {loop_type = #ktdf.loop_type<parallel_loop>}
