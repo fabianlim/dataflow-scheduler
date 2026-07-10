@@ -24,6 +24,7 @@
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLowering.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
@@ -72,15 +73,36 @@ mlir::LogicalResult filterAndUnwrapKTDFLoweringOps(
       });
   if (wr.wasInterrupted()) return mlir::failure();
 
-  // Unwrap applicable execute_on ops first, in walk order (post-order: inner
-  // before outer). Splicing inner contents out before the outer wrapper is
-  // unwrapped keeps the inner-collected pointers valid even if the outer
-  // wrapper is later erased as non-applicable.
-  for (auto exec : applicable_execs) {
+  // Unwrap applicable execute_on ops by splicing their body into the nearest
+  // SURVIVING ancestor block. In the flat (elementwise) case an applicable
+  // exec's immediate parent is itself applicable and survives, so this is
+  // equivalent to unwrapping in place. In the nested-reduction case an
+  // applicable exec (e.g. the HBM->LX load on l3lu) can sit under NON-
+  // applicable ancestor execs that are erased below; splicing into that
+  // immediate parent would destroy the content when the ancestor is erased.
+  // A block "survives" iff its parent op is not an execute_on -- walking up,
+  // the first such block is a scf.for body (or the PU region entry). Splicing
+  // there keeps SSA dominance: the transfers reference the enclosing scf.for
+  // induction variables and LX-buffer constants defined by sibling applicable
+  // ancestors that unwrap into the SAME surviving block.
+  //
+  // Process OUTER-first (reverse of post-order walk): after an outer applicable
+  // exec is unwrapped, an inner applicable exec's parent is already the
+  // surviving block, so its content is inserted at its own position and
+  // producer/consumer order is preserved (e.g. the LX-buffer constant defined
+  // by the outer exec precedes the inner load that uses it).
+  for (auto exec : llvm::reverse(applicable_execs)) {
+    mlir::Operation* anchor = exec.getOperation();
+    mlir::Block* dest = anchor->getBlock();
+    while (mlir::isa_and_nonnull<mlir::ktdf_lowering::ExecuteOnOp>(
+        dest->getParentOp())) {
+      anchor = dest->getParentOp();
+      dest = anchor->getBlock();
+    }
     mlir::Block* body = exec.getBodyBlock();
-    exec->getBlock()->getOperations().splice(
-        mlir::Block::iterator(exec.getOperation()), body->getOperations(),
-        body->begin(), body->end());
+    dest->getOperations().splice(mlir::Block::iterator(anchor),
+                                 body->getOperations(), body->begin(),
+                                 body->end());
     exec.erase();
   }
 
