@@ -48,6 +48,26 @@ static mlir::AffineMap createAffineMapForIntermediateBuffer(
   return mlir::AffineMap::getMultiDimIdentityMap(buffer->shape.size(), context);
 }
 
+/// Walk the operations that belong to a stage's OWN region, treating a nested
+/// `ktdf.pipeline` as a scope boundary. Data movement inside a nested pipeline
+/// belongs to that pipeline (PathExpansion legalizes it as its own planning
+/// unit), so resource/endpoint/FIFO analysis for this stage must not descend
+/// into it. The callback is invoked (pre-order) on the stage's own ops; on
+/// encountering a nested `ktdf.pipeline` its subtree is skipped. The callback
+/// may return a WalkResult; returning interrupt stops the walk.
+template <typename CallbackT>
+static void walkStageOwnRegion(mlir::ktdf::StageOp stage_op,
+                               CallbackT&& callback) {
+  mlir::Operation* stage_base = stage_op.getOperation();
+  stage_op.template walk<mlir::WalkOrder::PreOrder>(
+      [&](mlir::Operation* op) -> mlir::WalkResult {
+        if (op != stage_base && mlir::isa<mlir::ktdf::PipelineOp>(op)) {
+          return mlir::WalkResult::skip();
+        }
+        return callback(op);
+      });
+}
+
 /// Helper to validate FIFO slot index assignment
 /// Checks that the assigned slot index matches the original result index
 /// from the template transfer operation
@@ -221,10 +241,10 @@ class ResourceInferrer {
       const scheduler::arch_view::RoutingGraph& arch_graph) {
     if (!stage_op) return nullptr;
 
-    // Find the first data transfer operation in the stage
+    // Find the first data transfer operation in the stage's own region.
     mlir::ktdf::DataTransferOp first_transfer = nullptr;
-    stage_op.walk([&](mlir::ktdf::DataTransferOp transfer_op) {
-      if (!first_transfer) {
+    walkStageOwnRegion(stage_op, [&](mlir::Operation* op) {
+      if (auto transfer_op = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op)) {
         first_transfer = transfer_op;
         return mlir::WalkResult::interrupt();
       }
@@ -551,14 +571,59 @@ static void analyzeTransferEndpoints(
   }
 }
 
-/// Analyze stage body to determine operation types
+/// Record the residency endpoint of a FIFO read/write op that drains or fills
+/// the stage's accumulator within its own region. The FIFO's producer (write)
+/// or consumer (read) resource is recorded as a balanced input/output pair so
+/// it contributes exactly one node to the inferred path (the resource where
+/// this stage's compute settles).
+static void analyzeFifoResidencyEndpoint(
+    mlir::ktdf::FifoSlotType fifo_type, bool is_producer_side,
+    StageSummary& summary,
+    const scheduler::arch_view::RoutingGraph& arch_graph) {
+  ResourceType resource =
+      ResourceInferrer::fromType(fifo_type, is_producer_side, arch_graph);
+  if (!resource) {
+    return;
+  }
+  // Push the same resource on both sides so inferOriginalPath's
+  // size(input)==size(output) invariant holds and the residency collapses to a
+  // single path node.
+  summary.input_endpoints.push_back(resource);
+  summary.output_endpoints.push_back(resource);
+}
+
+/// Analyze stage body to determine operation types.
+///
+/// A `ktdf.pipeline` nested inside this stage is a scope boundary: its data
+/// movement belongs to that inner pipeline (which PathExpansion legalizes as
+/// its own planning unit), not to this stage. Endpoint collection therefore
+/// stops at the nested-pipeline edge while still exploring the stage's own
+/// region. A stage whose own region only drains/fills a FIFO (e.g. a reduction
+/// accumulate stage that writes its settled accumulator to a FIFO after the
+/// inner pipeline finishes) is summarized by that FIFO's residency resource.
 static void analyzeStageOperations(
     mlir::ktdf::StageOp stage_op, StageSummary& summary, bool& has_compute,
     bool& has_transfer, const scheduler::arch_view::RoutingGraph& arch_graph) {
-  stage_op.walk([&](mlir::Operation* op) {
+  walkStageOwnRegion(stage_op, [&](mlir::Operation* op) {
     if (auto transfer_op = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op)) {
       has_transfer = true;
       analyzeTransferEndpoints(transfer_op, summary, arch_graph);
+      return mlir::WalkResult::advance();
+    }
+
+    if (auto write_op = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(op)) {
+      // Producing into the FIFO: residency is the producer (src) side.
+      analyzeFifoResidencyEndpoint(write_op.getFifoSlot().getType(),
+                                   /*is_producer_side=*/true, summary,
+                                   arch_graph);
+      return mlir::WalkResult::advance();
+    }
+
+    if (auto read_op = mlir::dyn_cast<mlir::ktdf::ReadFromFifoOp>(op)) {
+      // Consuming from the FIFO: residency is the consumer (dest) side.
+      analyzeFifoResidencyEndpoint(read_op.getFifoSlot().getType(),
+                                   /*is_producer_side=*/false, summary,
+                                   arch_graph);
       return mlir::WalkResult::advance();
     }
 
@@ -1023,7 +1088,11 @@ static mlir::LogicalResult analyzeStageTransfers(
   mlir::ktdf::StageOp stage_op =
       mlir::cast<mlir::ktdf::StageOp>(current_stage->getOperation());
 
-  stage_op.walk([&](mlir::ktdf::DataTransferOp transfer) {
+  walkStageOwnRegion(stage_op, [&](mlir::Operation* op) {
+    auto transfer = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op);
+    if (!transfer) {
+      return mlir::WalkResult::advance();
+    }
     mlir::Type src_type = transfer.getSource().getType();
     mlir::Type dest_type = transfer.getDestination().getType();
 
@@ -1173,7 +1242,7 @@ static mlir::LogicalResult analyzeFifoOperations(
     mlir::ktdf::StageOp stage_op =
         mlir::cast<mlir::ktdf::StageOp>(current_stage->getOperation());
 
-    stage_op.walk([&](mlir::Operation* op) {
+    walkStageOwnRegion(stage_op, [&](mlir::Operation* op) {
       // Check if this is a read_from_fifo or write_to_fifo operation
       auto read_op = mlir::dyn_cast<mlir::ktdf::ReadFromFifoOp>(op);
       auto write_op = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(op);

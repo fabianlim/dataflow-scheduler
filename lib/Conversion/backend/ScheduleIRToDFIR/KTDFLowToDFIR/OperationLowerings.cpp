@@ -57,13 +57,17 @@ using namespace scheduler;
 
 namespace {
 
-/// Returns the lrfreg view if `val` is insert_slice(to_tensor(lrfreg_view)),
-/// otherwise returns nullptr. The lrfreg view is recognized by its backing
+/// Returns the lrfreg view if `val` is a read of the lrfreg accumulator —
+/// either insert_slice(to_tensor(lrfreg_view)) or a plain to_tensor(lrfreg_view)
+/// — otherwise returns nullptr. The lrfreg view is recognized by its backing
 /// get_local_unit {name="lrfreg"}.
 static mlir::Value getLrfregViewFromInsertSlice(mlir::Value val) {
-  auto ins = val.getDefiningOp<mlir::tensor::InsertSliceOp>();
-  if (!ins) return nullptr;
-  auto tt = ins.getSource().getDefiningOp<mlir::bufferization::ToTensorOp>();
+  auto tt = val.getDefiningOp<mlir::bufferization::ToTensorOp>();
+  if (!tt) {
+    auto ins = val.getDefiningOp<mlir::tensor::InsertSliceOp>();
+    if (!ins) return nullptr;
+    tt = ins.getSource().getDefiningOp<mlir::bufferization::ToTensorOp>();
+  }
   if (!tt) return nullptr;
   auto view =
       tt.getBuffer().getDefiningOp<mlir::dataflow::GetLogicalMemoryViewOp>();

@@ -36,9 +36,41 @@
 
 using namespace scheduler;
 
-// Peel the first iteration of each compute reduction loop (identified by the
-// ktdf.reduction_accumulator attribute + a vectorchain.binary body) out of the
-// loop and into an unconditional init store before the loop.
+namespace {
+
+// Returns true if `view` is a get_logical_memory_view rooted at the lrfreg
+// register-file local unit (get_local_unit {name="lrfreg"}). This mirrors the
+// structural accumulator recognition in the RMW-writeback half.
+bool isLrfregAccumulatorView(mlir::Value view) {
+  auto lmv = view.getDefiningOp<mlir::dataflow::GetLogicalMemoryViewOp>();
+  if (!lmv) return false;
+  auto lu = lmv.getFromUnit().getDefiningOp<mlir::dataflow::GetLocalUnitOp>();
+  return lu && lu.getName() == "lrfreg";
+}
+
+// Visits ops directly in `loop`'s body but not inside any nested scf.for, so an
+// enclosing loop is not mistaken for the innermost accumulation loop.
+template <typename OpT, typename FnT>
+void walkOwnBody(mlir::scf::ForOp loop, FnT fn) {
+  loop.getBody()->walk<mlir::WalkOrder::PreOrder>([&](mlir::Operation* op) {
+    if (op != loop.getOperation() && mlir::isa<mlir::scf::ForOp>(op))
+      return mlir::WalkResult::skip();
+    if (auto casted = mlir::dyn_cast<OpT>(op)) fn(casted);
+    return mlir::WalkResult::advance();
+  });
+}
+
+}  // namespace
+
+// Peel the first iteration of each reduction accumulation loop out of the loop
+// and into an unconditional init store before the loop.
+//
+// A reduction accumulation loop is identified STRUCTURALLY: its body contains a
+// vectorchain.binary and an agen.vector_load/store pair that read/write a view
+// rooted at the lrfreg accumulator (get_local_unit {name="lrfreg"}). This is
+// the accumulate-in-place register-file RMW; it is the exact dual of the
+// RMW-writeback detection, which recognizes the same accumulator by its backing
+// local unit.
 //
 // The loop body is:  def_immutable_mapping → query_map → receive → load(acc)
 //                    → binary(recv, load) → store(acc).
@@ -48,22 +80,35 @@ using namespace scheduler;
 //   [loop body unchanged, runs lb+step..ub]
 //
 // The unconditional init-store is required because a conditional store inside
-// scf.if is not honored by hardware. Only the compute loop (body has
-// vectorchain.binary) is peeled; transfer loops that share the
-// ktdf.reduction_accumulator attribute are left unchanged.
+// scf.if is not honored by hardware. Invariant: a loop is detected as a
+// reduction accumulation loop iff it must be peeled — every lrfreg
+// accumulate-in-place loop requires the unconditional-reset peel.
 void scheduler::peelReductionComputeLoop(mlir::func::FuncOp func) {
   auto* ctx = func.getContext();
   mlir::OpBuilder builder(ctx);
 
-  // Collect compute reduction loops (ktdf.reduction_accumulator + binary body).
+  // Collect reduction accumulation loops: a vectorchain.binary body whose
+  // vector_load/store target the lrfreg accumulator view.
   llvm::SmallVector<mlir::scf::ForOp> compute_loops;
   func.walk([&](mlir::scf::ForOp for_op) {
-    if (!for_op->hasAttr("ktdf.reduction_accumulator")) return;
+    // Match only the innermost accumulation loop: inspect ops in this loop's
+    // own body, not those nested in a deeper scf.for.
     bool has_binary = false;
-    for_op.getBody()->walk([&](mlir::vectorchain::BinaryOp) {
-      has_binary = true;
+    walkOwnBody<mlir::vectorchain::BinaryOp>(
+        for_op, [&](mlir::vectorchain::BinaryOp) { has_binary = true; });
+    if (!has_binary) return;
+
+    bool touches_lrfreg_acc = false;
+    walkOwnBody<mlir::agen::VectorLoadOp>(for_op, [&](mlir::agen::VectorLoadOp op) {
+      if (isLrfregAccumulatorView(op.getMemRef())) touches_lrfreg_acc = true;
     });
-    if (has_binary) compute_loops.push_back(for_op);
+    walkOwnBody<mlir::agen::VectorStoreOp>(
+        for_op, [&](mlir::agen::VectorStoreOp op) {
+          if (isLrfregAccumulatorView(op.getMemRef())) touches_lrfreg_acc = true;
+        });
+    assert((!touches_lrfreg_acc || has_binary) &&
+           "reduction accumulation loop must have a vectorchain.binary body");
+    if (touches_lrfreg_acc) compute_loops.push_back(for_op);
   });
 
   for (mlir::scf::ForOp loop : compute_loops) {

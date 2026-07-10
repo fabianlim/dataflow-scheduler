@@ -315,7 +315,21 @@ ktdf::StageOp StageCoarseningMaterializer::materializeStageNode(
   // Check if this stage has children (loops) or if we need to clone the body
   scheduler::OperationTreeNode* first_child = stage_node.getFirstChild();
 
-  if (first_child) {
+  // A nested ktdf.pipeline bounds a scope: everything inside it (including any
+  // loop it already absorbed) belongs to that inner scope, not to this
+  // coarsening candidate's tile-loop nest. Such a stage is a coarsening LEAF --
+  // its body is cloned verbatim and never has a tile loop sunk into its
+  // interior. This mirrors how DoubleBuffering and ParallelizeLoops stop their
+  // per-scope work at a non-scf.for boundary, so nested pipelines are treated
+  // as opaque here. Without this, the outer candidate would re-enter the inner
+  // pipeline (already coarsened by its own candidate) and mistake its
+  // PipelineNode child for a to-be-sunk loop.
+  bool child_is_scope_boundary =
+      first_child &&
+      static_cast<const scheduler::PipelineTreeNode*>(first_child)
+          ->isPipelineNode();
+
+  if (first_child && !child_is_scope_boundary) {
     // Stage has children (loops), materialize them first
     LLVM_DEBUG(llvm::dbgs() << "    Stage has children, materializing them\n");
     materializeChildren(stage_node);

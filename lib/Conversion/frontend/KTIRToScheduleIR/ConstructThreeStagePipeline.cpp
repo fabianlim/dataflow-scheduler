@@ -469,11 +469,12 @@ struct ConstructThreeStagePipelinePass
   llvm::SmallVector<int64_t> getStridesFromMemRefType(
       mlir::MemRefType memref_type);
 
-  // Reduction path: materialize (once, memoized) the full-rank
-  // memref.memory_space_cast of an access tile's underlying memory view, in the
-  // device memory space. The reduction data_transfers address this full view
-  // directly (identity map + per-dim subscripts), so no reinterpret_cast is
-  // emitted for these tiles.
+  // Reduction path: materialize (once, memoized) the full-rank memory view of
+  // an access tile's underlying memory view, in the device memory space. The
+  // reduction data_transfers address this full view directly (identity map +
+  // per-dim subscripts). To keep the view chain uniform for the backend, an
+  // identity reinterpret_cast (offset 0, full shape) is appended so every view
+  // is construct_memory_view -> memory_space_cast -> reinterpret_cast.
   mlir::Value materializeFullView(mlir::OpBuilder& builder, mlir::Location loc,
                                   mlir::ktdp::ConstructAccessTilesOp access_tile);
 
@@ -1133,6 +1134,14 @@ void ConstructThreeStagePipelinePass::instantiateReductionPipeline(
   // The 2-D accumulator memref shape: 1 x lanes.
   llvm::SmallVector<int64_t> acc_shape{1, total_num_elements_};
 
+  // The reduction accumulator lives in the register file. Mark it with the
+  // "lrfreg" memory space so the backend treats it as register-file-resident
+  // (an unconditional-reset peel target) rather than an HBM buffer.
+  // TODO: the residency should be analysis-determined; hardcoded for now.
+  auto acc_memref_ty = mlir::MemRefType::get(
+      acc_shape, elem_ty, mlir::MemRefLayoutAttrInterface{},
+      mlir::StringAttr::get(&getContext(), "lrfreg"));
+
   // FIFO attributes for the (single) load and store.
   assert(spec.loads.size() == 1 && spec.stores.size() == 1 &&
          "reduction group expects one load and one store");
@@ -1177,13 +1186,12 @@ void ConstructThreeStagePipelinePass::instantiateReductionPipeline(
     // OUTER private: acc memref + store FIFO + 2 tokens (t0, t1).
     auto outer_private = mlir::ktdf::PrivateOp::create(
         b, l,
-        mlir::TypeRange{mlir::MemRefType::get(acc_shape, elem_ty), store_fifo_ty,
+        mlir::TypeRange{acc_memref_ty, store_fifo_ty,
                         token_ty, token_ty});
     {
       mlir::OpBuilder::InsertionGuard g(b);
       b.setInsertionPointToStart(&outer_private.getRegion().front());
-      auto acc = mlir::memref::AllocOp::create(
-          b, l, mlir::MemRefType::get(acc_shape, elem_ty));
+      auto acc = mlir::memref::AllocOp::create(b, l, acc_memref_ty);
       auto store_fifo = mlir::ktdf::FifoAllocateOp::create(
           b, l, mlir::TypeRange{store_fifo_ty}, mlir::ValueRange{});
       auto t0 = mlir::ktdf::CreateTokenOp::create(b, l, token_ty);
@@ -1277,12 +1285,16 @@ void ConstructThreeStagePipelinePass::instantiateReductionPipeline(
                               mlir::RankedTensorType::get(acc_shape, elem_ty)},
                           mlir::ValueRange{read.getResult()},
                           mlir::ValueRange{cur.getResult()}, maps, iters);
-                      mlir::Block* body = cb.createBlock(
-                          &generic.getRegion(), generic.getRegion().end(),
-                          mlir::TypeRange{elem_ty, elem_ty},
-                          llvm::SmallVector<mlir::Location>{cl, cl});
                       {
+                        // Guard so that building the generic's body block does
+                        // not leave the insertion point inside the generic
+                        // region. The materialize below must be a sibling of the
+                        // generic in the stage body, not nested in its region.
                         mlir::OpBuilder::InsertionGuard g(cb);
+                        mlir::Block* body = cb.createBlock(
+                            &generic.getRegion(), generic.getRegion().end(),
+                            mlir::TypeRange{elem_ty, elem_ty},
+                            llvm::SmallVector<mlir::Location>{cl, cl});
                         cb.setInsertionPointToStart(body);
                         auto sum = mlir::arith::AddFOp::create(
                             cb, cl, body->getArgument(0), body->getArgument(1));
@@ -1586,8 +1598,33 @@ mlir::Value ConstructThreeStagePipelinePass::materializeFullView(
       mapped_memory_space);
   auto cast = mlir::memref::MemorySpaceCastOp::create(builder, loc, cast_type,
                                                       memory_view);
-  full_view_cache_[view_op] = cast.getResult();
-  return cast.getResult();
+
+  // Uniform view invariant: every memory view feeding a data_transfer is a
+  // construct_memory_view -> memory_space_cast -> reinterpret_cast chain, so
+  // the backend LogicalMemoryViewBuilder sees one chain shape. For the whole
+  // view the reinterpret_cast is an identity slice: offset 0, full shape, full
+  // strides. The per-tile subscript rides on the data_transfer source_map, not
+  // on the view. The explicit strided layout (offset 0) makes the result type
+  // differ from the memory_space_cast result type, so the identity cast is not
+  // folded away as a no-op by canonicalization.
+  llvm::SmallVector<int64_t> view_strides = getStridesFromMemRefType(view_type);
+  llvm::SmallVector<mlir::OpFoldResult> rc_sizes;
+  for (int64_t dim : view_type.getShape())
+    rc_sizes.push_back(builder.getIndexAttr(dim));
+  llvm::SmallVector<mlir::OpFoldResult> rc_strides;
+  for (int64_t stride : view_strides)
+    rc_strides.push_back(builder.getIndexAttr(stride));
+  mlir::StridedLayoutAttr rc_layout = mlir::StridedLayoutAttr::get(
+      builder.getContext(), /*offset=*/0, view_strides);
+  mlir::MemRefType rc_type = mlir::MemRefType::get(
+      view_type.getShape(), view_type.getElementType(), rc_layout,
+      mapped_memory_space);
+  auto rc = mlir::memref::ReinterpretCastOp::create(
+      builder, loc, rc_type, cast.getResult(),
+      /*offset=*/builder.getIndexAttr(0), rc_sizes, rc_strides);
+
+  full_view_cache_[view_op] = rc.getResult();
+  return rc.getResult();
 }
 
 llvm::SmallVector<int64_t>

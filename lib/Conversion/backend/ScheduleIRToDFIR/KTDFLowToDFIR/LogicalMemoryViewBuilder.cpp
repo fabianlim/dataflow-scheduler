@@ -177,9 +177,8 @@ mlir::AffineMap buildLinearizationMap(mlir::MLIRContext* ctx,
 /// Build an N-D tile get_logical_memory_view.
 /// start_address = cmv.getOffset() + reinterpret_offset (always).
 /// The layout uses the N-D linearization map from the memref strides.
-/// §3 (ADDRESSING_DESIGN_V2): offset is always loop-invariant, so there is one
-/// unified view builder. buildInvariantBaseView and buildTileAddressView are
-/// merged into this single function.
+/// The reinterpret offset is always loop-invariant, so a single unified view
+/// builder handles every chain.
 static mlir::dataflow::GetLogicalMemoryViewOp buildTileAddressView(
     mlir::OpBuilder& builder, mlir::Location loc,
     mlir::MemRefType src_type, mlir::Value from_unit,
@@ -194,8 +193,15 @@ static mlir::dataflow::GetLogicalMemoryViewOp buildTileAddressView(
 /// Phase 3b: replace Source A chains with get_logical_memory_view.
 /// Emits the view op and RAUWs the memref.cast result inline; does not
 /// populate `replacements` (Source A handles its own erasure).
-/// §3 (ADDRESSING_DESIGN_V2): always computes start_address = cmv.getOffset()
-/// + reinterpret_offset; uses a single unified N-D tile-address view builder.
+/// Always computes start_address = cmv.getOffset() + reinterpret_offset and
+/// uses a single unified N-D tile-address view builder.
+///
+/// Every Source A chain is uniformly
+///   construct_memory_view -> memory_space_cast -> reinterpret_cast [-> cast],
+/// so the reinterpret_cast is always present: access-tile views get a per-tile
+/// slice, and whole-view transfers get an identity slice (offset 0, full
+/// shape). A missing reinterpret_cast is therefore malformed input, not a
+/// supported shape.
 mlir::LogicalResult replaceSourceAChains(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::DenseMap<ResourceType, mlir::Value>& resolved_units,
@@ -252,10 +258,9 @@ mlir::LogicalResult replaceSourceAChains(
     // Build layout map from static strides.
     auto layout_map = buildLinearizationMap(ctx, static_strides);
 
-    // §3 (ADDRESSING_DESIGN_V2): the reinterpret_cast offset is always
-    // loop-invariant (loop IVs were excluded at pass-02 time). Always compute
-    // start_address = cmv.getOffset() + reinterpret_offset and use the single
-    // tile-address view builder. No has_invariant_base split needed.
+    // The reinterpret_cast offset is always loop-invariant (loop IVs were
+    // excluded at pass-02 time). Always compute start_address = cmv.getOffset()
+    // + reinterpret_offset and use the single tile-address view builder.
     mlir::Value start_address = cmv.getOffset();
     builder.setInsertionPointAfter(rc);
     {
@@ -330,13 +335,30 @@ mlir::LogicalResult replaceSourceBCasts(
   for (auto ucc : casts) {
     auto result_type =
         mlir::cast<mlir::MemRefType>(ucc.getOutputs()[0].getType());
-    auto shape = result_type.getShape();
+    auto orig_shape = result_type.getShape();
 
     // Assert fully static shape.
-    for (int64_t dim : shape) {
+    for (int64_t dim : orig_shape) {
       if (mlir::ShapedType::isDynamic(dim))
         return ucc.emitError(
             "unrealized_conversion_cast: dynamic shape not supported");
+    }
+
+    // Get memory space.
+    auto ms = getMemorySpaceAttr(result_type);
+    if (!ms)
+      return ucc.emitError("unrealized_conversion_cast: no ktdf memory space");
+
+    // The compute-local (lrfreg) accumulator is a flat register-file vector of
+    // `lanes` elements. Pass 02 shapes it as `1 x lanes` (rank 2) to match the
+    // 2-D linalg reduction body, but the register-file view — and every
+    // agen.vector_load/store that reads/writes it — is 1-D. Collapse leading
+    // unit dims so the view is rank-1, matching the register-file addressing.
+    // This is scoped to compute-local spaces: LX/HBM Source B views must keep
+    // their N-D shape for the data_transfer per-dim addressing.
+    llvm::SmallVector<int64_t> shape(orig_shape.begin(), orig_shape.end());
+    if (isComputeLocalMemorySpace(*ms)) {
+      while (shape.size() > 1 && shape.front() == 1) shape.erase(shape.begin());
     }
 
     // Synthesize contiguous row-major strides from shape.
@@ -347,9 +369,6 @@ mlir::LogicalResult replaceSourceBCasts(
     auto layout_map = buildLinearizationMap(ctx, strides);
 
     // Get from_unit.
-    auto ms = getMemorySpaceAttr(result_type);
-    if (!ms)
-      return ucc.emitError("unrealized_conversion_cast: no ktdf memory space");
     auto it = resolved_units.find(*ms);
     if (it == resolved_units.end())
       return ucc.emitError("no resolved unit for memory space");
