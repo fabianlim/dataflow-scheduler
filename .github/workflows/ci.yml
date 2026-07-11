@@ -1,0 +1,96 @@
+name: CI
+
+# Tracks torch-spyre/dataflow-scheduler#10
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      artifact-repo:
+        description: "GitHub repo (owner/repo) to fetch the LLVM artifact from. Defaults to the parent repo (torch-spyre/dataflow-scheduler)."
+        required: false
+        type: string
+
+jobs:
+  test:
+    name: Test (${{ matrix.config.name }})
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - { name: "Clang", cc: "clang", cxx: "clang++" }
+          - { name: "GCC",   cc: "gcc",   cxx: "g++"     }
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Resolve artifact repo
+        id: config
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ inputs.artifact-repo }}" ]; then
+            ARTIFACT_REPO="${{ inputs.artifact-repo }}"
+          else
+            ARTIFACT_REPO=$(curl -sf \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}" \
+              | jq -r '.parent.full_name // .full_name')
+          fi
+          echo "artifact-repo=${ARTIFACT_REPO}" >> $GITHUB_OUTPUT
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y ninja-build clang clang-format python3
+
+      - name: Read LLVM hash
+        id: llvm
+        run: |
+          echo "hash=$(cat external/ktir-mlir-frontend/cmake/llvm-hash.txt)" >> $GITHUB_OUTPUT
+
+      # Cache the extracted MLIR artifact across runs. The key encodes the LLVM
+      # hash and variant so a pin bump or variant change automatically triggers
+      # a fresh download.
+      - name: Cache MLIR
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ktir-mlir
+          key: mlir-dev-dylib-${{ steps.llvm.outputs.hash }}
+
+      # Downloads from the public GitHub Release on fabianlim/ktir-mlir-frontend
+      # (no token required). setup_mlir.py detects a cache hit and skips the
+      # download on subsequent runs.
+      - name: Download MLIR (dev-dylib)
+        run: |
+          MLIR_DIR=$(python3 external/ktir-mlir-frontend/scripts/setup_mlir.py \
+            --hash "${{ steps.llvm.outputs.hash }}" \
+            --variant dev-dylib \
+            --repo ${{ steps.config.outputs.artifact-repo }})
+          echo "MLIR_DIR=$MLIR_DIR" >> $GITHUB_ENV
+
+      - name: Install lit
+        run: pip install lit
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DLLVM_ENABLE_ASSERTIONS=ON \
+            -DCMAKE_C_COMPILER=${{ matrix.config.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.config.cxx }} \
+            -DMLIR_DIR=${{ env.MLIR_DIR }} \
+            -DLLVM_EXTERNAL_LIT=$(which lit)
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: cmake --build build --target check-dataflow-scheduler
