@@ -41,6 +41,11 @@ llvm_config.use_default_substitutions()
 
 config.excludes = ["Inputs", "CMakeLists.txt"]
 
+if config.enable_assertions:
+    config.available_features.add("asserts")
+else:
+    config.available_features.add("noasserts")
+
 tools = ["dataflow-scheduler", "dataflow-scheduler-opt", "FileCheck", "not"]
 tool_dirs = [config.dataflow_scheduler_tools_dir, config.llvm_tools_dir]
 

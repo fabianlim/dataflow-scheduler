@@ -19,6 +19,7 @@
 
 config.llvm_tools_dir = lit_config.substitute("@LLVM_TOOLS_DIR@")
 config.python_executable = "@Python3_EXECUTABLE@"
+config.enable_assertions = @ENABLE_ASSERTIONS@
 config.enable_python_bindings = @DataflowScheduler_ENABLE_PYTHON_BINDINGS@
 config.python_package_install_prefix = "@MLIR_BINDINGS_PYTHON_INSTALL_PREFIX@"
 config.dataflow_scheduler_obj_root = "@DataflowScheduler_BINARY_DIR@"
