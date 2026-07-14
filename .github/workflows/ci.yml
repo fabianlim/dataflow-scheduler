@@ -29,6 +29,7 @@ jobs:
           - { name: "GCC 13 (dev-dylib)",   cc: "gcc-13",   cxx: "g++-13",     variant: "dev-dylib", assertions: "ON"  }
           # Static Release: matches the production LLVM build.
           - { name: "Clang 21 (static)",    cc: "clang-21", cxx: "clang++-21", variant: "",          assertions: "OFF" }
+          - { name: "GCC 13 (static)",      cc: "gcc-13",   cxx: "g++-13",     variant: "",          assertions: "OFF" }
 
     steps:
       - uses: actions/checkout@v4
