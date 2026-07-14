@@ -26,6 +26,15 @@ if(PROJECT_IS_TOP_LEVEL)
   include(TableGen)
   include(AddLLVM)
   include(AddMLIR)
+  # Workaround: CMake 3.31 Ninja generator has a dedup bug when the first
+  # compile definition contains '='. HandleLLVMOptions adds definitions via
+  # add_compile_definitions (e.g. _GLIBCXX_USE_CXX11_ABI=1), and
+  # add_definitions(${LLVM_DEFINITIONS}) below duplicates them. The dedup
+  # fails when the first entry has '=' but succeeds when it doesn't.
+  # Adding _GNU_SOURCE (which is in LLVM_DEFINITIONS but not added by
+  # HandleLLVMOptions) before the include ensures a no-'=' entry comes first.
+  # See: https://github.com/llvm/llvm-project/issues/XXXXX
+  add_compile_definitions(_GNU_SOURCE)
   include(HandleLLVMOptions)
 
   # Apply target properties for LLVM/MLIR globally.
@@ -123,6 +132,9 @@ if(DataflowScheduler_ENABLE_WERROR)
   add_compile_options(-Werror)
   message(STATUS "DataflowScheduler: -Werror enabled for first-party sources")
 endif()
+
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN YES)
 
 # Include DataflowScheduler CMake module.
 set(KTIR_INCLUDE_DIRS 

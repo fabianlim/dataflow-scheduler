@@ -1,3 +1,4 @@
+// REQUIRES: asserts
 // RUN: dataflow-scheduler-opt -allow-unregistered-dialect %s -parallelize-loops-across-instances -debug-only=parallelize-loops-across-instances 2>&1 | FileCheck %s --check-prefix=DEBUG
 
 // Verify debug log emits the balanced-candidate line with the exact

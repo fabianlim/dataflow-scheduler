@@ -1,6 +1,7 @@
 // Verify the pass emits debug output via LLVM_DEBUG when --debug-only is
 // supplied.
 
+// REQUIRES: asserts
 // RUN: dataflow-scheduler-opt -allow-unregistered-dialect --debug-only=double-buffering %s -double-buffering 2>&1 | FileCheck %s
 
 // CHECK: [double-buffering {{.*}}] starting

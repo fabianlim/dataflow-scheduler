@@ -1,0 +1,113 @@
+name: CI
+
+# Tracks torch-spyre/dataflow-scheduler#10
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      artifact-repo:
+        description: "GitHub repo (owner/repo) to fetch the LLVM artifact from. Defaults to the parent repo (torch-spyre/dataflow-scheduler)."
+        required: false
+        type: string
+
+jobs:
+  test:
+    name: Test (${{ matrix.config.name }})
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          # Dev dylib: LLVM_BUILD_LLVM_DYLIB + RelWithDebInfo + assertions.
+          # Tests dynamic linking and assertion-gated lit tests.
+          - { name: "Clang 21 (dev-dylib)", cc: "clang-21", cxx: "clang++-21", variant: "dev-dylib", assertions: "ON"  }
+          - { name: "GCC 13 (dev-dylib)",   cc: "gcc-13",   cxx: "g++-13",     variant: "dev-dylib", assertions: "ON"  }
+          # Static Release: matches the production LLVM build.
+          - { name: "Clang 21 (static)",    cc: "clang-21", cxx: "clang++-21", variant: "",          assertions: "OFF" }
+          - { name: "GCC 13 (static)",      cc: "gcc-13",   cxx: "g++-13",     variant: "",          assertions: "OFF" }
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Resolve artifact repo
+        id: config
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ inputs.artifact-repo }}" ]; then
+            ARTIFACT_REPO="${{ inputs.artifact-repo }}"
+          else
+            ARTIFACT_REPO=$(curl -sf \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}" \
+              | jq -r '.parent.full_name // .full_name')
+          fi
+          echo "artifact-repo=${ARTIFACT_REPO}" >> $GITHUB_OUTPUT
+
+      - name: Install dependencies
+        run: |
+          # clang-21 from LLVM apt (matches project's recommended clang >= 21.0.0)
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          sudo add-apt-repository \
+            "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-21 main"
+
+          # gcc-13 from toolchain PPA
+          sudo add-apt-repository ppa:ubuntu-toolchain-r/test
+          sudo apt-get update -q
+          sudo apt-get install -y ninja-build clang-21 clang-format-21 gcc-13 g++-13 python3
+
+      - name: Read LLVM hash
+        id: llvm
+        run: |
+          echo "hash=$(cat external/ktir-mlir-frontend/cmake/llvm-hash.txt)" >> $GITHUB_OUTPUT
+
+      # Cache the extracted MLIR artifact across runs. The key encodes the LLVM
+      # hash and variant so a pin bump or variant change automatically triggers
+      # a fresh download.
+      - name: Cache MLIR
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ktir-mlir
+          key: mlir-${{ matrix.config.variant || 'static' }}-${{ steps.llvm.outputs.hash }}
+
+      # Downloads from the public GitHub Release on the artifact repo.
+      # setup_mlir.py detects a cache hit and skips the download on subsequent
+      # runs.
+      - name: Download MLIR
+        run: |
+          VARIANT_ARGS=""
+          if [ -n "${{ matrix.config.variant }}" ]; then
+            VARIANT_ARGS="--variant ${{ matrix.config.variant }}"
+          fi
+          MLIR_DIR=$(python3 external/ktir-mlir-frontend/scripts/setup_mlir.py \
+            --hash "${{ steps.llvm.outputs.hash }}" \
+            $VARIANT_ARGS \
+            --repo ${{ steps.config.outputs.artifact-repo }})
+          echo "MLIR_DIR=$MLIR_DIR" >> $GITHUB_ENV
+
+      - name: Install lit
+        run: pip install lit
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DLLVM_ENABLE_ASSERTIONS=${{ matrix.config.assertions }} \
+            -DCMAKE_C_COMPILER=${{ matrix.config.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.config.cxx }} \
+            -DMLIR_DIR=${{ env.MLIR_DIR }} \
+            -DLLVM_EXTERNAL_LIT=$(which lit)
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: cmake --build build --target check-dataflow-scheduler
