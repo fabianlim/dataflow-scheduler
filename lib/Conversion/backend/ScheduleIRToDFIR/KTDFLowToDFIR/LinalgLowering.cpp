@@ -60,12 +60,17 @@ struct LowerLinalgGenericPattern
       return mlir::failure();
     }
 
-    // Replace block arguments with generic inputs
+    // Replace block arguments with generic inputs.  Any input that is a
+    // constant tensor (e.g. a dense<0.0>) is converted to an equivalent
+    // arith.constant with vector type first so that vectorchain.binary always
+    // receives vector-typed operands.
     unsigned num_inputs = generic_op.getNumDpsInputs();
     for (auto [block_arg, input] :
          llvm::zip(body.getArguments().take_front(num_inputs),
                    generic_op.getDpsInputs())) {
-      block_arg.replaceAllUsesWith(input);
+      mlir::Value converted =
+          convertConstTensorInputToVector(input, generic_op, rewriter);
+      block_arg.replaceAllUsesWith(converted);
     }
 
     // Identity affine map used as op_specific_map for binary ops.
@@ -110,6 +115,42 @@ struct LowerLinalgGenericPattern
 
  private:
   arch_view::ResourceKinds& resource_kinds_;
+
+  /// Converts a constant tensor input of a linalg.generic to a vector-typed
+  /// arith.constant, preserving all element values.  This is needed because
+  /// linalg.generic inputs can be constant tensors (e.g. a dense<0.0>), while
+  /// vectorchain.binary requires vector operands.
+  ///
+  /// Only arith.constant ops whose value is a DenseElementsAttr are handled;
+  /// any other input (non-constant tensors, vectors, scalars) is returned
+  /// unchanged.
+  mlir::Value convertConstTensorInputToVector(
+      mlir::Value input, mlir::linalg::GenericOp generic_op,
+      mlir::PatternRewriter& rewriter) const {
+    // Only act on tensor-typed inputs — vectors and scalars pass through.
+    auto tensor_type = mlir::dyn_cast<mlir::RankedTensorType>(input.getType());
+    if (!tensor_type) return input;
+
+    // Must be a constant op with a dense attribute to convert.
+    auto const_op =
+        mlir::dyn_cast_or_null<mlir::arith::ConstantOp>(input.getDefiningOp());
+    if (!const_op) return input;
+    auto dense_attr =
+        mlir::dyn_cast<mlir::DenseElementsAttr>(const_op.getValue());
+    if (!dense_attr) return input;
+
+    // Determine the target vector type (same element type, flattened shape).
+    auto vector_type = getFlattenedVectorType(tensor_type, resource_kinds_);
+    if (!vector_type) return input;
+
+    // Re-materialise the constant with the vector type, preserving all element
+    // values by reinterpreting the same dense data into the flat vector shape.
+    auto vec_attr = dense_attr.reshape(vector_type);
+    rewriter.setInsertionPoint(generic_op);
+    return mlir::arith::ConstantOp::create(rewriter, const_op.getLoc(),
+                                           vector_type, vec_attr)
+        .getResult();
+  }
 
   // arith.mulf visitor: lowers to vectorchain.binary {binary_op = mul}
   mlir::LogicalResult lowerMulFOp(mlir::arith::MulFOp mulf_op,
