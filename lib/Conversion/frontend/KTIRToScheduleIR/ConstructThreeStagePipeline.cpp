@@ -307,6 +307,29 @@ mlir::LogicalResult ConstructThreeStagePipelinePass::fuseLinalgOps(
         auto fused_op =
             mlir::cast<mlir::linalg::GenericOp>(fusion_result->fusedOp);
 
+        // Immediately after fusion: ensure every outs operand of the fused op
+        // is a fresh tensor.empty. fuseElementwiseOps can pull a live producer
+        // result into the outs position; replace it now so the rest of the
+        // pipeline always sees a clean init tensor.
+        for (int64_t i = 0, e = fused_op.getNumDpsInits(); i < e; ++i) {
+          mlir::OpOperand* init_operand = fused_op.getDpsInitOperand(i);
+          mlir::Value outs_val = init_operand->get();
+          if (mlir::isa_and_present<mlir::tensor::EmptyOp>(
+                  outs_val.getDefiningOp())) {
+            continue;  // already a tensor.empty – nothing to do
+          }
+          auto tensor_type =
+              mlir::dyn_cast<mlir::RankedTensorType>(outs_val.getType());
+          if (!tensor_type) continue;
+
+          rewriter.setInsertionPoint(fused_op);
+          auto empty = mlir::tensor::EmptyOp::create(
+              rewriter, fused_op.getLoc(), tensor_type.getShape(),
+              tensor_type.getElementType());
+          rewriter.modifyOpInPlace(
+              fused_op, [&]() { init_operand->set(empty.getResult()); });
+        }
+
         // Replace uses of consumer with the fused operation (this also erases
         // consumer)
         rewriter.replaceOp(consumer, fused_op->getResults());
@@ -1035,6 +1058,25 @@ void ConstructThreeStagePipelinePass::createComputeOps(
     mapper.map(output_operand, empty_tensor.getResult());
   }
 
+  // Any linalg op input not already remapped
+  // that is defined by a tensor.extract_slice in the enclosing loop body
+  // cannot be used inside the stage nested region (would result in use before
+  // definition). Clone the extract_slice inside the stage so the cloned linalg
+  // can reference it legally.
+  if (linalg_op) {
+    for (mlir::OpOperand* input : linalg_op.getDpsInputOperands()) {
+      mlir::Value v = input->get();
+      if (mapper.contains(v)) continue;
+      auto extract_op = v.getDefiningOp<mlir::tensor::ExtractSliceOp>();
+      if (!extract_op) continue;
+      // Clone the extract_slice at the current insertion point (inside the
+      // stage), mapping its operands through the existing mapper so that any
+      // loop IVs etc. resolve correctly.
+      auto* cloned_extract = builder.clone(*extract_op, mapper);
+      mapper.map(v, cloned_extract->getResult(0));
+    }
+  }
+
   auto* cloned = builder.clone(*compute_op, mapper);
 
   // Create ktdf.write_to_fifo for each store operation
@@ -1192,23 +1234,30 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
     return;
   }
 
-  // Find the insertion point: right before the first loop in tiled_loops_
-  // to ensure def before use
-  mlir::Operation* insertion_point = nullptr;
-  if (!tiled_loops_.empty()) {
-    insertion_point = tiled_loops_.front();
-  } else {
-    // Fallback: find the last memory view operation
-    func_op.walk([&](mlir::ktdp::ConstructMemoryViewOp memory_view) {
-      insertion_point = memory_view.getOperation();
-    });
+  // Hoist construct_memory_view and construct_access_tile ops to just before
+  // the outermost tiled loop (or the func terminator if no loops exist).
+  // This ensures both the memory views and the access tiles — and therefore the
+  // memory_space_cast / reinterpret_cast we are about to emit in their place —
+  // all precede the pipeline that consumes them.
+  // We use the outermost tiled loop as the insertion anchor because that is
+  // where the pipeline lives; everything hoisted before it will dominate all
+  // uses inside the loop body.
+  mlir::Operation* hoist_before = tiled_loops_.empty()
+                                      ? func_op.front().getTerminator()
+                                      : tiled_loops_.front();
+  {
+    // Hoist memory views first (access tiles depend on them).
+    llvm::SmallVector<mlir::ktdp::ConstructMemoryViewOp> mem_views;
+    func_op.walk(
+        [&](mlir::ktdp::ConstructMemoryViewOp mv) { mem_views.push_back(mv); });
+    for (auto mv : mem_views) {
+      mv->moveBefore(hoist_before);
+    }
   }
-
-  if (!insertion_point) {
-    func_op.emitError(
-        "No insertion point found for reinterpret_cast operations");
-    signalPassFailure();
-    return;
+  // Hoist access tiles themselves so that inserting the casts before each
+  // access tile (below) also lands before the pipeline.
+  for (auto at : access_tiles) {
+    at->moveBefore(hoist_before);
   }
 
   mlir::OpBuilder builder(&getContext());
@@ -1259,12 +1308,12 @@ void ConstructThreeStagePipelinePass::replaceAccessTilesWithReinterpretCast(
       }
     }
 
-    builder.setInsertionPoint(insertion_point);
+    // Insert the cast sequence immediately before the (now-hoisted)
+    // construct_access_tile.  Both the memory view and index operands have
+    // already been moved above the outermost loop, so all operands dominate
+    // this insertion point.
+    builder.setInsertionPoint(access_tile);
     mlir::Location loc = access_tile.getLoc();
-
-    // Move the memory view operation right before the insertion point to ensure
-    // it dominates the reinterpret_cast
-    memory_view.getDefiningOp()->moveBefore(insertion_point);
 
     // Apply base_map to materialize one index per source-memref dimension.
     // Operands to expandAffineMap are dim-values followed by symbol-values; the
