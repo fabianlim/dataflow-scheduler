@@ -26,18 +26,18 @@
 // CHECK-NEXT:     %[[CONSTANT_15:.*]] = arith.constant 32 : index
 // CHECK-NEXT:     %[[CONSTANT_16:.*]] = arith.constant 32 : index
 // CHECK-NEXT:     %[[CONSTRUCT_MEMORY_VIEW_0:.*]] = ktdp.construct_memory_view %[[CONSTANT_5]], sizes: [96, 4, 32], strides: [128, 32, 1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<96x4x32xf16>
+// CHECK-NEXT:     %[[CONSTRUCT_MEMORY_VIEW_1:.*]] = ktdp.construct_memory_view %[[CONSTANT_6]], sizes: [96, 4, 32], strides: [128, 32, 1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<96x4x32xf16>
+// CHECK-NEXT:     %[[CONSTRUCT_MEMORY_VIEW_2:.*]] = ktdp.construct_memory_view %[[CONSTANT_7]], sizes: [96, 4, 32], strides: [128, 32, 1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<96x4x32xf16>
 // CHECK-NEXT:     %[[CONSTANT_17:.*]] = arith.constant 128 : index
 // CHECK-NEXT:     %[[MULI_1:.*]] = arith.muli %[[ADDI_0]], %[[CONSTANT_17]] : index
 // CHECK-NEXT:     %[[ADDI_1:.*]] = arith.addi %[[MULI_1]], %[[CONSTANT_3]] : index
 // CHECK-NEXT:     %[[MEMORY_SPACE_CAST_0:.*]] = memref.memory_space_cast %[[CONSTRUCT_MEMORY_VIEW_0]] : memref<96x4x32xf16> to memref<96x4x32xf16, "DDR">
 // CHECK-NEXT:     %[[REINTERPRET_CAST_0:.*]] = memref.reinterpret_cast %[[MEMORY_SPACE_CAST_0]] to offset: {{\[}}%[[ADDI_1]]], sizes: [2, 4, 32], strides: [128, 32, 1] : memref<96x4x32xf16, "DDR"> to memref<2x4x32xf16, strided<[128, 32, 1], offset: ?>, "DDR">
-// CHECK-NEXT:     %[[CONSTRUCT_MEMORY_VIEW_1:.*]] = ktdp.construct_memory_view %[[CONSTANT_6]], sizes: [96, 4, 32], strides: [128, 32, 1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<96x4x32xf16>
 // CHECK-NEXT:     %[[CONSTANT_18:.*]] = arith.constant 128 : index
 // CHECK-NEXT:     %[[MULI_2:.*]] = arith.muli %[[ADDI_0]], %[[CONSTANT_18]] : index
 // CHECK-NEXT:     %[[ADDI_2:.*]] = arith.addi %[[MULI_2]], %[[CONSTANT_3]] : index
 // CHECK-NEXT:     %[[MEMORY_SPACE_CAST_1:.*]] = memref.memory_space_cast %[[CONSTRUCT_MEMORY_VIEW_1]] : memref<96x4x32xf16> to memref<96x4x32xf16, "DDR">
 // CHECK-NEXT:     %[[REINTERPRET_CAST_1:.*]] = memref.reinterpret_cast %[[MEMORY_SPACE_CAST_1]] to offset: {{\[}}%[[ADDI_2]]], sizes: [2, 4, 32], strides: [128, 32, 1] : memref<96x4x32xf16, "DDR"> to memref<2x4x32xf16, strided<[128, 32, 1], offset: ?>, "DDR">
-// CHECK-NEXT:     %[[CONSTRUCT_MEMORY_VIEW_2:.*]] = ktdp.construct_memory_view %[[CONSTANT_7]], sizes: [96, 4, 32], strides: [128, 32, 1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<96x4x32xf16>
 // CHECK-NEXT:     %[[CONSTANT_19:.*]] = arith.constant 128 : index
 // CHECK-NEXT:     %[[MULI_3:.*]] = arith.muli %[[ADDI_0]], %[[CONSTANT_19]] : index
 // CHECK-NEXT:     %[[ADDI_3:.*]] = arith.addi %[[MULI_3]], %[[CONSTANT_3]] : index
