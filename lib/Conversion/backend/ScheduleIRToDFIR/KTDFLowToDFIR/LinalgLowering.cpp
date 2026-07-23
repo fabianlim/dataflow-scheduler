@@ -24,11 +24,13 @@
 
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
+#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
@@ -52,6 +54,13 @@ struct LowerLinalgGenericPattern
     if (!generic_op.hasPureTensorSemantics() ||
         generic_op.getNumResults() != 1) {
       return mlir::failure();
+    }
+
+    // If the generic has any reduction dimensions, delegate to the dedicated
+    // reduction lowering path before the elementwise path touches block args.
+    for (auto iter_type : generic_op.getIteratorTypesArray()) {
+      if (iter_type == mlir::utils::IteratorType::reduction)
+        return lowerReductionGenericOp(generic_op, rewriter);
     }
 
     mlir::Block& body = generic_op.getRegion().front();
@@ -115,6 +124,148 @@ struct LowerLinalgGenericPattern
 
  private:
   arch_view::ResourceKinds& resource_kinds_;
+
+  // Lowers a linalg.generic that has one or more reduction dimensions.
+  //
+  // One scf.for loop is emitted per reduction dimension (outermost first),
+  // carrying the output vector as an iter_arg accumulator.  Each innermost
+  // iteration extracts a parallel-shaped slice from the input tensor (size 1
+  // along every reduction dim, full extent along parallel dims), then
+  // accumulates it into the current accumulator via vectorchain.binary.
+  //
+  // The body op (addf / mulf / subf) determines the binary operator; the
+  // existing lowerXxxFOp helpers are reused for the accumulation step.
+  mlir::LogicalResult lowerReductionGenericOp(
+      mlir::linalg::GenericOp generic_op,
+      mlir::PatternRewriter& rewriter) const {
+    mlir::Location loc = generic_op.getLoc();
+
+    // Require exactly one body op (plus the linalg.yield terminator).
+    mlir::Block& body = generic_op.getRegion().front();
+    llvm::SmallVector<mlir::Operation*> body_ops;
+    for (mlir::Operation& op : body.without_terminator())
+      body_ops.push_back(&op);
+    if (body_ops.size() != 1)
+      return generic_op.emitError(
+          "reduction linalg.generic body must have exactly one compute op");
+
+    // Map body op kind to the vectorchain binary operator.
+    mlir::vectorchain::VectorChainBinaryOperator binary_kind;
+    if (mlir::isa<mlir::arith::AddFOp>(body_ops[0]))
+      binary_kind = mlir::vectorchain::VectorChainBinaryOperator::add;
+    else if (mlir::isa<mlir::arith::MulFOp>(body_ops[0]))
+      binary_kind = mlir::vectorchain::VectorChainBinaryOperator::mul;
+    else if (mlir::isa<mlir::arith::SubFOp>(body_ops[0]))
+      binary_kind = mlir::vectorchain::VectorChainBinaryOperator::sub;
+    else
+      return body_ops[0]->emitError(
+          "unsupported reduction body op in linalg.generic");
+
+    // Collect reduction dim indices and their sizes from the input type.
+    auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        generic_op.getDpsInputOperand(0)->get().getType());
+    if (!input_type) return mlir::failure();
+
+    const auto iterator_types = generic_op.getIteratorTypesArray();
+    llvm::SmallVector<int64_t> red_dims;
+    for (int64_t i = 0; i < static_cast<int64_t>(iterator_types.size()); ++i) {
+      if (iterator_types[i] == mlir::utils::IteratorType::reduction)
+        red_dims.push_back(i);
+    }
+
+    // The output type has only parallel dims and always fits in vector_length.
+    auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        generic_op.getDpsInitOperand(0)->get().getType());
+    if (!output_type) return mlir::failure();
+
+    mlir::VectorType vec_type =
+        getFlattenedVectorType(output_type, resource_kinds_);
+    if (!vec_type) return mlir::failure();
+
+    mlir::AffineMap identity_map =
+        mlir::AffineMap::getMultiDimIdentityMap(1, rewriter.getContext());
+
+    rewriter.setInsertionPoint(generic_op);
+
+    // Build the initial accumulator from the init operand.  For a tensor.empty
+    // (undefined init) use a zero vector; for a constant tensor reshape it.
+    mlir::Value init = generic_op.getDpsInitOperand(0)->get();
+    mlir::Value acc =
+        convertConstTensorInputToVector(init, generic_op, rewriter);
+    if (acc.getType() != vec_type) {
+      // Non-constant init (e.g. tensor.empty) — zero is the correct identity
+      // for reductions that start with an uninitialised accumulator.
+      acc = mlir::arith::ConstantOp::create(rewriter, loc, vec_type,
+                                            rewriter.getZeroAttr(vec_type));
+    }
+
+    // Emit one scf.for per reduction dimension (outermost first), each
+    // carrying the accumulator as its single iter_arg.
+    //
+    // The input to the linalg.generic comes from a ktdf.read_from_fifo whose
+    // result type includes all dims (parallel + reduction).  Rather than
+    // tensor.extract_slice-ing that large tensor inside the loop (which would
+    // require LowerReadFromFifoPattern to lower a tensor larger than
+    // vector_length), we instead emit one new ktdf.read_from_fifo per loop
+    // iteration — each producing the parallel-only shaped slice directly.
+    // The original read_from_fifo is replaced by the new ones so it is erased.
+    mlir::Value input = generic_op.getDpsInputOperand(0)->get();
+    auto read_from_fifo = mlir::dyn_cast_or_null<mlir::ktdf::ReadFromFifoOp>(
+        input.getDefiningOp());
+    if (!read_from_fifo)
+      return generic_op.emitError(
+          "reduction linalg.generic input must be produced by "
+          "ktdf.read_from_fifo");
+
+    // Parallel-only result type for each per-step read.
+    llvm::SmallVector<int64_t> parallel_shape;
+    for (int64_t i = 0; i < static_cast<int64_t>(iterator_types.size()); ++i) {
+      if (iterator_types[i] != mlir::utils::IteratorType::reduction)
+        parallel_shape.push_back(input_type.getShape()[i]);
+    }
+    auto parallel_type = mlir::RankedTensorType::get(
+        parallel_shape, input_type.getElementType());
+
+    mlir::Value cur_acc = acc;
+
+    // Build nested scf.for loops, one per reduction dimension.
+    llvm::SmallVector<mlir::scf::ForOp> for_ops;
+    for (int64_t red_dim : red_dims) {
+      mlir::Value lb = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+      mlir::Value ub = mlir::arith::ConstantIndexOp::create(
+          rewriter, loc, input_type.getShape()[red_dim]);
+      mlir::Value step = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
+      auto for_op = mlir::scf::ForOp::create(rewriter, loc, lb, ub, step,
+                                             mlir::ValueRange{cur_acc});
+      for_ops.push_back(for_op);
+      rewriter.setInsertionPointToStart(for_op.getBody());
+      cur_acc = for_op.getRegionIterArgs()[0];
+    }
+
+    // Innermost body: emit a new read_from_fifo producing parallel_type,
+    // then accumulate via vectorchain.binary.
+    auto new_read = mlir::ktdf::ReadFromFifoOp::create(
+        rewriter, loc, parallel_type, read_from_fifo.getFifoSlot());
+
+    // The parallel slice fits in vector_length.
+    auto binary = mlir::vectorchain::BinaryOp::create(
+        rewriter, loc, vec_type, cur_acc, new_read.getResult(),
+        /*mask=*/nullptr, /*dbgName=*/nullptr, binary_kind, identity_map);
+
+    // Yield the new accumulator up through each loop level.
+    mlir::Value result = binary.getData();
+    for (auto for_op : llvm::reverse(for_ops)) {
+      mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{result});
+      result = for_op.getResult(0);
+      rewriter.setInsertionPointAfter(for_op);
+    }
+
+    // Replace the linalg.generic result and erase the original read_from_fifo
+    // (which is now unused).
+    rewriter.replaceOp(generic_op, result);
+    rewriter.eraseOp(read_from_fifo);
+    return mlir::success();
+  }
 
   /// Converts a constant tensor input of a linalg.generic to a vector-typed
   /// arith.constant, preserving all element values.  This is needed because
