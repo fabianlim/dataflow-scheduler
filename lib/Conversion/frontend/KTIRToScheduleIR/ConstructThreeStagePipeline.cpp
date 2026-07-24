@@ -206,9 +206,6 @@ struct ConstructThreeStagePipelinePass
   // Tile sizes determined from linalg operation
   llvm::SmallVector<int64_t> tile_sizes_;
 
-  // Total number of elements (product of tile_sizes_)
-  int64_t total_num_elements_ = 0;
-
   // Operations to delete after pipeline creation
   llvm::SmallVector<mlir::Operation*> ops_to_delete_;
 
@@ -222,7 +219,6 @@ void ConstructThreeStagePipelinePass::resetState() {
   compute_ops_.clear();
   tiled_loops_.clear();
   tile_sizes_.clear();
-  total_num_elements_ = 0;
   ops_to_delete_.clear();
   const_builder_.reset();
 }
@@ -1056,10 +1052,27 @@ void ConstructThreeStagePipelinePass::createDataTransfers(
     // Get the FIFO slot from ktdf.private results.
     mlir::Value fifo_slot = private_op.getResult(private_result_offset + i);
 
-    // FIFO side size: read the capacity directly from the slot type.
-    auto fifo_slot_type =
-        mlir::cast<mlir::ktdf::FifoSlotType>(fifo_slot.getType());
-    llvm::SmallVector<int64_t> fifo_sizes = {fifo_slot_type.getNumElements()};
+    // For a load, the FIFO must hold the full input tile — including any
+    // reduction dimensions — because the compute stage reads a tensor of that
+    // full shape from the FIFO.  fifo_sizes therefore mirrors
+    // access_tile_sizes.
+    //
+    // For a store, the output tile contains only parallel dimensions, so
+    // reduction dims (tile_sizes[k] == 0) are absent from the output indexing
+    // map and must not appear in fifo_sizes.
+    llvm::SmallVector<int64_t> fifo_sizes;
+    if (is_load) {
+      fifo_sizes.assign(access_tile_sizes.begin(), access_tile_sizes.end());
+    } else {
+      for (mlir::AffineExpr result_expr : indexing_map->getResults()) {
+        if (auto dim_expr = mlir::dyn_cast<mlir::AffineDimExpr>(result_expr)) {
+          unsigned k = dim_expr.getPosition();
+          if (tile_sizes[k] > 0) fifo_sizes.push_back(tile_sizes[k]);
+        } else if (mlir::isa<mlir::AffineConstantExpr>(result_expr)) {
+          fifo_sizes.push_back(1);
+        }
+      }
+    }
 
     // The fifo side gets a null AffineMap; the access-tile (memref) side gets
     // the substituted+compressed map. map_ivs has exactly one entry per dim
