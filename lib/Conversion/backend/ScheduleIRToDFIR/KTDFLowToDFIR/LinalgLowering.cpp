@@ -24,6 +24,7 @@
 
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
+#include "dataflow-scheduler/Dialect/Agen/Agen.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
 #include "llvm/ADT/SmallVector.h"
@@ -32,6 +33,8 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AffineMap.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
 
@@ -358,6 +361,124 @@ struct LowerLinalgGenericPattern
   }
 };
 
+/// Pattern to lower linalg.fill into:
+///   vectorchain.constant_bitstream {value = [0x0]} : vector<1xT>
+///   vectorchain.shuffle ... {indices = [0 : i32], repetition = N}
+///       : vector<1xT>, vector<NxT>
+///
+/// Buffer semantics (memref output): the shuffle result is written to the
+/// output memref via agen.vector_store and the fill is erased.
+///
+/// Tensor semantics (tensor output): the shuffle result directly replaces
+/// the fill result (consumed by downstream vectorchain / FIFO ops).
+///
+/// Only zero fill values are supported. N and T are derived from the output
+/// type shape and element type.
+struct LowerLinalgFillPattern
+    : public mlir::OpRewritePattern<mlir::linalg::FillOp> {
+  LowerLinalgFillPattern(mlir::MLIRContext* context,
+                         arch_view::ResourceKinds& resource_kinds)
+      : OpRewritePattern(context), resource_kinds_(resource_kinds) {}
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::linalg::FillOp fill_op,
+      mlir::PatternRewriter& rewriter) const override {
+    // linalg.fill must have exactly one input (the fill scalar).
+    if (fill_op.getInputs().size() != 1) return mlir::failure();
+    mlir::Value fill_val = fill_op.getInputs()[0];
+    auto const_op = mlir::dyn_cast_or_null<mlir::arith::ConstantOp>(
+        fill_val.getDefiningOp());
+    if (!const_op) return mlir::failure();
+    auto scalar_attr = mlir::dyn_cast<mlir::TypedAttr>(const_op.getValue());
+    if (!scalar_attr) return mlir::failure();
+
+    // Derive output vector type from the output operand (memref or tensor).
+    mlir::Value out_operand = fill_op.getOutputs()[0];
+    mlir::VectorType out_vec_type =
+        getFlattenedVectorType(out_operand.getType(), resource_kinds_);
+    if (!out_vec_type) return mlir::failure();
+
+    mlir::Location loc = fill_op.getLoc();
+    mlir::MLIRContext* ctx = rewriter.getContext();
+    int64_t total_elements = out_vec_type.getNumElements();
+    mlir::Type elem_type = out_vec_type.getElementType();
+
+    rewriter.setInsertionPoint(fill_op);
+
+    // Only zero fills are supported.
+    if (auto fa = mlir::dyn_cast<mlir::FloatAttr>(scalar_attr)) {
+      if (!fa.getValue().isZero())
+        return fill_op.emitError(
+            "linalg.fill lowering only supports zero fill values");
+    } else if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(scalar_attr)) {
+      if (!ia.getValue().isZero())
+        return fill_op.emitError(
+            "linalg.fill lowering only supports zero fill values");
+    } else {
+      return fill_op.emitError(
+          "linalg.fill constant value must be integer or float");
+    }
+
+    // Step 1: vectorchain.constant_bitstream {value = [0x0]} : vector<1xT>
+    mlir::VectorType seed_type = mlir::VectorType::get({1}, elem_type);
+    mlir::ArrayAttr value_attr = rewriter.getArrayAttr(
+        {mlir::IntegerAttr::get(rewriter.getI64Type(), 0)});
+    auto bitstream = mlir::vectorchain::ConstantBitstreamOp::create(
+        rewriter, loc, seed_type, value_attr);
+
+    // Step 2: vectorchain.shuffle — splat to vector<NxT>
+    mlir::ArrayAttr indices_attr = rewriter.getArrayAttr(
+        {mlir::IntegerAttr::get(rewriter.getI32Type(), 0)});
+    auto shuffle = mlir::vectorchain::ShuffleOp::create(
+        rewriter, loc, out_vec_type, bitstream.getResult(),
+        /*mask=*/nullptr, /*dbgName=*/nullptr, indices_attr,
+        static_cast<uint32_t>(total_elements));
+
+    // Step 3a (tensor): replace the fill result directly with the vector.
+    if (!fill_op.getResultTensors().empty()) {
+      rewriter.replaceOp(fill_op, shuffle.getOutput());
+      return mlir::success();
+    }
+
+    // Step 3b (memref): write the filled vector into the output memref.
+    auto memref_type = mlir::cast<mlir::MemRefType>(out_operand.getType());
+    unsigned rank = memref_type.getRank();
+    auto identity_map = mlir::AffineMap::getMultiDimIdentityMap(rank, ctx);
+
+    llvm::SmallVector<mlir::AffineExpr> exprs;
+    llvm::SmallVector<bool> eq_flags;
+    for (unsigned i = 0; i < rank; ++i) {
+      auto dim = mlir::getAffineDimExpr(i, ctx);
+      int64_t size = memref_type.getShape()[i];
+      if (size == 1) {
+        exprs.push_back(dim);
+        eq_flags.push_back(/*equality=*/true);
+      } else {
+        exprs.push_back(dim);
+        eq_flags.push_back(false);
+        exprs.push_back(mlir::getAffineConstantExpr(size - 1, ctx) - dim);
+        eq_flags.push_back(false);
+      }
+    }
+    auto store_set = mlir::IntegerSet::get(rank, 0, exprs, eq_flags);
+
+    llvm::SmallVector<mlir::Value> zero_indices(
+        rank,
+        mlir::arith::ConstantIndexOp::create(rewriter, loc, 0).getResult());
+
+    mlir::agen::VectorStoreOp::create(rewriter, loc, shuffle.getOutput(),
+                                      out_operand,
+                                      /*dbgName=*/nullptr, identity_map,
+                                      zero_indices, store_set, identity_map);
+
+    rewriter.eraseOp(fill_op);
+    return mlir::success();
+  }
+
+ private:
+  arch_view::ResourceKinds& resource_kinds_;
+};
+
 }  // namespace
 
 void scheduler::populateLinalgLoweringPatterns(
@@ -365,4 +486,5 @@ void scheduler::populateLinalgLoweringPatterns(
     arch_view::ResourceKinds& resource_kinds) {
   patterns.add<LowerLinalgGenericPattern>(patterns.getContext(),
                                           resource_kinds);
+  patterns.add<LowerLinalgFillPattern>(patterns.getContext(), resource_kinds);
 }

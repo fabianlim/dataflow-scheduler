@@ -58,31 +58,36 @@ mlir::VectorType scheduler::getFlattenedVectorType(
     mlir::Type type, arch_view::ResourceKinds& resource_kinds) {
   // FIXME: Get this info from somewhere else.
 
+  llvm::ArrayRef<int64_t> shape;
+  mlir::Type elem_type;
+
   if (auto tensor_type = mlir::dyn_cast<mlir::RankedTensorType>(type)) {
-    int64_t total_elements = 1;
-    for (auto dim : tensor_type.getShape()) {
-      total_elements *= dim;
-    }
-
-    auto elem_type = tensor_type.getElementType();
-    const auto compute_kind = resource_kinds.getComputeKind();
-    if (!compute_kind) {
-      return nullptr;
-    }
-    const auto max_vector_length = std::max(
-        resource_kinds.getFeature<mlir::ktdf_arch::feature::SIMD>(compute_kind)
-            .getLanes(elem_type),
-        int64_t(1));
-
-    assert(total_elements <= max_vector_length &&
-           "Flattened tensor size exceeds maximum vector length");
-
-    return mlir::VectorType::get({total_elements}, elem_type);
-  }
-  if (auto vector_type = mlir::dyn_cast<mlir::VectorType>(type)) {
+    shape = tensor_type.getShape();
+    elem_type = tensor_type.getElementType();
+  } else if (auto memref_type = mlir::dyn_cast<mlir::MemRefType>(type)) {
+    shape = memref_type.getShape();
+    elem_type = memref_type.getElementType();
+  } else if (auto vector_type = mlir::dyn_cast<mlir::VectorType>(type)) {
     return vector_type;
+  } else {
+    return nullptr;
   }
-  return nullptr;
+
+  int64_t total_elements = 1;
+  for (auto dim : shape) total_elements *= dim;
+
+  const auto compute_kind = resource_kinds.getComputeKind();
+  if (!compute_kind) return nullptr;
+
+  const auto max_vector_length = std::max(
+      resource_kinds.getFeature<mlir::ktdf_arch::feature::SIMD>(compute_kind)
+          .getLanes(elem_type),
+      int64_t(1));
+
+  assert(total_elements <= max_vector_length &&
+         "Flattened tensor/memref size exceeds maximum vector length");
+
+  return mlir::VectorType::get({total_elements}, elem_type);
 }
 
 mlir::Value scheduler::createQueryMapForComponent(
