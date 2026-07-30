@@ -50,6 +50,7 @@ void scheduler::buildKTDPToDFIRPipeline(
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createLoopInvariantCodeMotionPass());
   pm.addPass(mlir::ktdf::createStageCoarseningPass());
+  pm.addPass(mlir::ktdf::createReductionLoopExposurePass());
   pm.addPass(mlir::ktdf::createBroadcastPromotionPass());
   pm.addPass(createDoubleBufferingPass(scheduler_ctx));
   // Parallelizing before tile selection is beneficial because the tile size
