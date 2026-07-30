@@ -34,40 +34,6 @@ using namespace scheduler;
 
 namespace {
 
-/// Helper to build IntegerSet from static size array
-/// Size of 1 corresponds to dk = 0, other sizes n correspond to 0 <= dk <= n-1
-mlir::IntegerSet buildIntegerSetFromSizes(mlir::OpBuilder& builder,
-                                          llvm::ArrayRef<int64_t> sizes) {
-  if (sizes.empty()) {
-    return mlir::IntegerSet::getEmptySet(0, 0, builder.getContext());
-  }
-
-  llvm::SmallVector<mlir::AffineExpr, 4> exprs;
-  llvm::SmallVector<bool, 4> eq_flags;
-  auto* context = builder.getContext();
-
-  for (unsigned i = 0; i < sizes.size(); ++i) {
-    auto dim = mlir::getAffineDimExpr(i, context);
-    int64_t size = sizes[i];
-
-    if (size == 1) {
-      // Size 1: dk = 0
-      exprs.push_back(dim);
-      eq_flags.push_back(true);
-    } else {
-      // Size n: 0 <= dk <= n-1
-      // This means: dk >= 0 and dk <= n-1
-      exprs.push_back(dim);  // dk >= 0
-      eq_flags.push_back(false);
-      exprs.push_back(mlir::getAffineConstantExpr(size - 1, context) -
-                      dim);  // n-1 - dk >= 0
-      eq_flags.push_back(false);
-    }
-  }
-
-  return mlir::IntegerSet::get(sizes.size(), 0, exprs, eq_flags);
-}
-
 /// Create a vectorchain.shuffle that broadcasts src_vec (vector<src_elements x
 /// T>) to vector<dst_elements x T> using indices [0..src_elements-1] repeated
 /// (dst_elements / src_elements) times.
@@ -262,10 +228,12 @@ struct LowerDataTransferPattern
       unsigned dst_num_dims, mlir::VectorType vector_type,
       mlir::AffineMap src_map, mlir::AffineMap dst_map) const {
     // Build src_load_set from source sizes
-    auto src_load_set = buildIntegerSetFromSizes(rewriter, src_static_sizes);
+    auto src_load_set = scheduler::buildIntegerSetFromSizes(
+        rewriter.getContext(), src_static_sizes);
 
     // Build dst_store_set from destination sizes
-    auto dst_store_set = buildIntegerSetFromSizes(rewriter, dst_static_sizes);
+    auto dst_store_set = scheduler::buildIntegerSetFromSizes(
+        rewriter.getContext(), dst_static_sizes);
 
     // load_order and store_order must match their respective set
     // dimensionality.
@@ -316,7 +284,8 @@ struct LowerDataTransferPattern
       mlir::ktdf::FifoSlotType dst_fifo_slot_type, bool is_splat,
       int64_t src_total_elements) const {
     // Build load_set from source sizes
-    auto load_set = buildIntegerSetFromSizes(rewriter, src_static_sizes);
+    auto load_set = scheduler::buildIntegerSetFromSizes(rewriter.getContext(),
+                                                        src_static_sizes);
 
     // Build load_order
     auto load_order = mlir::AffineMap::getMultiDimIdentityMap(
@@ -385,7 +354,8 @@ struct LowerDataTransferPattern
       unsigned num_dims, mlir::VectorType vector_type, mlir::AffineMap dst_map,
       mlir::ktdf::FifoSlotType src_fifo_slot_type) const {
     // Build store_set from destination sizes
-    auto store_set = buildIntegerSetFromSizes(rewriter, dst_static_sizes);
+    auto store_set = scheduler::buildIntegerSetFromSizes(rewriter.getContext(),
+                                                         dst_static_sizes);
 
     // Build store_order
     auto store_order = mlir::AffineMap::getMultiDimIdentityMap(

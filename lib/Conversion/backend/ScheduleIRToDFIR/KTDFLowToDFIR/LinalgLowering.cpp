@@ -34,7 +34,6 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
 
@@ -54,6 +53,10 @@ struct LowerLinalgGenericPattern
   mlir::LogicalResult matchAndRewrite(
       mlir::linalg::GenericOp generic_op,
       mlir::PatternRewriter& rewriter) const override {
+    // Buffer-semantics path: init operand is a memref accumulator.
+    if (generic_op.hasPureBufferSemantics())
+      return lowerMemRefGenericOp(generic_op, rewriter);
+
     if (!generic_op.hasPureTensorSemantics() ||
         generic_op.getNumResults() != 1) {
       return mlir::failure();
@@ -127,6 +130,73 @@ struct LowerLinalgGenericPattern
 
  private:
   arch_view::ResourceKinds& resource_kinds_;
+
+  // Lowers a linalg.generic with buffer semantics (memref init operand).
+  // The resulting accumulated vector is written back to the output buffer via
+  // agen.vector_store.
+  mlir::LogicalResult lowerMemRefGenericOp(
+      mlir::linalg::GenericOp generic_op,
+      mlir::PatternRewriter& rewriter) const {
+    mlir::Location loc = generic_op.getLoc();
+
+    mlir::Block& body = generic_op.getRegion().front();
+    auto yield_op = mlir::dyn_cast<mlir::linalg::YieldOp>(body.getTerminator());
+    if (!yield_op || yield_op.getNumOperands() != 1) return mlir::failure();
+
+    // Replace input block arguments with their corresponding linalg ins
+    // operands.
+    unsigned num_inputs = generic_op.getNumDpsInputs();
+    for (auto [block_arg, input] :
+         llvm::zip(body.getArguments().take_front(num_inputs),
+                   generic_op.getDpsInputs()))
+      block_arg.replaceAllUsesWith(input);
+
+    // The output block argument represents the current accumulator value held
+    // in the output memref.  Emit an agen.vector_load to read it into a vector,
+    // then replace all uses of the output block arg with that loaded vector.
+    mlir::Value out_memref = generic_op.getDpsInitOperand(0)->get();
+    auto out_memref_type = mlir::cast<mlir::MemRefType>(out_memref.getType());
+    auto acc_vec_type =
+        getFlattenedVectorType(out_memref_type, resource_kinds_);
+    if (!acc_vec_type) return mlir::failure();
+    rewriter.setInsertionPoint(generic_op);
+    body.getArguments().back().replaceAllUsesWith(
+        scheduler::emitVectorLoad(rewriter, loc, acc_vec_type, out_memref));
+
+    mlir::AffineMap identity_map =
+        mlir::AffineMap::getMultiDimIdentityMap(1, rewriter.getContext());
+
+    llvm::SmallVector<mlir::Operation*> ops_to_lower;
+    for (mlir::Operation& op : body.without_terminator())
+      ops_to_lower.push_back(&op);
+
+    rewriter.setInsertionPoint(generic_op);
+    for (mlir::Operation* op : ops_to_lower) {
+      mlir::LogicalResult result =
+          mlir::TypeSwitch<mlir::Operation*, mlir::LogicalResult>(op)
+              .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp mulf_op) {
+                return lowerMulFOp(mulf_op, rewriter, identity_map);
+              })
+              .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp addf_op) {
+                return lowerAddFOp(addf_op, rewriter, identity_map);
+              })
+              .Case<mlir::arith::SubFOp>([&](mlir::arith::SubFOp subf_op) {
+                return lowerSubFOp(subf_op, rewriter, identity_map);
+              })
+              .Default([](mlir::Operation* unknown_op) {
+                return unknown_op->emitError(
+                    "unsupported operation type in linalg.generic body");
+              });
+      if (mlir::failed(result)) return mlir::failure();
+    }
+
+    // Write the vectorchain.binary result back to the output buffer.
+    scheduler::emitVectorStore(rewriter, loc, yield_op.getOperand(0),
+                               out_memref);
+
+    rewriter.eraseOp(generic_op);
+    return mlir::success();
+  }
 
   // Lowers a linalg.generic that has one or more reduction dimensions.
   //
@@ -399,7 +469,6 @@ struct LowerLinalgFillPattern
     if (!out_vec_type) return mlir::failure();
 
     mlir::Location loc = fill_op.getLoc();
-    mlir::MLIRContext* ctx = rewriter.getContext();
     int64_t total_elements = out_vec_type.getNumElements();
     mlir::Type elem_type = out_vec_type.getElementType();
 
@@ -441,35 +510,7 @@ struct LowerLinalgFillPattern
     }
 
     // Step 3b (memref): write the filled vector into the output memref.
-    auto memref_type = mlir::cast<mlir::MemRefType>(out_operand.getType());
-    unsigned rank = memref_type.getRank();
-    auto identity_map = mlir::AffineMap::getMultiDimIdentityMap(rank, ctx);
-
-    llvm::SmallVector<mlir::AffineExpr> exprs;
-    llvm::SmallVector<bool> eq_flags;
-    for (unsigned i = 0; i < rank; ++i) {
-      auto dim = mlir::getAffineDimExpr(i, ctx);
-      int64_t size = memref_type.getShape()[i];
-      if (size == 1) {
-        exprs.push_back(dim);
-        eq_flags.push_back(/*equality=*/true);
-      } else {
-        exprs.push_back(dim);
-        eq_flags.push_back(false);
-        exprs.push_back(mlir::getAffineConstantExpr(size - 1, ctx) - dim);
-        eq_flags.push_back(false);
-      }
-    }
-    auto store_set = mlir::IntegerSet::get(rank, 0, exprs, eq_flags);
-
-    llvm::SmallVector<mlir::Value> zero_indices(
-        rank,
-        mlir::arith::ConstantIndexOp::create(rewriter, loc, 0).getResult());
-
-    mlir::agen::VectorStoreOp::create(rewriter, loc, shuffle.getOutput(),
-                                      out_operand,
-                                      /*dbgName=*/nullptr, identity_map,
-                                      zero_indices, store_set, identity_map);
+    scheduler::emitVectorStore(rewriter, loc, shuffle.getOutput(), out_operand);
 
     rewriter.eraseOp(fill_op);
     return mlir::success();
