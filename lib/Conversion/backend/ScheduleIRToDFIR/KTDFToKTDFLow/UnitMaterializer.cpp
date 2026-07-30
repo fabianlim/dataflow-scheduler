@@ -139,7 +139,8 @@ mlir::LogicalResult UnitMaterializer::materializeMemoryUnits(
           type_tag);
       memory_unit_ssa[{mspace_attr, -1}] = get_unit_op.getUnit();
       LDBG(1) << "  Created global memory unit for " << space_name;
-    } else if (memory_tree.isPerCoreScratchPadMemory(mspace_attr)) {
+    } else if (memory_tree.isPerCoreScratchPadMemory(mspace_attr) ||
+               memory_tree.isBelowScratchPad(mspace_attr)) {
       for (int core = 0; core < grid_size; ++core) {
         auto unit_name = "C" + std::to_string(core) + "-" + type_tag;
         auto get_unit_op = mlir::dataflow::GetUnitOp::create(

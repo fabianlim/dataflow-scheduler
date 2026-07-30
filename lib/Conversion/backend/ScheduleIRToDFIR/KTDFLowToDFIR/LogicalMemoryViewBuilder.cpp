@@ -30,6 +30,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
@@ -138,6 +139,8 @@ mlir::LogicalResult buildResolvedUnits(
       resolved_units[ms] = it->second;
     } else if (memory_tree.isPerCoreScratchPadMemory(ms)) {
       per_core.insert(ms);
+    } else if (memory_tree.isBelowScratchPad(ms)) {
+      per_core.insert(ms);  // same per-core uniform map path as L1
     }
   }
 
@@ -395,10 +398,14 @@ mlir::LogicalResult propagateTypes(
                 "select_memref result used by unexpected op; expected "
                 "data_transfer");
         }
+      } else if (auto fill = mlir::dyn_cast<mlir::linalg::FillOp>(user)) {
+        fill->replaceUsesOfWith(old_val, new_val);
+      } else if (auto generic = mlir::dyn_cast<mlir::linalg::GenericOp>(user)) {
+        generic->replaceUsesOfWith(old_val, new_val);
       } else {
         return pu.emitError(
             "unexpected consumer of memory view; expected "
-            "data_transfer or select_memref");
+            "data_transfer, select_memref, linalg.fill, or linalg.generic");
       }
     }
   }
