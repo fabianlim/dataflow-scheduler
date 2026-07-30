@@ -140,6 +140,12 @@ struct ConstructThreeStagePipelinePass
   // computes, stores.
   void createPipeline(mlir::scf::ForOp innermost_loop);
 
+  // Create a 2-stage pipeline for the explicit-M reduction path.
+  // Emits an accumulate stage (with an explicit reduction scf.for inside) and a
+  // store stage.  Called instead of createPipeline when the linalg.generic has
+  // at least one reduction iterator.
+  void createReductionPipeline(mlir::scf::ForOp innermost_loop);
+
   // Create linalg compute operations in stage 2
   void createComputeOps(mlir::OpBuilder& builder, mlir::Location loc,
                         mlir::ktdf::PrivateOp private_op);
@@ -180,6 +186,11 @@ struct ConstructThreeStagePipelinePass
   std::pair<mlir::Attribute, mlir::Attribute> getFifoAttributesForStore(
       mlir::ktdp::StoreOp store_op);
 
+  // Get the memory space attribute for compute-local storage (e.g. "lrfreg").
+  // Queries the device for a memory resource with ktdf_arch.feature.local_to_compute.
+  // Falls back to StringAttr "lrfreg" if no such resource is found.
+  mlir::Attribute getLocalComputeStorageMemSpace();
+
   // Compute offset for reinterpret_cast from indices and strides
   mlir::Value computeReinterpretCastOffset(
       mlir::OpBuilder& builder, mlir::Location loc,
@@ -202,11 +213,21 @@ struct ConstructThreeStagePipelinePass
   // Tiled loops from linalg tiling (outermost to innermost)
   llvm::SmallVector<mlir::Operation*> tiled_loops_;
 
-  // Tile sizes determined from linalg operation
+  // Tile sizes determined from linalg operation (iterator-space indexed,
+  // 0 at reduction positions)
   llvm::SmallVector<int64_t> tile_sizes_;
 
-  // Total number of elements (product of tile_sizes_)
+  // Total number of elements (product of non-zero tile_sizes_)
   int64_t total_num_elements_ = 0;
+
+  // True when the linalg op has at least one reduction iterator.  When set,
+  // runOnFunc calls createReductionPipeline instead of createPipeline.
+  bool has_reduction_ = false;
+
+  // For each reduction iterator position (in iterator-space order), the full
+  // dimension size from the original linalg op's input tensor.  Used by
+  // createReductionPipeline to emit the explicit M loop.
+  llvm::SmallVector<int64_t> reduction_dim_sizes_;
 
   // Operations to delete after pipeline creation
   llvm::SmallVector<mlir::Operation*> ops_to_delete_;
@@ -222,6 +243,8 @@ void ConstructThreeStagePipelinePass::resetState() {
   tiled_loops_.clear();
   tile_sizes_.clear();
   total_num_elements_ = 0;
+  has_reduction_ = false;
+  reduction_dim_sizes_.clear();
   ops_to_delete_.clear();
   const_builder_.reset();
 }
@@ -344,61 +367,90 @@ llvm::SmallVector<int64_t> ConstructThreeStagePipelinePass::determineTileSizes(
   const auto vector_length =
       std::max(simd_feature.getLanes(elem_type), int64_t(1));
 
-  llvm::SmallVector<int64_t> tile_sizes;
+  llvm::ArrayRef<int64_t> output_shape = shaped_type.getShape();
+  int64_t output_rank = output_shape.size();
 
-  llvm::ArrayRef<int64_t> shape = shaped_type.getShape();
-  int64_t rank = shape.size();
-
-  // Start from rightmost dimension and multiply until we reach vector_length
+  // Run the greedy algorithm on the output tensor shape (parallel dims only).
+  // Start from rightmost dimension and multiply until we reach vector_length.
   int64_t product = 1;
   int64_t covered_dims = 0;
 
-  for (int64_t i = rank - 1; i >= 0; --i) {
-    product *= shape[i];
+  for (int64_t i = output_rank - 1; i >= 0; --i) {
+    product *= output_shape[i];
     covered_dims++;
     if (product >= vector_length) {
       break;
     }
   }
 
-  // Build tile sizes: 1 for uncovered dims, partial/full for covered dims
-  tile_sizes.resize(rank);
-  for (int64_t i = 0; i < rank - covered_dims; ++i) {
-    tile_sizes[i] = 1;
+  // Build output_tile_sizes: 1 for uncovered dims, partial/full for covered.
+  llvm::SmallVector<int64_t> output_tile_sizes(output_rank);
+  for (int64_t i = 0; i < output_rank - covered_dims; ++i) {
+    output_tile_sizes[i] = 1;
   }
 
-  // For covered dimensions, compute tile sizes that divide evenly
   int64_t remaining_product = vector_length;
-  for (int64_t i = rank - 1; i >= rank - covered_dims; --i) {
-    int64_t dim_size = shape[i];
+  for (int64_t i = output_rank - 1; i >= output_rank - covered_dims; --i) {
+    int64_t dim_size = output_shape[i];
 
     // Use GCD to find largest value that divides both dim_size and
-    // remaining_product
+    // remaining_product.
     int64_t tile_size = std::gcd(dim_size, remaining_product);
 
-    // Clamp to dimension size
+    // Clamp to dimension size.
     tile_size = std::min(tile_size, dim_size);
 
-    tile_sizes[i] = tile_size;
+    output_tile_sizes[i] = tile_size;
     remaining_product /= tile_size;
     if (remaining_product <= 1) remaining_product = 1;
   }
 
-  LLVM_DEBUG({
-    llvm::dbgs() << "    Shape: [";
-    for (int64_t i = 0; i < rank; ++i) {
-      llvm::dbgs() << shape[i];
-      if (i < rank - 1) llvm::dbgs() << ", ";
+  // Map output_tile_sizes to the full iterator space.  For each iterator:
+  //   - parallel   -> consume next output-dim tile size
+  //   - reduction  -> insert 0, record the full dim size into
+  //                   reduction_dim_sizes_ from the first input tensor shape
+  const auto& iter_types = linalg_op.getIteratorTypesArray();
+  int64_t num_iters = static_cast<int64_t>(iter_types.size());
+
+  mlir::RankedTensorType input_type;
+  if (!linalg_op.getDpsInputOperands().empty()) {
+    input_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        linalg_op.getDpsInputOperand(0)->get().getType());
+  }
+
+  llvm::SmallVector<int64_t> full_tile_sizes;
+  full_tile_sizes.reserve(num_iters);
+  size_t out_idx = 0;
+  for (int64_t i = 0; i < num_iters; ++i) {
+    if (iter_types[i] == mlir::utils::IteratorType::reduction) {
+      full_tile_sizes.push_back(0);
+      int64_t red_size = mlir::ShapedType::kDynamic;
+      if (input_type && i < input_type.getRank()) {
+        red_size = input_type.getDimSize(i);
+      }
+      reduction_dim_sizes_.push_back(red_size);
+    } else {
+      assert(out_idx < output_tile_sizes.size() &&
+             "output_tile_sizes too short for parallel iterators");
+      full_tile_sizes.push_back(output_tile_sizes[out_idx++]);
     }
-    llvm::dbgs() << "]\n    Tile sizes: [";
-    for (int64_t i = 0; i < rank; ++i) {
-      llvm::dbgs() << tile_sizes[i];
-      if (i < rank - 1) llvm::dbgs() << ", ";
+  }
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "    Output shape: [";
+    for (int64_t i = 0; i < output_rank; ++i) {
+      llvm::dbgs() << output_shape[i];
+      if (i < output_rank - 1) llvm::dbgs() << ", ";
+    }
+    llvm::dbgs() << "]\n    Full tile sizes (iterator space): [";
+    for (int64_t i = 0; i < num_iters; ++i) {
+      llvm::dbgs() << full_tile_sizes[i];
+      if (i < num_iters - 1) llvm::dbgs() << ", ";
     }
     llvm::dbgs() << "]\n";
   });
 
-  return tile_sizes;
+  return full_tile_sizes;
 }
 
 void ConstructThreeStagePipelinePass::annotateLoopsWithIteratorTypes(
@@ -406,17 +458,29 @@ void ConstructThreeStagePipelinePass::annotateLoopsWithIteratorTypes(
     mlir::linalg::GenericOp generic_op) {
   assert(generic_op);
 
-  // Annotate each loop with its corresponding iterator type obtained from
-  // generic_op.
   const auto& iterator_types = generic_op.getIteratorTypesArray();
-  for (size_t i = 0; i < loops.size() && i < iterator_types.size(); ++i) {
-    auto for_op = mlir::dyn_cast<mlir::scf::ForOp>(loops[i]);
+
+  // `loops` has one entry per non-zero tile_size (i.e., per emitted scf.for).
+  // `iterator_types` spans the full iterator space (including reduction dims
+  // where tile_size==0 and no loop was emitted).  Walk iterator_types and
+  // only consume a loop when the corresponding tile_size is non-zero.
+  size_t loop_idx = 0;
+  for (size_t iter_idx = 0;
+       iter_idx < iterator_types.size() && loop_idx < loops.size();
+       ++iter_idx) {
+    // Skip iterator positions where no loop was emitted (tile_size == 0).
+    if (iter_idx < tile_sizes_.size() && tile_sizes_[iter_idx] == 0) {
+      continue;
+    }
+
+    auto for_op = mlir::dyn_cast<mlir::scf::ForOp>(loops[loop_idx]);
     assert(for_op);
 
     mlir::ktdf::LoopType loop_type;
-    if (iterator_types[i] == mlir::utils::IteratorType::parallel) {
+    if (iterator_types[iter_idx] == mlir::utils::IteratorType::parallel) {
       loop_type = mlir::ktdf::LoopType::ParallelLoop;
-    } else if (iterator_types[i] == mlir::utils::IteratorType::reduction) {
+    } else if (iterator_types[iter_idx] ==
+               mlir::utils::IteratorType::reduction) {
       loop_type = mlir::ktdf::LoopType::ReductionLoop;
     } else {
       for_op->emitError("Unsupported iterator type");
@@ -428,12 +492,15 @@ void ConstructThreeStagePipelinePass::annotateLoopsWithIteratorTypes(
         mlir::ktdf::LoopTypeAttr::get(&getContext(), loop_type);
     for_op->setAttr("loop_type", loop_type_attr);
 
-    LDBG(1) << "  Annotated loop " << i << " with loop_type: "
+    LDBG(1) << "  Annotated loop " << loop_idx << " (iter dim " << iter_idx
+            << ") with loop_type: "
             << (loop_type == mlir::ktdf::LoopType::ParallelLoop ? "parallel"
                                                                 : "reduction")
             << "";
+    ++loop_idx;
   }
 }
+
 
 void ConstructThreeStagePipelinePass::createLoopsFromLinalg(
     llvm::ArrayRef<mlir::linalg::LinalgOp> linalg_ops) {
@@ -448,8 +515,9 @@ void ConstructThreeStagePipelinePass::createLoopsFromLinalg(
 
     rewriter.setInsertionPoint(linalg_op);
 
-    // Determine tile sizes from output operand shape (needed for loop
-    // creation)
+    // Determine tile sizes for the full iterator space (0 at reduction
+    // positions, parallel dims tiled by the greedy algorithm).
+    // reduction_dim_sizes_ is populated as a side effect.
     tile_sizes_ = determineTileSizes(linalg_op);
 
     if (tile_sizes_.empty()) {
@@ -458,10 +526,12 @@ void ConstructThreeStagePipelinePass::createLoopsFromLinalg(
       return;
     }
 
-    // Calculate total number of elements (product of tile_sizes_)
+    has_reduction_ = !reduction_dim_sizes_.empty();
+
+    // Calculate total number of elements (product of non-zero tile_sizes_)
     total_num_elements_ = 1;
     for (int64_t dim : tile_sizes_) {
-      total_num_elements_ *= dim;
+      if (dim != 0) total_num_elements_ *= dim;
     }
 
     LLVM_DEBUG({
@@ -735,6 +805,381 @@ void ConstructThreeStagePipelinePass::cleanupOperations() {
     if (!op || !op->use_empty()) continue;
     deleteOpAndUnusedChainOfOperands(op);
   }
+}
+
+// Forward declarations for static helper functions defined later in this file.
+static std::optional<mlir::AffineMap> findIndexingMapForLoadResult(
+    mlir::linalg::LinalgOp linalg_op, mlir::Value tensor_value);
+static std::optional<mlir::AffineMap> findIndexingMapForStoreSource(
+    mlir::linalg::LinalgOp linalg_op, mlir::Value tensor_value);
+
+mlir::Attribute
+ConstructThreeStagePipelinePass::getLocalComputeStorageMemSpace() {
+  // Walk all resource exemplars and find the first one tagged with
+  // ktdf_arch.feature.local_to_compute.  Return its kind attribute as the
+  // memory space string for the accumulator memref.
+  for (auto& [kind, resource] : *resource_kinds_) {
+    // resource is const; use const_cast to satisfy getOperation()'s non-const
+    // signature — we only read the features attribute.
+    mlir::Operation* resource_op =
+        const_cast<mlir::ktdf_arch::Resource&>(resource).getOperation();
+    if (mlir::ktdf_arch::getFeature<mlir::ktdf_arch::feature::LocalToCompute>(
+            resource_op)) {
+      return kind;
+    }
+  }
+  // Fallback: no device annotation found — use the well-known literal.
+  return mlir::StringAttr::get(&getContext(), "lrfreg");
+}
+
+void ConstructThreeStagePipelinePass::createReductionPipeline(
+    mlir::scf::ForOp innermost_loop) {
+  LDBG(1) << "Creating reduction pipeline (flat three-stage design)";
+
+  // Collect compute ops from the innermost loop body.
+  compute_ops_.clear();
+  innermost_loop.getBody()->walk([&](mlir::linalg::LinalgOp linalg_op) {
+    compute_ops_.push_back(linalg_op);
+  });
+
+  assert(compute_ops_.size() == 1 &&
+         "expected exactly one linalg compute op after fusion");
+  assert(load_ops_.size() == 1 &&
+         "expected exactly one load op for reduction pipeline");
+  assert(store_ops_.size() == 1 &&
+         "expected exactly one store op for reduction pipeline");
+  assert(reduction_dim_sizes_.size() == 1 &&
+         "expected exactly one reduction dimension");
+
+  // Fix up the scf.yield in innermost_loop to yield iter_args (same as
+  // createPipeline does) so that tensor.insert_slice / original linalg can
+  // be cleaned up later.
+  auto yield_op =
+      mlir::cast<mlir::scf::YieldOp>(innermost_loop.getBody()->getTerminator());
+  for (mlir::Value operand : yield_op.getOperands()) {
+    if (auto* def_op = operand.getDefiningOp()) {
+      ops_to_delete_.push_back(def_op);
+    }
+  }
+  mlir::OpBuilder yield_builder(yield_op);
+  llvm::SmallVector<mlir::Value> new_yield_operands;
+  for (mlir::BlockArgument iter_arg : innermost_loop.getRegionIterArgs()) {
+    new_yield_operands.push_back(iter_arg);
+  }
+  mlir::scf::YieldOp::create(yield_builder, yield_op.getLoc(),
+                             new_yield_operands);
+  yield_op.erase();
+
+  // Collect IVs from the tiled parallel loops.  tiled_loops_ has one entry per
+  // non-zero tile size (i.e., the parallel dims only).  innermost_loop is the
+  // last entry.
+  llvm::SmallVector<mlir::Value> parallel_ivs;
+  for (auto* loop_op : tiled_loops_) {
+    parallel_ivs.push_back(
+        mlir::cast<mlir::scf::ForOp>(loop_op).getInductionVar());
+  }
+
+  // Determine element type and shapes from the linalg compute op.
+  mlir::linalg::LinalgOp linalg_op = compute_ops_[0];
+  auto result_tensor_type = mlir::dyn_cast<mlir::RankedTensorType>(
+      linalg_op->getResult(0).getType());
+  assert(result_tensor_type && "expected ranked tensor result from linalg op");
+  mlir::Type elem_type = result_tensor_type.getElementType();
+  // Accumulator shape = tiled parallel output shape (same as linalg result).
+  llvm::ArrayRef<int64_t> acc_shape = result_tensor_type.getShape();
+
+  // FIFO sizes: total_num_elements_ elements per slot.
+  llvm::SmallVector<int64_t> fifo_sizes = {total_num_elements_};
+
+  // Get FIFO src/dest attributes.
+  auto [load_src, load_dest] = getFifoAttributesForLoad(load_ops_[0]);
+  auto [store_src, store_dest] = getFifoAttributesForStore(store_ops_[0]);
+
+  auto load_fifo_type = mlir::ktdf::FifoSlotType::get(
+      &getContext(), load_src, load_dest, total_num_elements_, elem_type);
+  auto store_fifo_type = mlir::ktdf::FifoSlotType::get(
+      &getContext(), store_src, store_dest, total_num_elements_, elem_type);
+
+  mlir::ktdf::TokenType token_type =
+      mlir::ktdf::TokenType::get(&getContext());
+
+  // Accumulator memref type: parallel-tiled shape in the local-compute memory
+  // space queried from the device.
+  mlir::Attribute acc_mem_space = getLocalComputeStorageMemSpace();
+  mlir::MemRefType acc_memref_type =
+      mlir::MemRefType::get(acc_shape, elem_type,
+                            mlir::MemRefLayoutAttrInterface{}, acc_mem_space);
+
+  // Reduction loop trip count and last-iteration index (for conditional store).
+  int64_t reduction_trip_count = reduction_dim_sizes_[0];
+  int64_t last_iter_idx = reduction_trip_count - 1;
+
+  // Get the linalg.generic body region to clone into the accumulate RMW
+  // generic.
+  auto generic_op = mlir::dyn_cast<mlir::linalg::GenericOp>(
+      linalg_op.getOperation());
+  assert(generic_op && "expected linalg.generic after tiling");
+
+  // Original iterator types and indexing maps from the linalg.generic —
+  // used verbatim in the accumulate stage's RMW generic.
+  llvm::SmallVector<mlir::utils::IteratorType> orig_iter_types =
+      generic_op.getIteratorTypesArray();
+  auto indexing_maps_range = generic_op.getIndexingMapsArray();
+  llvm::SmallVector<mlir::AffineMap> orig_indexing_maps(
+      indexing_maps_range.begin(), indexing_maps_range.end());
+
+  // Per-row memref type: the load FIFO delivers one row at a time.  Shape is
+  // tile_sizes_ with reduction dim replaced by 1 (matching the row shape).
+  llvm::SmallVector<int64_t> row_shape;
+  for (int64_t ts : tile_sizes_) {
+    row_shape.push_back(ts == 0 ? 1 : ts);
+  }
+  mlir::MemRefType row_memref_type =
+      mlir::MemRefType::get(row_shape, elem_type);
+
+  // Input indexing map for the load (used in both the load stage data_transfer
+  // and the accumulate stage linalg.generic input).
+  auto input_linalg_map =
+      findIndexingMapForLoadResult(linalg_op, load_ops_[0].getResult());
+  assert(input_linalg_map && "could not find input linalg map for load");
+
+  // Output indexing map for the store.
+  auto output_linalg_map =
+      findIndexingMapForStoreSource(linalg_op, store_ops_[0].getDataTile());
+  assert(output_linalg_map && "could not find output linalg map for store");
+
+  // Build the flat three-stage ktdf.pipeline at the start of innermost_loop's
+  // body.
+  mlir::OpBuilder pipeline_builder(innermost_loop.getBodyRegion());
+  mlir::Location loc = innermost_loop.getLoc();
+
+  mlir::ktdf::PipelineOp::create(
+      pipeline_builder, loc,
+      [&](mlir::OpBuilder& builder, mlir::Location loc) {
+        // ------------------------------------------------------------------
+        // ktdf.private: load_fifo, store_fifo, t0 (load->accum), t1 (accum->store)
+        // ------------------------------------------------------------------
+        llvm::SmallVector<mlir::Type> private_types = {load_fifo_type,
+                                                        store_fifo_type,
+                                                        token_type, token_type};
+        auto priv = mlir::ktdf::PrivateOp::create(builder, loc, private_types);
+
+        {
+          mlir::Region& pr = priv.getRegion();
+          mlir::Block* pb = &pr.front();
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToStart(pb);
+
+          auto load_fifo_alloc = mlir::ktdf::FifoAllocateOp::create(
+              builder, loc, mlir::TypeRange{load_fifo_type},
+              mlir::ValueRange{});
+          auto store_fifo_alloc = mlir::ktdf::FifoAllocateOp::create(
+              builder, loc, mlir::TypeRange{store_fifo_type},
+              mlir::ValueRange{});
+          auto t0 = mlir::ktdf::CreateTokenOp::create(builder, loc, token_type);
+          auto t1 = mlir::ktdf::CreateTokenOp::create(builder, loc, token_type);
+
+          mlir::ktdf::PrivateYieldOp::create(
+              builder, loc,
+              mlir::ValueRange{load_fifo_alloc.getResult(0),
+                               store_fifo_alloc.getResult(0), t0.getResult(),
+                               t1.getResult()});
+        }
+
+        // Private results:
+        //   [0] = load_fifo
+        //   [1] = store_fifo
+        //   [2] = t0  (LOAD depends_out, ACCUMULATE depends_in)
+        //   [3] = t1  (ACCUMULATE depends_out, STORE depends_in)
+        mlir::Value load_fifo_val = priv.getResult(0);
+        mlir::Value store_fifo_val = priv.getResult(1);
+
+        // ------------------------------------------------------------------
+        // Stage 1 (LOAD): reduction scf.for containing one data_transfer per
+        // row.
+        // ------------------------------------------------------------------
+        mlir::ktdf::StageOp::create(
+            builder, loc,
+            /*depends_in=*/{},
+            /*depends_out=*/{priv.getResult(2)},
+            [&](mlir::OpBuilder& builder, mlir::Location loc) {
+              mlir::Value c0 =
+                  mlir::arith::ConstantIndexOp::create(builder, loc, 0)
+                      .getResult();
+              mlir::Value c_red = mlir::arith::ConstantIndexOp::create(
+                                      builder, loc, reduction_trip_count)
+                                      .getResult();
+              mlir::Value c1 =
+                  mlir::arith::ConstantIndexOp::create(builder, loc, 1)
+                      .getResult();
+
+              auto load_loop =
+                  mlir::scf::ForOp::create(builder, loc, c0, c_red, c1,
+                                           /*iterArgs=*/{});
+              load_loop->setAttr(
+                  "loop_type",
+                  mlir::ktdf::LoopTypeAttr::get(
+                      &getContext(), mlir::ktdf::LoopType::ReductionLoop));
+
+              {
+                mlir::OpBuilder::InsertionGuard loop_guard(builder);
+                builder.setInsertionPointToStart(load_loop.getBody());
+                mlir::Value d_red_iv = load_loop.getInductionVar();
+
+                // Build per-iterator-dim indices for the data_transfer source.
+                llvm::SmallVector<mlir::Value> src_indices;
+                size_t par_idx = 0;
+                for (size_t i = 0; i < tile_sizes_.size(); ++i) {
+                  if (tile_sizes_[i] == 0) {
+                    src_indices.push_back(d_red_iv);
+                  } else {
+                    src_indices.push_back(parallel_ivs[par_idx++]);
+                  }
+                }
+
+                mlir::Value input_memref = load_ops_[0].getAccessTile();
+                mlir::AffineMap null_map;
+                mlir::ktdf::DataTransferOp::create(
+                    builder, loc, input_memref, *input_linalg_map, src_indices,
+                    row_shape, load_fifo_val, null_map, mlir::ValueRange{},
+                    fifo_sizes);
+              }
+            });
+
+        // ------------------------------------------------------------------
+        // Stage 2 (ACCUMULATE): alloc accumulator, fill zero, reduction
+        // scf.for containing read_from_fifo + linalg.generic RMW +
+        // conditional write_to_fifo on last iteration.
+        // ------------------------------------------------------------------
+        mlir::ktdf::StageOp::create(
+            builder, loc,
+            /*depends_in=*/{priv.getResult(2)},
+            /*depends_out=*/{priv.getResult(3)},
+            [&](mlir::OpBuilder& builder, mlir::Location loc) {
+              // Allocate the accumulator in compute-local storage.
+              auto acc_alloc =
+                  mlir::memref::AllocOp::create(builder, loc, acc_memref_type);
+              mlir::Value acc_val = acc_alloc.getResult();
+
+              // Unconditionally fill with zero (hardware invariant).
+              mlir::Value zero_val = mlir::arith::ConstantOp::create(
+                  builder, loc, elem_type,
+                  builder.getFloatAttr(elem_type, 0.0));
+              {
+                mlir::OperationState fill_state(
+                    loc, mlir::linalg::FillOp::getOperationName());
+                mlir::linalg::FillOp::build(builder, fill_state,
+                                            mlir::ValueRange{zero_val},
+                                            mlir::ValueRange{acc_val});
+                builder.create(fill_state);
+              }
+
+              // Reduction loop.
+              mlir::Value c0 =
+                  mlir::arith::ConstantIndexOp::create(builder, loc, 0)
+                      .getResult();
+              mlir::Value c_red = mlir::arith::ConstantIndexOp::create(
+                                      builder, loc, reduction_trip_count)
+                                      .getResult();
+              mlir::Value c1 =
+                  mlir::arith::ConstantIndexOp::create(builder, loc, 1)
+                      .getResult();
+
+              auto acc_loop =
+                  mlir::scf::ForOp::create(builder, loc, c0, c_red, c1,
+                                           /*iterArgs=*/{});
+              acc_loop->setAttr(
+                  "loop_type",
+                  mlir::ktdf::LoopTypeAttr::get(
+                      &getContext(), mlir::ktdf::LoopType::ReductionLoop));
+
+              {
+                mlir::OpBuilder::InsertionGuard loop_guard(builder);
+                builder.setInsertionPointToStart(acc_loop.getBody());
+                mlir::Value d_red_iv = acc_loop.getInductionVar();
+
+                // Read one row from the load FIFO.
+                auto row = mlir::ktdf::ReadFromFifoOp::create(
+                    builder, loc, row_memref_type, load_fifo_val);
+
+                // RMW linalg.generic: uses original iterator_types and
+                // indexing_maps from the source linalg.generic.  The output
+                // operand is the accumulator memref (in-place update).
+                mlir::OperationState generic_state(
+                    loc, mlir::linalg::GenericOp::getOperationName());
+                mlir::linalg::GenericOp::build(
+                    builder, generic_state,
+                    /*resultTensorTypes=*/mlir::TypeRange{},
+                    /*inputs=*/mlir::ValueRange{row.getResult()},
+                    /*outputs=*/mlir::ValueRange{acc_val},
+                    orig_indexing_maps, orig_iter_types);
+                auto* generic_raw = builder.create(generic_state);
+                auto rmw_op =
+                    mlir::cast<mlir::linalg::GenericOp>(generic_raw);
+
+                // Clone the scalar body from the original linalg.generic.
+                mlir::Region& rmw_region = rmw_op.getRegion();
+                mlir::IRMapping mapping;
+                generic_op.getRegion().cloneInto(&rmw_region, mapping);
+
+                // On the last iteration, write the accumulator to the store
+                // FIFO.  This is a peel of the final iteration's store — the
+                // conditional is evaluated at runtime.
+                mlir::Value c_last = mlir::arith::ConstantIndexOp::create(
+                                         builder, loc, last_iter_idx)
+                                         .getResult();
+                mlir::Value is_last = mlir::arith::CmpIOp::create(
+                    builder, loc, mlir::arith::CmpIPredicate::eq, d_red_iv,
+                    c_last);
+                mlir::scf::IfOp::create(
+                    builder, loc, is_last,
+                    [&](mlir::OpBuilder& then_builder, mlir::Location then_loc) {
+                      mlir::ktdf::WriteToFifoOp::create(then_builder, then_loc,
+                                                        acc_val, store_fifo_val);
+                      mlir::scf::YieldOp::create(then_builder, then_loc,
+                                                  mlir::ValueRange{});
+                    });
+              }
+            })
+            .setApplicableUnitsAttr(
+                builder.getArrayAttr(resource_kinds_->getComputeKind()));
+
+        // ------------------------------------------------------------------
+        // Stage 3 (STORE): data_transfer from store FIFO to output HBM memref.
+        // ------------------------------------------------------------------
+        mlir::ktdf::StageOp::create(
+            builder, loc,
+            /*depends_in=*/{priv.getResult(3)},
+            /*depends_out=*/{},
+            [&](mlir::OpBuilder& builder, mlir::Location loc) {
+              mlir::Value output_memref = store_ops_[0].getAccessTile();
+
+              // Store indices: parallel IVs for non-zero tile dims, c0 for
+              // reduction dims.  The output linalg map spans the full iterator
+              // space so we must supply one value per iterator dim.
+              llvm::SmallVector<mlir::Value> store_loop_ivs;
+              size_t par_idx = 0;
+              for (size_t i = 0; i < tile_sizes_.size(); ++i) {
+                if (tile_sizes_[i] == 0) {
+                  store_loop_ivs.push_back(
+                      mlir::arith::ConstantIndexOp::create(builder, loc, 0)
+                          .getResult());
+                } else {
+                  store_loop_ivs.push_back(parallel_ivs[par_idx++]);
+                }
+              }
+
+              // Output tile sizes: the accumulator shape (parallel tile dims).
+              llvm::SmallVector<int64_t> output_tile_sizes(acc_shape.begin(),
+                                                           acc_shape.end());
+
+              mlir::AffineMap null_map;
+              mlir::ktdf::DataTransferOp::create(
+                  builder, loc, store_fifo_val, null_map, mlir::ValueRange{},
+                  fifo_sizes, output_memref, *output_linalg_map, store_loop_ivs,
+                  output_tile_sizes);
+            });
+      });
 }
 
 // Find the linalg operand fed by `tensor_value` (directly or through a
@@ -1393,7 +1838,10 @@ void ConstructThreeStagePipelinePass::runOnFunc(mlir::func::FuncOp func_op) {
   // Step 4: Create pipeline if we have tiled loops
   if (!tiled_loops_.empty()) {
     auto innermost_loop = llvm::cast<mlir::scf::ForOp>(tiled_loops_.back());
-    createPipeline(innermost_loop);
+    if (has_reduction_)
+      createReductionPipeline(innermost_loop);
+    else
+      createPipeline(innermost_loop);
   }
 
   LDBG(1) << "After pipeline created:\n" << func_op << "\n";
