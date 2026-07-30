@@ -69,12 +69,22 @@ struct LowerReadFromFifoPattern
     auto fifo_slot_type =
         llvm::cast<mlir::ktdf::FifoSlotType>(read_op.getFifoSlot().getType());
 
-    // Get the result tensor type
-    auto result_type = llvm::cast<mlir::RankedTensorType>(read_op.getType());
-
-    // Convert tensor to flattened vector type
-    auto vector_type = getFlattenedVectorType(result_type, resource_kinds_);
-    if (!vector_type) {
+    // Convert result type (tensor or memref) to flattened vector type
+    mlir::VectorType vector_type;
+    if (auto tensor_type =
+            mlir::dyn_cast<mlir::RankedTensorType>(read_op.getType())) {
+      vector_type = getFlattenedVectorType(tensor_type, resource_kinds_);
+      if (!vector_type) {
+        return mlir::failure();
+      }
+    } else if (auto memref_type =
+                   mlir::dyn_cast<mlir::MemRefType>(read_op.getType())) {
+      // PR #16: read_from_fifo can return a memref
+      int64_t n = 1;
+      for (auto dim : memref_type.getShape()) n *= dim;
+      vector_type =
+          mlir::VectorType::get({n}, memref_type.getElementType());
+    } else {
       return mlir::failure();
     }
 
