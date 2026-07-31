@@ -310,11 +310,26 @@ ktdf::StageOp StageCoarseningMaterializer::materializeStageNode(
   Block* stage_body = new_stage.getBody();
   builder_.setInsertionPointToStart(stage_body);
 
-  // Check if this stage has children (loops) or if we need to clone the body
+  // Check if this stage has children (loops) or if we need to clone the body.
+  // Only treat the stage as having children when the first child is an
+  // *unmaterialized* loop node — those are the outer loops distributed into
+  // this stage by DistributeAndSinkIntoPipeline.  Materialized loop children
+  // are original inner-stage loops that belong to the stage body and will be
+  // handled correctly by cloneStageBody.  If we were to materialize them here
+  // we would register their IVs in value_map_ before cloneStageBody runs, and
+  // MLIR's clone would then reuse the mapped IV instead of creating a fresh
+  // block argument, producing a body block with 0 arguments and crashing the
+  // LoopLikeOpInterface verifier.
   scheduler::OperationTreeNode* first_child = stage_node.getFirstChild();
+  auto* first_pchild =
+      static_cast<const scheduler::PipelineTreeNode*>(first_child);
+  bool has_distributed_loop_children =
+      first_child && first_pchild->isLoopNode() &&
+      !first_pchild->isMaterialized();
 
-  if (first_child) {
-    // Stage has children (loops), materialize them first
+  if (has_distributed_loop_children) {
+    // Stage has distributed (unmaterialized) outer loop children — materialize
+    // them first, then sink the original stage body into the innermost loop.
     LDBG(1) << "    Stage has children, materializing them";
     materializeChildren(stage_node);
 
@@ -344,7 +359,12 @@ ktdf::StageOp StageCoarseningMaterializer::materializeStageNode(
       cloneStageBody(orig_stage);
     }
   } else if (orig_stage) {
-    // Stage has no children, clone the original stage body directly
+    // Stage has no distributed loop children — clone the original stage body
+    // directly.  This covers:
+    //   (a) stages with no children at all, and
+    //   (b) stages whose only tree children are materialized inner-stage loops
+    //       (e.g. reduction loops); those loops are part of the body and are
+    //       reproduced faithfully by cloneStageBody.
     LDBG(1) << "    Cloning original stage body";
     cloneStageBody(orig_stage);
   } else {
