@@ -68,26 +68,43 @@ auto mlir::ktdf::analyzeStageDependencies(ArrayRef<StageOp> stages,
     }
   }
 
-  // Cycle detection via DFS.
+  // Back-edge removal via DFS. Token dependencies that form cycles are cross-
+  // iteration synchronization signals (ping-pong tokens between pipeline stages
+  // that alternate across outer loop iterations). These back-edges must not be
+  // treated as intra-iteration ordering constraints — they are removed from the
+  // DAG so that topological sort and signal insertion see an acyclic graph.
+  // The KTDF IR itself retains the back-edge tokens; only the dependency DAG
+  // used for ordering drops them.
   std::map<Operation*, int> color;  // 0=white, 1=gray, 2=black
-  std::function<bool(Operation*)> hasCycle;
-  hasCycle = [&](Operation* op) -> bool {
+  // Collect (producer, consumer) back-edges to remove after DFS.
+  llvm::SmallVector<std::pair<Operation*, Operation*>, 4> back_edges;
+  std::function<void(Operation*)> removeBackEdges;
+  removeBackEdges = [&](Operation* op) {
     color[op] = 1;
     for (auto* succ : dag.successors[op]) {
-      if (color[succ] == 1) return true;
-      if (color[succ] == 0 && hasCycle(succ)) return true;
+      if (color[succ] == 1) {
+        // Back-edge: succ is an ancestor of op in the DFS tree — this is a
+        // cross-iteration dependency (e.g. LXLU→L3LU+SFP pingpong token).
+        back_edges.push_back({op, succ});
+      } else if (color[succ] == 0) {
+        removeBackEdges(succ);
+      }
     }
     color[op] = 2;
-    return false;
   };
 
   for (auto stage : stages) {
     if (color[stage.getOperation()] == 0) {
-      if (hasCycle(stage.getOperation())) {
-        return stage.emitError(
-            "Circular token dependency detected in pipeline");
-      }
+      removeBackEdges(stage.getOperation());
     }
+  }
+
+  // Remove back-edges from the DAG.
+  for (auto& [producer, consumer] : back_edges) {
+    LDBG(1) << "  Removing back-edge (cross-iteration token dependency): "
+            << producer << " -> " << consumer;
+    llvm::erase(dag.successors[producer], consumer);
+    llvm::erase(dag.predecessors[consumer], producer);
   }
 
   LLVM_DEBUG({
