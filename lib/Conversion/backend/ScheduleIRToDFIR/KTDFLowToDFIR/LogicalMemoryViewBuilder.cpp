@@ -402,10 +402,14 @@ mlir::LogicalResult propagateTypes(
         fill->replaceUsesOfWith(old_val, new_val);
       } else if (auto generic = mlir::dyn_cast<mlir::linalg::GenericOp>(user)) {
         generic->replaceUsesOfWith(old_val, new_val);
+      } else if (auto write_fifo =
+                     mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(user)) {
+        write_fifo->replaceUsesOfWith(old_val, new_val);
       } else {
         return pu.emitError(
             "unexpected consumer of memory view; expected "
-            "data_transfer, select_memref, linalg.fill, or linalg.generic");
+            "data_transfer, select_memref, linalg.fill, linalg.generic, "
+            "or write_to_fifo");
       }
     }
   }
