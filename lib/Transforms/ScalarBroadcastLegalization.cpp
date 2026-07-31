@@ -270,9 +270,11 @@ static mlir::LogicalResult collectSites(
 
     auto inputs = generic_op.getDpsInputs();
     if (inputs.empty()) return mlir::WalkResult::advance();
+    auto first_input_type = inputs[0].getType();
+    if (!mlir::isa<mlir::RankedTensorType>(first_input_type))
+      return mlir::WalkResult::advance();
     mlir::Type elem_type =
-        mlir::cast<mlir::RankedTensorType>(inputs[0].getType())
-            .getElementType();
+        mlir::cast<mlir::RankedTensorType>(first_input_type).getElementType();
     int64_t vector_width =
         compute.getFeature<mlir::ktdf_arch::feature::SIMD>().getLanes(
             elem_type);
