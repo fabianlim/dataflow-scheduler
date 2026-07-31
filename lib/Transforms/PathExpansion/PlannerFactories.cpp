@@ -251,9 +251,13 @@ TransferMaterializationInfo* TransferInfoFactory::createSynthetic(
     const PrivateResourceSpec* dest_spec, size_t dest_slot_index,
     llvm::ArrayRef<mlir::Value> dest_indices,
     llvm::ArrayRef<mlir::OpFoldResult> dest_sizes, mlir::AffineMap dest_map,
-    mlir::MLIRContext* context) {
+    mlir::MLIRContext* context, mlir::Operation* neighbor_template_op) {
   auto transfer = std::make_unique<TransferMaterializationInfo>();
-  transfer->template_op = nullptr;  // Synthetic transfer, no template
+  // For a synthetic transfer, template_op is set to the neighboring transfer's
+  // template op (if any).  This allows the materializer to detect when the
+  // neighbor was nested inside an scf.for and wrap the synthesized
+  // data_transfer in a matching loop.
+  transfer->template_op = neighbor_template_op;
   transfer->hop = edge;
   transfer->source_resource = source_resource;
   transfer->dest_resource = dest_resource;

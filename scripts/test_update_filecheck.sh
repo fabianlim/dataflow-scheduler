@@ -55,17 +55,45 @@ function derivePathsFromBuildDir() {
 
   # LLVMConfig.cmake contains a line like:
   #   set(LLVM_BUILD_MAIN_SRC_DIR "/path/to/llvm-project/llvm")
+  # Pre-built cached distributions (e.g. the ktir-mlir binary cache) omit this
+  # variable.  Resolve GENERATE_TEST_CHECKS directly in that case via:
+  #   1. GENERATE_TEST_CHECKS env variable (explicit user override), or
+  #   2. LLVM_PROJ_SRC env variable (set to the llvm-project root), or
+  #   3. The triton checkout at /home/senuser/dt-inductor/triton/utils/,
+  #      which ships generate-test-checks.py alongside this repo.
   local llvm_src_dir
   llvm_src_dir=$(grep -m1 'LLVM_BUILD_MAIN_SRC_DIR' "${llvm_config}" \
                    | sed 's/.*"\(.*\)".*/\1/')
   if [[ -z "${llvm_src_dir}" ]]; then
-    echo "Error: LLVM_BUILD_MAIN_SRC_DIR not found in '${llvm_config}'"
+    if [[ -n "${GENERATE_TEST_CHECKS}" ]]; then
+      # Caller set the script path directly — nothing more to do.
+      return 0
+    fi
+    if [[ -n "${LLVM_PROJ_SRC}" ]]; then
+      # Caller exported LLVM_PROJ_SRC; derive script path from it below.
+      GENERATE_TEST_CHECKS="${LLVM_PROJ_SRC}/mlir/utils/generate-test-checks.py"
+      return 0
+    fi
+    # Fall back to the triton checkout, which ships generate-test-checks.py.
+    # The triton repo lives alongside the scheduler under dt-inductor/.
+    local triton_script="/home/senuser/dt-inductor/triton/utils/generate-test-checks.py"
+    if [[ -f "${triton_script}" ]]; then
+      GENERATE_TEST_CHECKS="${triton_script}"
+      # Keep LLVM_PROJ_SRC consistent for any other callers.
+      LLVM_PROJ_SRC="$(dirname "$(dirname "${triton_script}")")"
+      return 0
+    fi
+    echo "Error: LLVM_BUILD_MAIN_SRC_DIR not found in '${llvm_config}'."
+    echo "       Options:"
+    echo "         export GENERATE_TEST_CHECKS=/path/to/generate-test-checks.py"
+    echo "         export LLVM_PROJ_SRC=/path/to/llvm-project  # must contain mlir/utils/"
     exit 1
   fi
 
   # LLVM_BUILD_MAIN_SRC_DIR points to the llvm/ sub-directory of the
   # monorepo, so the monorepo root (which contains mlir/) is its parent.
   LLVM_PROJ_SRC="$(dirname "${llvm_src_dir}")"
+  GENERATE_TEST_CHECKS="${LLVM_PROJ_SRC}/mlir/utils/generate-test-checks.py"
 }
 
 # Usage
@@ -167,14 +195,14 @@ function run() {
     sed -e "/\/\/ CHECK/d" < $file > /tmp/out && mv /tmp/out $file
     if [ ! -z ${KTIRScheduler} ]; then
       if [ ! -z "${run_scheduler}" ]; then
-        echo "${KTIRScheduler} ${run_scheduler} ${file} | $LLVM_PROJ_SRC/mlir/utils/generate-test-checks.py > /tmp/out_sent"
-        eval ${KTIRScheduler} ${run_scheduler} ${file} | $LLVM_PROJ_SRC/mlir/utils/generate-test-checks.py > /tmp/out_sent
+        echo "${KTIRScheduler} ${run_scheduler} ${file} | $GENERATE_TEST_CHECKS > /tmp/out_sent"
+        eval ${KTIRScheduler} ${run_scheduler} ${file} | $GENERATE_TEST_CHECKS > /tmp/out_sent
 #       sed -e "s/\/\/ CHECK:/\/\/ CHECK:/" < ${file} > /tmp/out && mv /tmp/out /tmp/out_sent
         sed -e "s/\/\/ CHECK:      /\/\/ CHECK-NEXT:/" < /tmp/out_sent > /tmp/out && mv /tmp/out /tmp/out_sent
       else
         # Empty command means just parse the file (no transformation passes)
-        echo "${KTIRScheduler} ${file} | $LLVM_PROJ_SRC/mlir/utils/generate-test-checks.py > /tmp/out_sent"
-        eval ${KTIRScheduler} ${file} | $LLVM_PROJ_SRC/mlir/utils/generate-test-checks.py > /tmp/out_sent
+        echo "${KTIRScheduler} ${file} | $GENERATE_TEST_CHECKS > /tmp/out_sent"
+        eval ${KTIRScheduler} ${file} | $GENERATE_TEST_CHECKS > /tmp/out_sent
         sed -e "s/\/\/ CHECK:      /\/\/ CHECK-NEXT:/" < /tmp/out_sent > /tmp/out && mv /tmp/out /tmp/out_sent
       fi
     else

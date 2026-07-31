@@ -1430,7 +1430,7 @@ static mlir::LogicalResult populateIntermediateStageTransfers(
               prev_transfer->dest_indices, prev_transfer->dest_sizes,
               source_map_for_intermediate, dest_resource_spec, dest_slot_idx,
               dest_indices_from_next, dest_sizes_from_next,
-              dest_map_for_intermediate, ctx);
+              dest_map_for_intermediate, ctx, prev_transfer->template_op);
 
       stage_info.transfers.push_back(transfer_info);
 

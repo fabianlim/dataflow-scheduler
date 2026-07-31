@@ -170,6 +170,9 @@ class TransferInfoFactory {
   /// @param dest_sizes The destination sizes
   /// @param dest_map The destination affine map (from neighboring transfer)
   /// @param context MLIR context for creating attributes
+  /// @param neighbor_template_op Optional template op from a neighboring
+  ///        transfer; if it is nested inside an scf.for, the synthesized
+  ///        transfer will be wrapped in a matching loop during materialization
   /// @return Pointer to created transfer info (owned by factory)
   TransferMaterializationInfo* createSynthetic(
       const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,
@@ -180,7 +183,8 @@ class TransferInfoFactory {
       mlir::AffineMap source_map, const PrivateResourceSpec* dest_spec,
       size_t dest_slot_index, llvm::ArrayRef<mlir::Value> dest_indices,
       llvm::ArrayRef<mlir::OpFoldResult> dest_sizes, mlir::AffineMap dest_map,
-      mlir::MLIRContext* context);
+      mlir::MLIRContext* context,
+      mlir::Operation* neighbor_template_op = nullptr);
 
  private:
   // Owned transfer info objects

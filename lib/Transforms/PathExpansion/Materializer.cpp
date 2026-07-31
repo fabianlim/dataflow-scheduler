@@ -810,10 +810,39 @@ void PathExpansionMaterializer::synthesizeTransferStage(
     mlir::AffineMap dest_map =
         canonicalizeMapAndIndices(transfer_info->dest_map, dest_indices);
 
-    // Create the transfer operation
-    mlir::ktdf::DataTransferOp::create(
-        builder_, loc, source, source_map, source_indices, source_sizes,
-        destination, dest_map, dest_indices, dest_sizes);
+    // If the template op is nested inside a parent scf.for, wrap the
+    // synthesized data_transfer in a new scf.for with the same bounds and
+    // attributes (e.g. loop_type = reduction_loop).  The transfer indices are
+    // already materialized as constants so no IV substitution is needed.
+    mlir::scf::ForOp parent_for;
+    if (transfer_info->template_op) {
+      parent_for =
+          transfer_info->template_op->getParentOfType<mlir::scf::ForOp>();
+    }
+
+    if (parent_for) {
+      mlir::Value lb = materializeValue(parent_for.getLowerBound());
+      mlir::Value ub = materializeValue(parent_for.getUpperBound());
+      mlir::Value step = materializeValue(parent_for.getStep());
+
+      auto new_for = mlir::scf::ForOp::create(builder_, parent_for.getLoc(),
+                                              lb, ub, step);
+      // Copy all attributes (including loop_type) from the parent loop.
+      for (mlir::NamedAttribute attr : parent_for->getAttrs()) {
+        new_for->setAttr(attr.getName(), attr.getValue());
+      }
+
+      mlir::OpBuilder::InsertionGuard guard(builder_);
+      builder_.setInsertionPointToStart(new_for.getBody());
+      mlir::ktdf::DataTransferOp::create(
+          builder_, loc, source, source_map, source_indices, source_sizes,
+          destination, dest_map, dest_indices, dest_sizes);
+    } else {
+      // Create the transfer operation directly (no enclosing loop).
+      mlir::ktdf::DataTransferOp::create(
+          builder_, loc, source, source_map, source_indices, source_sizes,
+          destination, dest_map, dest_indices, dest_sizes);
+    }
   }
 }
 
