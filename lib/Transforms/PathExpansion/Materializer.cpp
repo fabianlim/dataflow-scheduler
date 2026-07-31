@@ -666,9 +666,79 @@ void PathExpansionMaterializer::adaptStageBodyWithTransfers(
       }
     }
 
-    // If not adapted, clone as-is
+    // If not adapted, clone as-is. For scf.for ops that contain FIFO or
+    // data_transfer ops that need adaptation (e.g. the reduction load/compute
+    // stages loop over M rows), we handle them in two steps:
+    //
+    // Step A — pre-map FIFO-slot operands for read_from_fifo and
+    //   write_to_fifo ops (at any nesting depth) into value_map_ before the
+    //   clone. The deep clone then picks up the new physical FIFO slots.
+    //
+    // Step B — for data_transfer ops that need new addressing (dest indices,
+    //   sizes, maps from transfer_info), do a one-level lockstep walk after
+    //   the clone to replace each cloned data_transfer with a proper adapted
+    //   op emitted via tryAdaptDataTransferOp.
     if (!adapted) {
-      builder_.clone(op, value_map_);
+      if (auto for_op = mlir::dyn_cast<mlir::scf::ForOp>(&op)) {
+        // Step A: pre-map FIFO slots for nested FIFO ops.
+        if (handle_fifo_ops) {
+          for_op.walk([&](mlir::Operation* inner) {
+            const TransferMaterializationInfo* t_info =
+                transfer_map.lookup(inner);
+            if (!t_info) return mlir::WalkResult::advance();
+
+            if (auto read_op =
+                    mlir::dyn_cast<mlir::ktdf::ReadFromFifoOp>(inner)) {
+              if (t_info->source_private_resource) {
+                mlir::Value new_fifo = getPrivateResourceValue(
+                    t_info->source_private_resource,
+                    t_info->source_slot_index);
+                value_map_.map(read_op.getFifoSlot(), new_fifo);
+              }
+            } else if (auto write_op =
+                           mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(inner)) {
+              if (t_info->dest_private_resource) {
+                mlir::Value new_fifo = getPrivateResourceValue(
+                    t_info->dest_private_resource, t_info->dest_slot_index);
+                value_map_.map(write_op.getFifoSlot(), new_fifo);
+              }
+            }
+            return mlir::WalkResult::advance();
+          });
+        }
+      }
+
+      mlir::Operation* cloned = builder_.clone(op, value_map_);
+
+      // Step B: for data_transfer ops that are direct children of a nested
+      // scf.for body, replace the cloned op with a properly adapted op that
+      // carries new dest indices/sizes/maps from the transfer_info.
+      if (auto for_op = mlir::dyn_cast<mlir::scf::ForOp>(&op)) {
+        auto cloned_for = mlir::cast<mlir::scf::ForOp>(cloned);
+        mlir::Block* orig_for_body = for_op.getBody();
+        mlir::Block* cloned_for_body = cloned_for.getBody();
+
+        auto orig_it = orig_for_body->begin();
+        auto cloned_it = cloned_for_body->begin();
+        while (orig_it != orig_for_body->end()) {
+          mlir::Operation* orig_inner = &*orig_it;
+          mlir::Operation* cloned_inner = &*cloned_it;
+          ++orig_it;
+          ++cloned_it;
+
+          if (auto transfer_op =
+                  mlir::dyn_cast<mlir::ktdf::DataTransferOp>(orig_inner)) {
+            const TransferMaterializationInfo* t_info =
+                transfer_map.lookup(orig_inner);
+            if (t_info) {
+              mlir::OpBuilder::InsertionGuard guard(builder_);
+              builder_.setInsertionPoint(cloned_inner);
+              tryAdaptDataTransferOp(transfer_op, t_info);
+              cloned_inner->erase();
+            }
+          }
+        }
+      }
     }
   }
 }
