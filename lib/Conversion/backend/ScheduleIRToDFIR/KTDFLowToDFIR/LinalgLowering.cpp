@@ -25,11 +25,15 @@
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
 #include "dataflow-scheduler/Dialect/Agen/Agen.h"
+#include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
+#include "dataflow-scheduler/Dialect/Dataflow/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AffineMap.h"
@@ -48,7 +52,8 @@ struct LowerLinalgGenericPattern
     : public mlir::OpRewritePattern<mlir::linalg::GenericOp> {
   LowerLinalgGenericPattern(mlir::MLIRContext* context,
                             arch_view::ResourceKinds& resource_kinds)
-      : OpRewritePattern(context), resource_kinds_(resource_kinds) {}
+      : OpRewritePattern(context, /*benefit=*/2),
+        resource_kinds_(resource_kinds) {}
 
   mlir::LogicalResult matchAndRewrite(
       mlir::linalg::GenericOp generic_op,
@@ -57,16 +62,19 @@ struct LowerLinalgGenericPattern
     if (generic_op.hasPureBufferSemantics())
       return lowerMemRefGenericOp(generic_op, rewriter);
 
-    if (!generic_op.hasPureTensorSemantics() ||
-        generic_op.getNumResults() != 1) {
-      return mlir::failure();
-    }
-
     // If the generic has any reduction dimensions, delegate to the dedicated
-    // reduction lowering path before the elementwise path touches block args.
+    // reduction lowering path.  Check this before the pure-tensor-semantics
+    // gate because the read_from_fifo pattern may have already lowered the
+    // input to a vector (making hasPureTensorSemantics() return false), but
+    // the reduction lowering can still proceed.
     for (auto iter_type : generic_op.getIteratorTypesArray()) {
       if (iter_type == mlir::utils::IteratorType::reduction)
         return lowerReductionGenericOp(generic_op, rewriter);
+    }
+
+    if (!generic_op.hasPureTensorSemantics() ||
+        generic_op.getNumResults() != 1) {
+      return mlir::failure();
     }
 
     mlir::Block& body = generic_op.getRegion().front();
@@ -159,6 +167,11 @@ struct LowerLinalgGenericPattern
     auto acc_vec_type =
         getFlattenedVectorType(out_memref_type, resource_kinds_);
     if (!acc_vec_type) return mlir::failure();
+    // An address-assigned accumulator in compute-unit-local memory arrives
+    // still wearing its memory space; resolve it against the owning unit.
+    if (mlir::failed(scheduler::resolveComputeUnitLocalBuffer(
+            generic_op, out_memref, rewriter)))
+      return mlir::failure();
     rewriter.setInsertionPoint(generic_op);
     body.getArguments().back().replaceAllUsesWith(
         scheduler::emitVectorLoad(rewriter, loc, acc_vec_type, out_memref));
@@ -198,16 +211,12 @@ struct LowerLinalgGenericPattern
     return mlir::success();
   }
 
-  // Lowers a linalg.generic that has one or more reduction dimensions.
+  // Lowers a tensor-semantics linalg.generic that has one or more reduction
+  // dimensions by emitting one scf.for per reduction dimension, each carrying
+  // the accumulator vector as its iter_arg.
   //
-  // One scf.for loop is emitted per reduction dimension (outermost first),
-  // carrying the output vector as an iter_arg accumulator.  Each innermost
-  // iteration extracts a parallel-shaped slice from the input tensor (size 1
-  // along every reduction dim, full extent along parallel dims), then
-  // accumulates it into the current accumulator via vectorchain.binary.
-  //
-  // The body op (addf / mulf / subf) determines the binary operator; the
-  // existing lowerXxxFOp helpers are reused for the accumulation step.
+  // A reduction whose accumulator is a buffer does not come here: it has pure
+  // buffer semantics and is handled by lowerMemRefGenericOp.
   mlir::LogicalResult lowerReductionGenericOp(
       mlir::linalg::GenericOp generic_op,
       mlir::PatternRewriter& rewriter) const {
@@ -241,10 +250,9 @@ struct LowerLinalgGenericPattern
 
     const auto iterator_types = generic_op.getIteratorTypesArray();
     llvm::SmallVector<int64_t> red_dims;
-    for (int64_t i = 0; i < static_cast<int64_t>(iterator_types.size()); ++i) {
+    for (int64_t i = 0; i < static_cast<int64_t>(iterator_types.size()); ++i)
       if (iterator_types[i] == mlir::utils::IteratorType::reduction)
         red_dims.push_back(i);
-    }
 
     // The output type has only parallel dims and always fits in vector_length.
     auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(
@@ -255,6 +263,7 @@ struct LowerLinalgGenericPattern
         getFlattenedVectorType(output_type, resource_kinds_);
     if (!vec_type) return mlir::failure();
 
+    mlir::Value init = generic_op.getDpsInitOperand(0)->get();
     mlir::AffineMap identity_map =
         mlir::AffineMap::getMultiDimIdentityMap(1, rewriter.getContext());
 
@@ -262,7 +271,6 @@ struct LowerLinalgGenericPattern
 
     // Build the initial accumulator from the init operand.  For a tensor.empty
     // (undefined init) use a zero vector; for a constant tensor reshape it.
-    mlir::Value init = generic_op.getDpsInitOperand(0)->get();
     mlir::Value acc =
         convertConstTensorInputToVector(init, generic_op, rewriter);
     if (acc.getType() != vec_type) {
@@ -488,6 +496,15 @@ struct LowerLinalgFillPattern
           "linalg.fill constant value must be integer or float");
     }
 
+    // Step 0 (memref only): a compute-unit-local buffer arrives here still
+    // wearing its memory space, because no logical memory view was built for it.
+    // Resolve it against the owning compute unit at its assigned offset.
+    mlir::Value store_target = out_operand;
+    if (fill_op.getResultTensors().empty() &&
+        mlir::failed(scheduler::resolveComputeUnitLocalBuffer(
+            fill_op, store_target, rewriter)))
+      return mlir::failure();
+
     // Step 1: vectorchain.constant_bitstream {value = [0x0]} : vector<1xT>
     mlir::VectorType seed_type = mlir::VectorType::get({1}, elem_type);
     mlir::ArrayAttr value_attr = rewriter.getArrayAttr(
@@ -510,7 +527,8 @@ struct LowerLinalgFillPattern
     }
 
     // Step 3b (memref): write the filled vector into the output memref.
-    scheduler::emitVectorStore(rewriter, loc, shuffle.getOutput(), out_operand);
+    scheduler::emitVectorStore(rewriter, loc, shuffle.getOutput(),
+                               store_target);
 
     rewriter.eraseOp(fill_op);
     return mlir::success();

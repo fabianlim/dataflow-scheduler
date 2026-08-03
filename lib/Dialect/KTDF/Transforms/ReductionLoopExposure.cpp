@@ -17,8 +17,8 @@
 //===----------------------------------------------------------------------===//
 //
 // ReductionLoopExposure: expose the reduction dimension of a linalg.generic
-// inside a ktdf.pipeline as an explicit scf.for loop with a loop-carry
-// accumulator tensor.
+// inside a ktdf.pipeline as an explicit scf.for loop accumulating into a
+// compute-unit-local accumulator buffer.
 //
 // Algorithm:
 //   1. Walk the module for any ktdf.stage containing a linalg.generic with
@@ -36,9 +36,12 @@
 //   7. For every stage in the pipeline, wrap its entire body in
 //      scf.for %r = 0 to R step 1.
 //   8. For the compute stage specifically:
-//      - tensor.empty is emitted before the loop (accumulator init).
-//      - The loop carries the accumulator as iter_args.
-//      - The original linalg.generic is cloned inside the loop via IRMapping.
+//      - A memref.alloc in the compute unit's register-file memory space plus a
+//        zeroing linalg.fill are emitted before the loop (accumulator init).
+//        Allocating here, ahead of address assignment, is what gets the buffer
+//        a physical offset.
+//      - The loop carries no iter_args: the accumulator is a buffer, so the
+//        linalg.generic writes it in place and yields no SSA value.
 //      - write_to_fifo is emitted unconditionally every iteration.
 //      - The loop is tagged {loop_type = reduction_loop}.
 //   9. Find the store stage (downstream of compute via depends_out/depends_in
@@ -55,8 +58,8 @@
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -80,6 +83,11 @@ static llvm::cl::opt<bool> DisableThisPass(
     llvm::cl::init(false));
 
 namespace {
+
+// Memory space of the reduction accumulator: the register file private to the
+// compute unit that runs the reduction.  Must name a memory declared in the
+// device spec — an unrecognised space asserts in address assignment.
+constexpr llvm::StringLiteral kAccumulatorMemorySpace = "SFU_REG";
 
 // ---------------------------------------------------------------------------
 // Return the first linalg.generic with a reduction iterator found anywhere
@@ -331,19 +339,25 @@ struct ReductionLoopExposurePass
       return failure();
     }
 
-    // Output accumulator tensor type (from the generic's output).
+    // Accumulator buffer type: the generic's output shape, in the compute
+    // unit's register-file memory space.
     auto output_tensor_type =
         cast<RankedTensorType>(generic_op.getOutputs().front().getType());
+    auto acc_memref_type = MemRefType::get(
+        output_tensor_type.getShape(), output_tensor_type.getElementType(),
+        /*layout=*/MemRefLayoutAttrInterface{},
+        StringAttr::get(ctx, kAccumulatorMemorySpace));
 
-    // Per-iteration input slice tensor: same shape as generic input but size-1
-    // in the reduction dim (e.g. 1x256x64 → 1x1x64).
+    // Per-iteration input slice: same shape as the generic input but size-1 in
+    // the reduction dim (e.g. 1x256x64 → 1x1x64).  The slice is produced by
+    // read_from_fifo, so it carries no memory space.
     auto slice_tensor_type =
         cast<RankedTensorType>(generic_op.getInputs().front().getType());
     SmallVector<int64_t> slice_shape(slice_tensor_type.getShape().begin(),
                                      slice_tensor_type.getShape().end());
     slice_shape[static_cast<size_t>(reduction_dim)] = 1;
-    auto one_row_tensor_type =
-        RankedTensorType::get(slice_shape, slice_tensor_type.getElementType());
+    auto one_row_memref_type =
+        MemRefType::get(slice_shape, slice_tensor_type.getElementType());
 
     // -----------------------------------------------------------------------
     // 1b. Patch data_transfer static sizes for any transfer that uses a
@@ -427,7 +441,7 @@ struct ReductionLoopExposurePass
     for (auto stage : inner_pipeline.getStages()) {
       if (stage == compute_stage) {
         rewriteComputeStage(rewriter, loc, ctx, stage, generic_op,
-                            one_row_tensor_type, output_tensor_type, fifo_in,
+                            one_row_memref_type, acc_memref_type, fifo_in,
                             fifo_out, c0, c1, c_red);
       } else if (stage == conditional_store_stage) {
         rewriteConditionalStoreStage(rewriter, loc, stage, c0, c1, c_red);
@@ -539,17 +553,21 @@ struct ReductionLoopExposurePass
 
   // -------------------------------------------------------------------------
   // Rewrite the compute stage:
-  //   %empty = tensor.empty()  : output_tensor_type          (before loop)
-  //   scf.for %r = 0 to R iter_args(%carry = %empty)
-  //       {loop_type = reduction_loop}
-  //     <read_from_fifo one slice, linalg.generic accumulates into carry>
-  //     write_to_fifo %updated_carry, fifo_out   (unconditional every iter)
-  //     scf.yield %updated_carry
+  //   %acc  = memref.alloc() : acc_memref_type                (before loop)
+  //   %zero = arith.constant 0
+  //   linalg.fill ins(%zero) outs(%acc)
+  //   scf.for %r = 0 to R                     {loop_type = reduction_loop}
+  //     %slice = read_from_fifo -> one_row_memref_type
+  //     linalg.generic ins(%slice) outs(%acc)  (no results; in-place)
+  //     write_to_fifo %acc, fifo_out           (unconditional every iter)
+  //
+  // The loop carries no iter_args: the accumulator lives in the buffer, so the
+  // buffer-semantics linalg.generic has no SSA result to thread through.
   // -------------------------------------------------------------------------
   void rewriteComputeStage(IRRewriter& rewriter, Location loc, MLIRContext* ctx,
                            ktdf::StageOp stage, linalg::GenericOp generic_op,
-                           RankedTensorType one_row_tensor_type,
-                           RankedTensorType output_tensor_type, Value fifo_in,
+                           MemRefType one_row_memref_type,
+                           MemRefType acc_memref_type, Value fifo_in,
                            Value fifo_out, Value c0, Value c1, Value c_red) {
     Block* body = stage.getBody();
 
@@ -559,36 +577,36 @@ struct ReductionLoopExposurePass
 
     rewriter.setInsertionPointToStart(body);
 
-    // Accumulator initialiser — emitted once, outside the loop.
-    auto empty =
-        tensor::EmptyOp::create(rewriter, loc, output_tensor_type.getShape(),
-                                output_tensor_type.getElementType());
+    // Accumulator buffer and its zero initialiser — emitted once, outside the
+    // loop, so that address assignment gives the buffer a physical offset.
+    Value acc = memref::AllocOp::create(rewriter, loc, acc_memref_type);
+    Value zero = arith::ConstantOp::create(
+        rewriter, loc,
+        cast<TypedAttr>(
+            rewriter.getZeroAttr(acc_memref_type.getElementType())));
+    linalg::FillOp::create(rewriter, loc, ValueRange{zero}, ValueRange{acc});
 
-    // Build the reduction scf.for via the body-builder callback.
-    auto acc_for = scf::ForOp::create(
-        rewriter, loc, c0, c_red, c1, ValueRange{empty.getResult()},
-        [&](OpBuilder& b, Location l, Value iv, ValueRange iter_args) {
-          Value carry = iter_args.front();
+    auto acc_for = scf::ForOp::create(rewriter, loc, c0, c_red, c1);
+    rewriter.setInsertionPointToStart(acc_for.getBody());
 
-          // read_from_fifo: one row at a time.
-          auto slice =
-              ktdf::ReadFromFifoOp::create(b, l, one_row_tensor_type, fifo_in);
+    // read_from_fifo: one row at a time.
+    auto slice =
+        ktdf::ReadFromFifoOp::create(rewriter, loc, one_row_memref_type,
+                                     fifo_in);
 
-          // Clone the original linalg.generic, remapping its operands.
-          IRMapping mapping;
-          mapping.map(generic_op.getInputs().front(), slice.getResult());
-          mapping.map(generic_op.getOutputs().front(), carry);
-          auto new_generic = cast<linalg::GenericOp>(
-              b.clone(*generic_op.getOperation(), mapping));
-          Value updated_carry = new_generic.getResult(0);
+    // Rebuild the linalg.generic with buffer semantics: same maps, same
+    // iterators, same body, but no result — it accumulates into %acc in place.
+    auto new_generic = linalg::GenericOp::create(
+        rewriter, loc, /*resultTensorTypes=*/TypeRange{},
+        /*inputs=*/ValueRange{slice.getResult()}, /*outputs=*/ValueRange{acc},
+        generic_op.getIndexingMapsArray(), generic_op.getIteratorTypesArray());
+    IRMapping mapping;
+    generic_op.getRegion().cloneInto(&new_generic.getRegion(), mapping);
 
-          // Write the partial accumulator to fifo_out every iteration.
-          // LXSU overwrites the same address each iteration; last write wins.
-          // FIFO send/receive must be unconditional and balanced every iteration.
-          ktdf::WriteToFifoOp::create(b, l, updated_carry, fifo_out);
-
-          scf::YieldOp::create(b, l, ValueRange{updated_carry});
-        });
+    // Publish the running accumulator to fifo_out every iteration.  LXSU
+    // overwrites the same address each iteration; last write wins.  FIFO
+    // send/receive must be unconditional and balanced every iteration.
+    ktdf::WriteToFifoOp::create(rewriter, loc, acc, fifo_out);
 
     acc_for->setAttr("loop_type", ktdf::LoopTypeAttr::get(
                                       ctx, ktdf::LoopType::ReductionLoop));

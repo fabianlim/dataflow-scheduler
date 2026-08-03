@@ -97,15 +97,19 @@ def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"
 
       load stage:    scf.for %r = 0 to R           -- all original ops inside
                        data_transfer LX -> fifo_in  (static dest size / R)
-      compute stage: %init = tensor.empty : tensor<1xCxf16>
-                     scf.for %r = 0 to R iter_args(%carry = %init)
-                         {loop_type = reduction_loop}
-                       slice  = read_from_fifo -> tensor<1x1xCxf16>
-                       %carry = linalg.generic (unchanged) ins(slice) outs(%carry)
-                       if (%r == R-1): write_to_fifo %carry
-                       scf.yield %carry
+      compute stage: %acc = memref.alloc : memref<1xCxf16, "SFU_REG">
+                     linalg.fill ins(0) outs(%acc)
+                     scf.for %r = 0 to R           {loop_type = reduction_loop}
+                       slice = read_from_fifo -> memref<1x1xCxf16>
+                       linalg.generic ins(slice) outs(%acc)   -- in place
+                       write_to_fifo %acc
       store stage:   scf.for %r = 0 to R           -- all original ops inside
-                       if (%r == R-1): data_transfer fifo_out -> LX
+                       data_transfer fifo_out -> LX
+
+    The accumulator is allocated here, before address assignment, so that it
+    is given a physical offset in the compute unit's register file.  Because it
+    is a buffer, the linalg.generic has buffer semantics and no result, so the
+    loop needs no iter_args.
 
     Any data_transfer in any stage whose source or destination is a shrunken
     FIFO has its static sizes divided by R automatically.
@@ -134,7 +138,7 @@ def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"
     "mlir::scf::SCFDialect",
     "mlir::arith::ArithDialect",
     "mlir::linalg::LinalgDialect",
-    "mlir::tensor::TensorDialect"
+    "mlir::memref::MemRefDialect"
   ];
 }
 

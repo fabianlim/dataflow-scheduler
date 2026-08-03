@@ -1,10 +1,12 @@
 // RUN: dataflow-scheduler-opt -pass-pipeline="builtin.module(ktdflowering-to-dfir)" %s | FileCheck %s
 // CHECK: #[[$ATTR_0:.+]] = affine_map<(d0, d1, d2, d3) -> (d0 * 64 + d1 * 64 + d2 * 64 + d3)>
 // CHECK: #[[$ATTR_1:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+// CHECK: #[[$ACC_ID:.+]] = affine_map<(d0, d1) -> (d0, d1)>
 // CHECK: #[[$ATTR_2:.+]] = affine_map<(d0) -> (d0)>
 // CHECK: #[[$ATTR_3:.+]] = affine_map<(d0, d1, d2) -> (d0 * 64 + d1 * 64 + d2)>
-// CHECK: #[[$ATTR_4:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+// CHECK: #[[$ATTR_3D_ID:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 // CHECK: #[[$ATTR_5:.+]] = affine_set<(d0, d1, d2, d3) : (d0 == 0, d1 == 0, d2 == 0, d3 >= 0, -d3 + 63 >= 0)>
+// CHECK: #[[$SET_ACC:.+]] = affine_set<(d0, d1) : (d0 == 0, d1 >= 0, -d1 + 63 >= 0)>
 // CHECK: #[[$ATTR_6:.+]] = affine_set<(d0, d1, d2) : (d0 == 0, d1 == 0, d2 >= 0, -d2 + 63 >= 0)>
 
 
@@ -12,60 +14,64 @@
 // CHECK-LABEL:   ktdf_arch.device @spyre_1core import("Inputs/spyre_1core_device.mlir")
 
 // CHECK-LABEL:   func.func @corelet_parallel_fifo_mapping() attributes {grid = [1]} {
-// CHECK-NEXT:     %[[VAL_0:.*]] = arith.constant dense<0.000000e+00> : vector<64xf16>
-// CHECK-NEXT:     %[[VAL_1:.*]] = arith.constant 65536 : index
-// CHECK-NEXT:     %[[VAL_2:.*]] = arith.constant 256 : index
-// CHECK-NEXT:     %[[VAL_3:.*]] = arith.constant 255 : index
-// CHECK-NEXT:     %[[VAL_4:.*]] = arith.constant 1 : index
-// CHECK-NEXT:     %[[VAL_5:.*]] = arith.constant 0 : index
-// CHECK-NEXT:     %[[VAL_6:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-lxlu-CL0", type = "lxlu"} : index
-// CHECK-NEXT:     %[[VAL_7:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 1 : i32, name = "C0-lxlu-CL1", type = "lxlu"} : index
-// CHECK-NEXT:     %[[VAL_8:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-sfp-CL0", type = "sfp"} : index
-// CHECK-NEXT:     %[[VAL_9:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 1 : i32, name = "C0-sfp-CL1", type = "sfp"} : index
-// CHECK-NEXT:     %[[VAL_10:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-lxsu-CL0", type = "lxsu"} : index
-// CHECK-NEXT:     %[[VAL_11:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 1 : i32, name = "C0-lxsu-CL1", type = "lxsu"} : index
-// CHECK-NEXT:     %[[VAL_12:.*]] = dataflow.get_unit {core = 0 : i32, name = "C0-lx", type = "lx"} : index
-// CHECK-NEXT:     dataflow.program_unit iter_arg : %[[VAL_13:.*]] -> (%[[VAL_6]], %[[VAL_7]]) : {
-// CHECK-NEXT:       %[[VAL_14:.*]] = uniform.def_immutable_mapping({{\[}}%[[VAL_6]] -> %[[VAL_12]]], {{\[}}%[[VAL_7]] -> %[[VAL_12]]]):index
-// CHECK-NEXT:       %[[VAL_15:.*]] = uniform.query_map(map:%[[VAL_14]], key:%[[VAL_13]]) : index
-// CHECK-NEXT:       %[[VAL_16:.*]] = dataflow.get_logical_memory_view %[[VAL_15]], %[[VAL_5]] {layout_map = #[[$ATTR_0]]} : index, index, memref<1x1x1x64xf16>
-// CHECK-NEXT:       scf.for %[[VAL_17:.*]] = %[[VAL_5]] to %[[VAL_2]] step %[[VAL_4]] {
-// CHECK-NEXT:         %[[VAL_18:.*]] = agen.vector_load %[[VAL_16]][0, 0, 0, 0] {load_order = #[[$ATTR_1]], load_set = #[[$ATTR_5]]} : memref<1x1x1x64xf16>, vector<64xf16>
-// CHECK-NEXT:         %[[VAL_19:.*]] = uniform.def_immutable_mapping({{\[}}%[[VAL_6]] -> %[[VAL_8]]], {{\[}}%[[VAL_7]] -> %[[VAL_9]]]):index
-// CHECK-NEXT:         %[[VAL_20:.*]] = uniform.query_map(map:%[[VAL_19]], key:%[[VAL_13]]) : index
-// CHECK-NEXT:         dataflow.send %[[VAL_20]], %[[VAL_18]] : vector<64xf16>
-// CHECK-NEXT:       }
-// CHECK-NEXT:     }
-// CHECK-NEXT:     dataflow.program_unit iter_arg : %[[VAL_21:.*]] -> (%[[VAL_8]], %[[VAL_9]]) : {
-// CHECK-NEXT:       scf.for %[[VAL_22:.*]] = %[[VAL_5]] to %[[VAL_2]] step %[[VAL_4]] {
-// CHECK-NEXT:         %[[VAL_23:.*]] = uniform.def_immutable_mapping({{\[}}%[[VAL_8]] -> %[[VAL_6]]], {{\[}}%[[VAL_9]] -> %[[VAL_7]]]):index
-// CHECK-NEXT:         %[[VAL_24:.*]] = uniform.query_map(map:%[[VAL_23]], key:%[[VAL_21]]) : index
-// CHECK-NEXT:         %[[VAL_25:.*]] = dataflow.receive %[[VAL_24]] : vector<64xf16>
-// CHECK-NEXT:         %[[VAL_26:.*]] = vectorchain.binary %[[VAL_0]], %[[VAL_25]] {binary_op = {{.*}}<binary_operator add>, op_specific_map = #[[$ATTR_2]]} : vector<64xf16>, vector<64xf16>, vector<64xf16>
-// CHECK-NEXT:         %[[VAL_27:.*]] = arith.cmpi eq, %[[VAL_22]], %[[VAL_3]] : index
-// CHECK-NEXT:         scf.if %[[VAL_27]] {
-// CHECK-NEXT:           %[[VAL_28:.*]] = uniform.def_immutable_mapping({{\[}}%[[VAL_8]] -> %[[VAL_10]]], {{\[}}%[[VAL_9]] -> %[[VAL_11]]]):index
-// CHECK-NEXT:           %[[VAL_29:.*]] = uniform.query_map(map:%[[VAL_28]], key:%[[VAL_21]]) : index
-// CHECK-NEXT:           dataflow.send %[[VAL_29]], %[[VAL_26]] : vector<64xf16>
-// CHECK-NEXT:         }
-// CHECK-NEXT:       }
-// CHECK-NEXT:     }
-// CHECK-NEXT:     dataflow.program_unit iter_arg : %[[VAL_30:.*]] -> (%[[VAL_10]], %[[VAL_11]]) : {
-// CHECK-NEXT:       %[[VAL_31:.*]] = uniform.def_immutable_mapping({{\[}}%[[VAL_10]] -> %[[VAL_12]]], {{\[}}%[[VAL_11]] -> %[[VAL_12]]]):index
-// CHECK-NEXT:       %[[VAL_32:.*]] = uniform.query_map(map:%[[VAL_31]], key:%[[VAL_30]]) : index
-// CHECK-NEXT:       %[[VAL_33:.*]] = dataflow.get_logical_memory_view %[[VAL_32]], %[[VAL_1]] {layout_map = #[[$ATTR_3]]} : index, index, memref<2x1x64xf16>
-// CHECK-NEXT:       scf.for %[[VAL_34:.*]] = %[[VAL_5]] to %[[VAL_2]] step %[[VAL_4]] {
-// CHECK-NEXT:         %[[VAL_35:.*]] = arith.cmpi eq, %[[VAL_34]], %[[VAL_3]] : index
-// CHECK-NEXT:         scf.if %[[VAL_35]] {
-// CHECK-NEXT:           %[[VAL_36:.*]] = uniform.def_immutable_mapping({{\[}}%[[VAL_10]] -> %[[VAL_8]]], {{\[}}%[[VAL_11]] -> %[[VAL_9]]]):index
-// CHECK-NEXT:           %[[VAL_37:.*]] = uniform.query_map(map:%[[VAL_36]], key:%[[VAL_30]]) : index
-// CHECK-NEXT:           %[[VAL_38:.*]] = dataflow.receive %[[VAL_37]] : vector<64xf16>
-// CHECK-NEXT:           agen.vector_store %[[VAL_38]], %[[VAL_33]][0, 0, 0] {store_order = #[[$ATTR_4]], store_set = #[[$ATTR_6]]} : memref<2x1x64xf16>, vector<64xf16>
-// CHECK-NEXT:         }
-// CHECK-NEXT:       }
-// CHECK-NEXT:     }
-// CHECK-NEXT:     return
-// CHECK-NEXT:   }
+// CHECK-DAG:       %[[C65536:.*]] = arith.constant 65536 : index
+// CHECK-DAG:       %[[C256:.*]] = arith.constant 256 : index
+// CHECK-DAG:       %[[C1:.*]] = arith.constant 1 : index
+// CHECK-DAG:       %[[C0:.*]] = arith.constant 0 : index
+// CHECK-DAG:       %[[LXLU0:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-lxlu-CL0", type = "lxlu"} : index
+// CHECK-DAG:       %[[LXLU1:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 1 : i32, name = "C0-lxlu-CL1", type = "lxlu"} : index
+// CHECK-DAG:       %[[SFP0:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-sfp-CL0", type = "sfp"} : index
+// CHECK-DAG:       %[[SFP1:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 1 : i32, name = "C0-sfp-CL1", type = "sfp"} : index
+// CHECK-DAG:       %[[LXSU0:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-lxsu-CL0", type = "lxsu"} : index
+// CHECK-DAG:       %[[LXSU1:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 1 : i32, name = "C0-lxsu-CL1", type = "lxsu"} : index
+// CHECK-DAG:       %[[LX:.*]] = dataflow.get_unit {core = 0 : i32, name = "C0-lx", type = "lx"} : index
+
+// LXLU program_unit: sends to SFP (corelet-parallel)
+// CHECK:       dataflow.program_unit iter_arg : %[[LXLU_ARG:.*]] -> (%[[LXLU0]], %[[LXLU1]]) : {
+// CHECK:         %[[LXLU_LX_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[LXLU0]] -> %[[LX]]], {{\[}}%[[LXLU1]] -> %[[LX]]]):index
+// CHECK:         %[[LXLU_LX:.*]] = uniform.query_map(map:%[[LXLU_LX_MAP]], key:%[[LXLU_ARG]]) : index
+// CHECK:         %[[LXLU_VIEW:.*]] = dataflow.get_logical_memory_view %[[LXLU_LX]], %[[C0]] {layout_map = #[[$ATTR_0]]} : index, index, memref<1x1x1x64xf16>
+// CHECK:         scf.for %{{.*}} = %[[C0]] to %[[C256]] step %[[C1]] {
+// CHECK:           %{{.*}} = agen.vector_load %[[LXLU_VIEW]]
+// CHECK:           %[[SEND_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[LXLU0]] -> %[[SFP0]]], {{\[}}%[[LXLU1]] -> %[[SFP1]]]):index
+// CHECK:           %[[SEND_DST:.*]] = uniform.query_map(map:%[[SEND_MAP]], key:%[[LXLU_ARG]]) : index
+// CHECK:           dataflow.send %[[SEND_DST]],
+// CHECK:         }
+// CHECK:       }
+
+// SFP program_unit: receives from LXLU (corelet-parallel), accumulates in the
+// register-file buffer, sends to LXSU every iteration
+// CHECK:       dataflow.program_unit iter_arg : %[[SFP_ARG:.*]] -> (%[[SFP0]], %[[SFP1]]) : {
+// CHECK:         %[[ACC:.*]] = memref.alloc() : memref<1x64xf16, "SFU_REG">
+// CHECK:         %[[SEED:.*]] = vectorchain.constant_bitstream {value = [0x0]} : vector<1xf16>
+// CHECK:         %[[ZERO:.*]] = vectorchain.shuffle %[[SEED]] {indices = [0 : i32], repetition = 64 : i32} : vector<1xf16>, vector<64xf16>
+// CHECK:         agen.vector_store %[[ZERO]], %[[ACC]][%[[C0]], %[[C0]]] {{.*}} : memref<1x64xf16, "SFU_REG">, vector<64xf16>
+// CHECK:         scf.for %[[IV:.*]] = %[[C0]] to %[[C256]] step %[[C1]] {
+// CHECK:           %[[RECV_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[SFP0]] -> %[[LXLU0]]], {{\[}}%[[SFP1]] -> %[[LXLU1]]]):index
+// CHECK:           %[[RECV_SRC:.*]] = uniform.query_map(map:%[[RECV_MAP]], key:%[[SFP_ARG]]) : index
+// CHECK:           %[[RECV:.*]] = dataflow.receive %[[RECV_SRC]] : vector<64xf16>
+// CHECK:           %[[LOAD:.*]] = agen.vector_load %[[ACC]][%[[C0]], %[[C0]]] {{.*}} : memref<1x64xf16, "SFU_REG">, vector<64xf16>
+// CHECK:           %[[SUM:.*]] = vectorchain.binary %[[RECV]], %[[LOAD]] {binary_op = {{.*}}<binary_operator add>, op_specific_map = #[[$ATTR_2]]} : vector<64xf16>, vector<64xf16>, vector<64xf16>
+// CHECK:           agen.vector_store %[[SUM]], %[[ACC]][%[[C0]], %[[C0]]] {{.*}} : memref<1x64xf16, "SFU_REG">, vector<64xf16>
+// CHECK:           %[[SEND_MAP2:.*]] = uniform.def_immutable_mapping({{\[}}%[[SFP0]] -> %[[LXSU0]]], {{\[}}%[[SFP1]] -> %[[LXSU1]]]):index
+// CHECK:           %[[SEND_DST2:.*]] = uniform.query_map(map:%[[SEND_MAP2]], key:%[[SFP_ARG]]) : index
+// CHECK:           %[[OUT:.*]] = agen.vector_load %[[ACC]][%[[C0]], %[[C0]]] {{.*}} : memref<1x64xf16, "SFU_REG">, vector<64xf16>
+// CHECK:           dataflow.send %[[SEND_DST2]], %[[OUT]] : vector<64xf16>
+// CHECK:         }
+// CHECK:       }
+
+// LXSU program_unit: receives from SFP (corelet-parallel)
+// CHECK:       dataflow.program_unit iter_arg : %[[LXSU_ARG:.*]] -> (%[[LXSU0]], %[[LXSU1]]) : {
+// CHECK:         %[[LXSU_LX_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[LXSU0]] -> %[[LX]]], {{\[}}%[[LXSU1]] -> %[[LX]]]):index
+// CHECK:         %[[LXSU_LX:.*]] = uniform.query_map(map:%[[LXSU_LX_MAP]], key:%[[LXSU_ARG]]) : index
+// CHECK:         %[[LXSU_VIEW:.*]] = dataflow.get_logical_memory_view %[[LXSU_LX]], %[[C65536]] {layout_map = #[[$ATTR_3]]} : index, index, memref<2x1x64xf16>
+// CHECK:         scf.for %[[LXSU_IV:.*]] = %[[C0]] to %[[C256]] step %[[C1]] {
+// CHECK:           %[[RECV_MAP3:.*]] = uniform.def_immutable_mapping({{\[}}%[[LXSU0]] -> %[[SFP0]]], {{\[}}%[[LXSU1]] -> %[[SFP1]]]):index
+// CHECK:           %[[RECV_SRC3:.*]] = uniform.query_map(map:%[[RECV_MAP3]], key:%[[LXSU_ARG]]) : index
+// CHECK:           %[[RECV3:.*]] = dataflow.receive %[[RECV_SRC3]] : vector<64xf16>
+// CHECK:           agen.vector_store %[[RECV3]], %[[LXSU_VIEW]][0, 0, 0] {{.*}} : memref<2x1x64xf16>, vector<64xf16>
+// CHECK:         }
+// CHECK:       }
 
 
 
@@ -108,7 +114,6 @@ module {
 
     %c0  = arith.constant 0 : index
     %c1  = arith.constant 1 : index
-    %c255 = arith.constant 255 : index
     %c256 = arith.constant 256 : index
 
     // Query maps for each unit type (corelet-indexed)
@@ -139,26 +144,25 @@ module {
         }
       }
 
-      // SFP execute_on: receive from LXLU FIFO, accumulate, send to LXSU FIFO on last iter
+      // SFP execute_on: receive from LXLU FIFO, accumulate into the register-file
+      // buffer, send to LXSU FIFO every iteration
       ktdf_lowering.execute_on %sfp_q {
-        %init = tensor.empty() : tensor<1x64xf16>
-        %result = scf.for %iv = %c0 to %c256 step %c1 iter_args(%acc = %init) -> (tensor<1x64xf16>) {
+        %acc = memref.alloc() : memref<1x64xf16, "SFU_REG">
+        %zero = arith.constant 0.0 : f16
+        linalg.fill ins(%zero : f16) outs(%acc : memref<1x64xf16, "SFU_REG">)
+        scf.for %iv = %c0 to %c256 step %c1 {
           %chunk = ktdf.read_from_fifo %fifo_lxlu_sfp
-            : <"LXLU" -> "SFP", 64xf16> -> tensor<1x1x64xf16>
-          %reduced = linalg.generic {
+            : <"LXLU" -> "SFP", 64xf16> -> memref<1x1x64xf16>
+          linalg.generic {
             indexing_maps = [#map, #map1],
             iterator_types = ["parallel", "reduction", "parallel"]
-          } ins(%chunk : tensor<1x1x64xf16>) outs(%acc : tensor<1x64xf16>) {
+          } ins(%chunk : memref<1x1x64xf16>) outs(%acc : memref<1x64xf16, "SFU_REG">) {
           ^bb0(%in: f16, %out: f16):
             %s = arith.addf %in, %out : f16
             linalg.yield %s : f16
-          } -> tensor<1x64xf16>
-          %is_last = arith.cmpi eq, %iv, %c255 : index
-          scf.if %is_last {
-            ktdf.write_to_fifo %reduced, %fifo_sfp_lxsu
-              : tensor<1x64xf16>, <"SFP" -> "LXSU", 64xf16>
           }
-          scf.yield %reduced : tensor<1x64xf16>
+          ktdf.write_to_fifo %acc, %fifo_sfp_lxsu
+            : memref<1x64xf16, "SFU_REG">, <"SFP" -> "LXSU", 64xf16>
         }
       }
 
@@ -167,12 +171,9 @@ module {
       %lx_out = builtin.unrealized_conversion_cast %lx_out_offset : index to memref<2x1x64xf16, "LX">
       ktdf_lowering.execute_on %lxsu_q {
         scf.for %iv = %c0 to %c256 step %c1 {
-          %is_last = arith.cmpi eq, %iv, %c255 : index
-          scf.if %is_last {
-            ktdf.data_transfer from %fifo_sfp_lxsu size [64]
-              to %lx_out[0, 0, 0] size [1, 1, 64]
-              : !ktdf.fifo.slot<"SFP" -> "LXSU", 64xf16>, memref<2x1x64xf16, "LX">
-          }
+          ktdf.data_transfer from %fifo_sfp_lxsu size [64]
+            to %lx_out[0, 0, 0] size [1, 1, 64]
+            : !ktdf.fifo.slot<"SFP" -> "LXSU", 64xf16>, memref<2x1x64xf16, "LX">
         }
       }
     }
