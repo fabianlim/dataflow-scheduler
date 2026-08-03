@@ -22,6 +22,7 @@
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
 #include "dataflow-scheduler/Dialect/Agen/Agen.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
+#include "dataflow-scheduler/Dialect/Dataflow/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
@@ -161,6 +162,7 @@ mlir::Value scheduler::createQueryMapForComponent(
     auto core_attr = get_unit->getAttrOfType<mlir::IntegerAttr>("core");
     assert(core_attr && "dataflow.get_unit must have 'core' attribute");
     int core = static_cast<int>(core_attr.getInt());
+    int corelet = mlir::dataflow::getCoreletId(get_unit);
 
     mlir::Value matching_target;
     for (mlir::Value target : target_units) {
@@ -172,10 +174,13 @@ mlir::Value scheduler::createQueryMapForComponent(
           target_get_unit->getAttrOfType<mlir::IntegerAttr>("core");
       assert(target_core_attr &&
              "target dataflow.get_unit must have 'core' attribute");
-      if (static_cast<int>(target_core_attr.getInt()) == core) {
-        matching_target = target;
-        break;
-      }
+      if (static_cast<int>(target_core_attr.getInt()) != core) continue;
+      // When the source unit has a corelet, the target must match it so that
+      // each src corelet maps to its own dst corelet (not always corelet 0).
+      int target_corelet = mlir::dataflow::getCoreletId(target_get_unit);
+      if (corelet >= 0 && target_corelet != corelet) continue;
+      matching_target = target;
+      break;
     }
 
     assert(matching_target &&
