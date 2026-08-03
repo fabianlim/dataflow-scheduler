@@ -65,7 +65,15 @@ bool onlyDeallocUses(mlir::Value val) {
 /// casts.
 /// - Prune Source B casts whose only uses are memref.dealloc (delete cast +
 /// deallocs). Returns the set of needed memory space attributes.
-llvm::SetVector<ResourceType> discoverAndPrune(mlir::func::FuncOp func) {
+///
+/// Compute-unit-local spaces (memory-tree depth >= 2) are deliberately not
+/// collected: they get no logical memory view, because the compute unit that
+/// owns them resolves its own handle via dataflow.get_local_unit. Their cast
+/// survives into the operation lowerings, which read the assigned offset from
+/// it.
+llvm::SetVector<ResourceType> discoverAndPrune(
+    mlir::func::FuncOp func,
+    const scheduler::arch_view::MemoryTree& memory_tree) {
   llvm::SetVector<ResourceType> needed;
 
   func.walk([&](mlir::dataflow::ProgramUnitOp pu) {
@@ -96,7 +104,7 @@ llvm::SetVector<ResourceType> discoverAndPrune(mlir::func::FuncOp func) {
 
         if (onlyDeallocUses(ucc.getOutputs()[0])) {
           to_prune.push_back(op);
-        } else {
+        } else if (!memory_tree.isBelowScratchPad(*ms)) {
           needed.insert(*ms);
         }
       }
@@ -138,6 +146,9 @@ mlir::LogicalResult buildResolvedUnits(
       resolved_units[ms] = it->second;
     } else if (memory_tree.isPerCoreScratchPadMemory(ms)) {
       per_core.insert(ms);
+    } else if (memory_tree.isBelowScratchPad(ms)) {
+      // Compute-unit-local memory: no unit to resolve. The owning compute unit
+      // is its own handle (dataflow.get_local_unit), so no view is built here.
     }
   }
 
@@ -299,9 +310,14 @@ mlir::LogicalResult replaceSourceAChains(
 
 /// Phase 3c: replace Source B unrealized_conversion_casts with
 /// get_logical_memory_view. Dealloc-only casts were pruned in Phase 1.
+///
+/// Casts into compute-unit-local memory are left in place: no view is built for
+/// them and they are not pruned, since the operation lowerings recover the
+/// assigned offset from the cast operand.
 mlir::LogicalResult replaceSourceBCasts(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::DenseMap<ResourceType, mlir::Value>& resolved_units,
+    const scheduler::arch_view::MemoryTree& memory_tree,
     llvm::DenseMap<mlir::Value, mlir::Value>& replacements,
     mlir::OpBuilder& builder) {
   auto* ctx = pu.getContext();
@@ -312,7 +328,11 @@ mlir::LogicalResult replaceSourceBCasts(
         !mlir::isa<mlir::IndexType>(ucc.getInputs()[0].getType()))
       return;
     if (ucc.getOutputs().size() != 1) return;
-    if (!getMemorySpaceAttr(ucc.getOutputs()[0].getType())) return;
+    auto ms = getMemorySpaceAttr(ucc.getOutputs()[0].getType());
+    if (!ms) return;
+    // Compute-unit-local memory gets no view; leave the cast untouched so the
+    // operation lowerings can read the assigned offset off it.
+    if (memory_tree.isBelowScratchPad(*ms)) return;
     casts.push_back(ucc);
   });
 
@@ -426,7 +446,7 @@ mlir::LogicalResult scheduler::buildLogicalMemoryViews(
   LDBG(1) << "buildLogicalMemoryViews on " << func.getName();
 
   // Phase 1: discover needed memory spaces and prune dealloc-only casts.
-  auto needed_spaces = discoverAndPrune(func);
+  auto needed_spaces = discoverAndPrune(func, memory_tree);
   if (needed_spaces.empty()) {
     LDBG(1) << "  No memory spaces found; skipping";
     return mlir::success();
@@ -483,8 +503,8 @@ mlir::LogicalResult scheduler::buildLogicalMemoryViews(
       return mlir::failure();
 
     // Phase 3c: Source B casts.
-    if (mlir::failed(
-            replaceSourceBCasts(pu, resolved_units, replacements, builder)))
+    if (mlir::failed(replaceSourceBCasts(pu, resolved_units, memory_tree,
+                                         replacements, builder)))
       return mlir::failure();
 
     // Phase 3d: RAUW + type propagation.

@@ -150,6 +150,11 @@ mlir::LogicalResult UnitMaterializer::materializeMemoryUnits(
         LDBG(1) << "  Created per-core memory unit for " << space_name
                 << " core " << core;
       }
+    } else if (memory_tree.isBelowScratchPad(mspace_attr)) {
+      // Compute-unit-local memory: no memory unit to materialize. Access is
+      // always from the owning compute unit itself, resolved via
+      // dataflow.get_local_unit.
+      LDBG(1) << "  Skipping compute-unit-local memory " << space_name;
     } else {
       return func_.emitError("Unknown memory space classification for: ")
              << space_name;
