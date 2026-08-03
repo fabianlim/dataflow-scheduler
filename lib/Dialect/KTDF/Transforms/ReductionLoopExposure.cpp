@@ -39,11 +39,11 @@
 //      - tensor.empty is emitted before the loop (accumulator init).
 //      - The loop carries the accumulator as iter_args.
 //      - The original linalg.generic is cloned inside the loop via IRMapping.
-//      - write_to_fifo is wrapped in scf.if (%r == R-1).
+//      - write_to_fifo is emitted unconditionally every iteration.
 //      - The loop is tagged {loop_type = reduction_loop}.
-//   9. Find the conditional-store stage (downstream of compute via
-//      depends_out/depends_in token chain).  Wrap its data_transfer in
-//      scf.if (%r == R-1) inside the already-created scf.for.
+//   9. Find the store stage (downstream of compute via depends_out/depends_in
+//      token chain).  Its data_transfer runs unconditionally every iteration
+//      (LXSU overwrites the same address; last write wins = final result).
 //
 //===----------------------------------------------------------------------===//
 
@@ -362,6 +362,23 @@ struct ReductionLoopExposurePass
             for (int64_t s : *sizes) new_sizes.push_back(s / reduction_size);
             dt.setStaticDestSizesAttr(DenseI64ArrayAttr::get(ctx, new_sizes));
           }
+          // Also patch source_sizes when source is a memref (not a FIFO).
+          // The reduction dimension is baked into the memref source sizes and
+          // must be divided now that the transfer runs once per iteration.
+          if (!dt.isSourceFifo()) {
+            if (auto sizes = dt.getStaticSourceSizes()) {
+              SmallVector<int64_t> new_sizes(sizes->begin(), sizes->end());
+              for (int64_t i = 0; i < static_cast<int64_t>(new_sizes.size());
+                   ++i) {
+                if (new_sizes[i] == reduction_size) {
+                  new_sizes[i] = 1;
+                  break;
+                }
+              }
+              dt.setStaticSourceSizesAttr(
+                  DenseI64ArrayAttr::get(ctx, new_sizes));
+            }
+          }
         }
       }
       // Check if the source FIFO was shrunken.
@@ -385,13 +402,11 @@ struct ReductionLoopExposurePass
     Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
     Value c1 = arith::ConstantIndexOp::create(rewriter, loc, 1);
     Value c_red = arith::ConstantIndexOp::create(rewriter, loc, reduction_size);
-    Value c_last =
-        arith::ConstantIndexOp::create(rewriter, loc, reduction_size - 1);
 
     // -----------------------------------------------------------------------
-    // 3. Find the "conditional store" stage: the sibling stage whose
-    //    depends_in includes a token that the compute stage lists in
-    //    depends_out.  Its data_transfer must be guarded by scf.if (r==R-1).
+    // 3. Find the store stage: the sibling stage whose depends_in includes a
+    //    token that the compute stage lists in depends_out.  Its data_transfer
+    //    runs unconditionally every iteration (last write wins).
     // -----------------------------------------------------------------------
     ktdf::StageOp conditional_store_stage;
     for (Value tok : compute_stage.getDependsOut()) {
@@ -413,10 +428,11 @@ struct ReductionLoopExposurePass
       if (stage == compute_stage) {
         rewriteComputeStage(rewriter, loc, ctx, stage, generic_op,
                             one_row_tensor_type, output_tensor_type, fifo_in,
-                            fifo_out, c0, c1, c_red, c_last);
+                            fifo_out, c0, c1, c_red);
       } else if (stage == conditional_store_stage) {
-        rewriteConditionalStoreStage(rewriter, loc, stage, c0, c1, c_red,
-                                     c_last);
+        rewriteConditionalStoreStage(rewriter, loc, stage, c0, c1, c_red);
+      } else if (stage == load_stage) {
+        rewriteLoadStage(rewriter, loc, stage, c0, c1, c_red, reduction_size);
       } else {
         rewritePlainStage(rewriter, loc, stage, c0, c1, c_red);
       }
@@ -446,21 +462,95 @@ struct ReductionLoopExposurePass
   }
 
   // -------------------------------------------------------------------------
+  // Rewrite the load stage: same as plain (wrap in scf.for), but also
+  // patch the source_map of any memref-to-FIFO data_transfer to use the
+  // loop IV at the reduction-dimension position.
+  //
+  // The source subscript is encoded as an AffineMap (source_map) over the
+  // source_indices SSA operands.  E.g. source_map = (d0) -> (d0, 0, 0, 0)
+  // with one SSA operand.  After the fix: (d0, d1) -> (d0, 0, d1, 0) with
+  // the loop IV appended to source_indices.
+  // -------------------------------------------------------------------------
+  void rewriteLoadStage(IRRewriter& rewriter, Location loc,
+                        ktdf::StageOp stage, Value c0, Value c1, Value c_red,
+                        int64_t reduction_size) {
+    Block* body = stage.getBody();
+
+    // Collect all existing ops (snapshot before insertion).
+    SmallVector<Operation*> ops;
+    for (auto& op : *body) ops.push_back(&op);
+
+    rewriter.setInsertionPointToStart(body);
+    auto red_for = scf::ForOp::create(rewriter, loc, c0, c_red, c1);
+
+    // Move all original ops into the loop body, before the terminator.
+    Operation* loop_term = red_for.getBody()->getTerminator();
+    for (auto* op : ops) op->moveBefore(loop_term);
+
+    // Patch source_map: for each memref-to-FIFO data_transfer, add the loop
+    // IV as a new dimension in the affine map at the reduction-dim result
+    // position.
+    Value iv = red_for.getInductionVar();
+    MLIRContext* ctx = rewriter.getContext();
+    red_for.getBody()->walk([&](ktdf::DataTransferOp dt) {
+      if (!dt.isSourceMemRef() || !dt.isDestFifo()) return WalkResult::advance();
+
+      // Identify the reduction dim in the source memref shape.
+      auto src_memref_type = cast<MemRefType>(dt.getSource().getType());
+      ArrayRef<int64_t> shape = src_memref_type.getShape();
+      int64_t red_idx = -1;
+      for (int64_t i = 0; i < static_cast<int64_t>(shape.size()); ++i) {
+        if (shape[i] == reduction_size) {
+          red_idx = i;
+          break;
+        }
+      }
+      if (red_idx < 0) return WalkResult::advance();
+
+      // Get the current source_map. It has N input dims mapping to M results.
+      // We add one more input dim (for the loop IV) and replace result[red_idx]
+      // with that new dim.
+      auto map_attr = dt.getSourceMapAttr();
+      if (!map_attr) return WalkResult::advance();
+      AffineMap old_map = map_attr.getValue();
+      unsigned num_dims = old_map.getNumDims();
+      unsigned new_dim_pos = num_dims;  // new dim at the end
+
+      // Build new result expressions: replace the constant-0 at red_idx with
+      // the new dimension.
+      SmallVector<AffineExpr> new_results;
+      for (unsigned i = 0; i < old_map.getNumResults(); ++i) {
+        if (static_cast<int64_t>(i) == red_idx) {
+          new_results.push_back(getAffineDimExpr(new_dim_pos, ctx));
+        } else {
+          new_results.push_back(old_map.getResult(i));
+        }
+      }
+      AffineMap new_map = AffineMap::get(num_dims + 1, old_map.getNumSymbols(),
+                                         new_results, ctx);
+      dt.setSourceMapAttr(AffineMapAttr::get(new_map));
+
+      // Append the loop IV to source_indices operands.
+      dt.getSourceIndicesMutable().append(iv);
+
+      return WalkResult::advance();
+    });
+  }
+
+  // -------------------------------------------------------------------------
   // Rewrite the compute stage:
   //   %empty = tensor.empty()  : output_tensor_type          (before loop)
   //   scf.for %r = 0 to R iter_args(%carry = %empty)
   //       {loop_type = reduction_loop}
-  //     <all original body ops, but read_from_fifo gets new result type
-  //      and linalg.generic is recloned with updated operands>
-  //     if (%r == R-1): write_to_fifo %updated_carry, fifo_out
+  //     <read_from_fifo one slice, linalg.generic accumulates into carry>
+  //     write_to_fifo %updated_carry, fifo_out   (unconditional every iter)
   //     scf.yield %updated_carry
   // -------------------------------------------------------------------------
   void rewriteComputeStage(IRRewriter& rewriter, Location loc, MLIRContext* ctx,
                            ktdf::StageOp stage, linalg::GenericOp generic_op,
                            RankedTensorType one_row_tensor_type,
                            RankedTensorType output_tensor_type, Value fifo_in,
-                           Value fifo_out, Value c0, Value c1, Value c_red,
-                           Value c_last) {
+                           Value fifo_out, Value c0, Value c1, Value c_red) {
     Block* body = stage.getBody();
 
     // Collect existing ops to erase after the rewrite.
@@ -492,16 +582,10 @@ struct ReductionLoopExposurePass
               b.clone(*generic_op.getOperation(), mapping));
           Value updated_carry = new_generic.getResult(0);
 
-          // On the last iteration, write the accumulated result to fifo_out.
-          Value is_last =
-              arith::CmpIOp::create(b, l, arith::CmpIPredicate::eq, iv, c_last);
-          auto if_op = scf::IfOp::create(b, l, TypeRange{}, is_last,
-                                         /*withElseRegion=*/false);
-          {
-            OpBuilder then_b =
-                OpBuilder::atBlockBegin(&if_op.getThenRegion().front());
-            ktdf::WriteToFifoOp::create(then_b, l, updated_carry, fifo_out);
-          }
+          // Write the partial accumulator to fifo_out every iteration.
+          // LXSU overwrites the same address each iteration; last write wins.
+          // FIFO send/receive must be unconditional and balanced every iteration.
+          ktdf::WriteToFifoOp::create(b, l, updated_carry, fifo_out);
 
           scf::YieldOp::create(b, l, ValueRange{updated_carry});
         });
@@ -515,23 +599,18 @@ struct ReductionLoopExposurePass
   }
 
   // -------------------------------------------------------------------------
-  // Rewrite the conditional-store stage:
+  // Rewrite the store stage:
   //   scf.for %r = 0 to R
-  //     <all original body ops except the data_transfer>
-  //     if (%r == R-1):
-  //       <the data_transfer>
+  //     <all original body ops including the data_transfer — unconditional>
+  //
+  // The data_transfer runs every iteration (LXSU overwrites the same LX
+  // address; last write wins = final sum).  FIFO send/receive must be
+  // unconditional and balanced every iteration to avoid hardware deadlock.
   // -------------------------------------------------------------------------
   void rewriteConditionalStoreStage(IRRewriter& rewriter, Location loc,
                                     ktdf::StageOp stage, Value c0, Value c1,
-                                    Value c_red, Value c_last) {
+                                    Value c_red) {
     Block* body = stage.getBody();
-
-    // Find the data_transfer that must be conditioned.
-    ktdf::DataTransferOp transfer;
-    body->walk([&](ktdf::DataTransferOp dt) {
-      transfer = dt;
-      return WalkResult::interrupt();
-    });
 
     // Collect all existing ops.
     SmallVector<Operation*> all_ops;
@@ -541,20 +620,8 @@ struct ReductionLoopExposurePass
     auto red_for = scf::ForOp::create(rewriter, loc, c0, c_red, c1);
     Operation* loop_term = red_for.getBody()->getTerminator();
 
-    // Move all ops into the loop body.
+    // Move all ops into the loop body unconditionally.
     for (auto* op : all_ops) op->moveBefore(loop_term);
-
-    if (!transfer) return;  // no transfer found — nothing to guard
-
-    // Wrap just the data_transfer in scf.if (%r == R-1).
-    rewriter.setInsertionPoint(transfer);
-    Value is_last =
-        arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq,
-                              red_for.getInductionVar(), c_last);
-    auto if_op = scf::IfOp::create(rewriter, loc, TypeRange{}, is_last,
-                                   /*withElseRegion=*/false);
-    // Move the transfer inside the then-block.
-    transfer->moveBefore(if_op.getThenRegion().front().getTerminator());
   }
 };
 

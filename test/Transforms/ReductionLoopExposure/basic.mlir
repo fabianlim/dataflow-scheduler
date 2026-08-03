@@ -53,7 +53,6 @@
 // CHECK-NEXT:              %[[CONSTANT_4:.*]] = arith.constant 0 : index
 // CHECK-NEXT:              %[[CONSTANT_5:.*]] = arith.constant 1 : index
 // CHECK-NEXT:              %[[CONSTANT_6:.*]] = arith.constant 256 : index
-// CHECK-NEXT:              %[[CONSTANT_7:.*]] = arith.constant 255 : index
 
 // Inner ktdf.private — input FIFO shrunk from 16384 to 64 elements (R=256 divides it).
 // CHECK:                 ktdf.pipeline {
@@ -65,16 +64,16 @@
 // CHECK-NEXT:                ktdf.private_yield %[[FIFO_0]], %[[FIFO_1]], %[[CREATE_TOKEN_2]], %[[CREATE_TOKEN_3]] : !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, !ktdf.token, !ktdf.token
 // CHECK-NEXT:              }
 
-// L1LU stage: plain scf.for over R; data_transfer dest size patched from 16384 to 64.
+// L1LU stage: scf.for over R; source_map updated to use loop IV at reduction dim; sizes patched.
 // CHECK:                   ktdf.stage depends_in(none) depends_out(%[[VAL_4:.*]]#2) {
 // CHECK-NEXT:                scf.for %[[VAL_5:.*]] = %[[CONSTANT_4]] to %[[CONSTANT_6]] step %[[CONSTANT_5]] {
 // CHECK-NEXT:                  %[[SUBI_1:.*]] = arith.subi %[[VAL_3]], %[[CONSTANT_0]] : index
 // CHECK-NEXT:                  %[[DIVSI_1:.*]] = arith.divsi %[[SUBI_1]], %[[CONSTANT_1]] : index
-// CHECK-NEXT:                  ktdf.data_transfer from %[[VAL_2]]#0{{\[}}%[[DIVSI_1]], 0, 0, 0] size [1, 1, 256, 64] to %[[VAL_4]]#0 size [64] : memref<2x1x256x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+// CHECK-NEXT:                  ktdf.data_transfer from %[[VAL_2]]#0{{\[}}%[[DIVSI_1]], 0, %[[VAL_5]], 0] size [1, 1, 1, 64] to %[[VAL_4]]#0 size [64] : memref<2x1x256x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
 // CHECK-NEXT:                }
 // CHECK-NEXT:              } {applicable_units = ["L1LU"]}
 
-// SFU stage: tensor.empty init + reduction scf.for with iter_args; write_to_fifo only on last iteration.
+// SFU stage: tensor.empty init + reduction scf.for with iter_args; write_to_fifo unconditional every iteration.
 // CHECK:                   ktdf.stage depends_in(%[[VAL_6:.*]]#2) depends_out(%[[VAL_6]]#3) {
 // CHECK-NEXT:                %[[EMPTY_0:.*]] = tensor.empty() : tensor<1x64xf16>
 // CHECK-NEXT:                %[[FOR_0:.*]] = scf.for %[[VAL_7:.*]] = %[[CONSTANT_4]] to %[[CONSTANT_6]] step %[[CONSTANT_5]] iter_args(%[[VAL_8:.*]] = %[[EMPTY_0]]) -> (tensor<1x64xf16>) {
@@ -84,23 +83,17 @@
 // CHECK-NEXT:                    %[[ADDF_0:.*]] = arith.addf %[[VAL_9]], %[[VAL_10]] : f16
 // CHECK-NEXT:                    linalg.yield %[[ADDF_0]] : f16
 // CHECK-NEXT:                  } -> tensor<1x64xf16>
-// CHECK-NEXT:                  %[[CMPI_0:.*]] = arith.cmpi eq, %[[VAL_7]], %[[CONSTANT_7]] : index
-// CHECK-NEXT:                  scf.if %[[CMPI_0]] {
-// CHECK-NEXT:                    ktdf.write_to_fifo %[[GENERIC_0]], %[[VAL_6]]#1 : tensor<1x64xf16>, <"SFU" -> "L1SU", 64xf16>
-// CHECK-NEXT:                  }
+// CHECK-NEXT:                  ktdf.write_to_fifo %[[GENERIC_0]], %[[VAL_6]]#1 : tensor<1x64xf16>, <"SFU" -> "L1SU", 64xf16>
 // CHECK-NEXT:                  scf.yield %[[GENERIC_0]] : tensor<1x64xf16>
 // CHECK-NEXT:                } {loop_type = #ktdf.loop_type<reduction_loop>}
 // CHECK-NEXT:              } {applicable_units = ["SFU"]}
 
-// L1SU stage: scf.for over R; data_transfer guarded behind scf.if on the last iteration.
+// L1SU stage: scf.for over R; data_transfer unconditional every iteration (last write wins).
 // CHECK:                   ktdf.stage depends_in(%[[VAL_11:.*]]#3) depends_out(none) {
 // CHECK-NEXT:                scf.for %[[VAL_12:.*]] = %[[CONSTANT_4]] to %[[CONSTANT_6]] step %[[CONSTANT_5]] {
 // CHECK-NEXT:                  %[[SUBI_2:.*]] = arith.subi %[[VAL_3]], %[[CONSTANT_0]] : index
 // CHECK-NEXT:                  %[[DIVSI_2:.*]] = arith.divsi %[[SUBI_2]], %[[CONSTANT_1]] : index
-// CHECK-NEXT:                  %[[CMPI_1:.*]] = arith.cmpi eq, %[[VAL_12]], %[[CONSTANT_7]] : index
-// CHECK-NEXT:                  scf.if %[[CMPI_1]] {
-// CHECK-NEXT:                    ktdf.data_transfer from %[[VAL_11]]#1 size [64] to %[[VAL_2]]#1{{\[}}%[[DIVSI_2]], 0, 0] size [1, 1, 64] : !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, memref<2x1x64xf16, "L1">
-// CHECK-NEXT:                  }
+// CHECK-NEXT:                  ktdf.data_transfer from %[[VAL_11]]#1 size [64] to %[[VAL_2]]#1{{\[}}%[[DIVSI_2]], 0, 0] size [1, 1, 64] : !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, memref<2x1x64xf16, "L1">
 // CHECK-NEXT:                }
 // CHECK-NEXT:              } {applicable_units = ["L1SU"]}
 // CHECK-NEXT:            }
