@@ -69,11 +69,9 @@ struct LowerReadFromFifoPattern
     auto fifo_slot_type =
         llvm::cast<mlir::ktdf::FifoSlotType>(read_op.getFifoSlot().getType());
 
-    // Get the result tensor type
-    auto result_type = llvm::cast<mlir::RankedTensorType>(read_op.getType());
-
-    // Convert tensor to flattened vector type
-    auto vector_type = getFlattenedVectorType(result_type, resource_kinds_);
+    // Convert result type (tensor or memref) to flattened vector type
+    auto vector_type =
+        getFlattenedVectorType(read_op.getType(), resource_kinds_);
     if (!vector_type) {
       return mlir::failure();
     }
@@ -151,9 +149,22 @@ struct LowerWriteToFifoPattern
     }
     mlir::Value queried_unit = *queried_unit_result;
 
+    // A buffer operand (e.g. a reduction accumulator) has to be read into a
+    // vector before it can be sent; a tensor or vector operand is already the
+    // value to send.
+    mlir::Value data = write_op.getData();
+    if (mlir::isa<mlir::MemRefType>(data.getType())) {
+      if (mlir::failed(scheduler::resolveComputeUnitLocalBuffer(write_op, data,
+                                                                rewriter)))
+        return mlir::failure();
+      rewriter.setInsertionPoint(write_op);
+      data = scheduler::emitVectorLoad(rewriter, write_op.getLoc(), vector_type,
+                                       data);
+    }
+
     // Create dataflow.send operation
     mlir::dataflow::SendOp::create(rewriter, write_op.getLoc(), queried_unit,
-                                   write_op.getData(), /*dir=*/nullptr,
+                                   data, /*dir=*/nullptr,
                                    /*dbgName=*/nullptr);
 
     // Erase the write_to_fifo operation
@@ -401,7 +412,7 @@ mlir::LogicalResult scheduler::runOperationLowerings(
                                          components);
   patterns.add<LowerWriteToFifoPattern>(func.getContext(), resource_kinds,
                                         components);
-  populateDataTransferLoweringPatterns(patterns, components);
+  populateDataTransferLoweringPatterns(patterns, components, resource_kinds);
   patterns.add<LowerSignalPattern>(func.getContext(), scheduler_ctx,
                                    components);
   patterns.add<LowerGetTileSizePattern>(func.getContext(), scheduler_ctx,

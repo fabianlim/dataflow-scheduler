@@ -72,6 +72,78 @@ def StageCoarseningPass : Pass<"stage-coarsening", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::ktdf::KTDFDialect"];
 }
 
+def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"> {
+  let summary = "Expose the reduction loop of a linalg.generic as an explicit scf.for with a loop-carry accumulator";
+  let description = [{
+    Walks the module for any ktdf.stage that contains a linalg.generic with a
+    reduction iterator (the compute stage).  For each one found it rewrites the
+    parent ktdf.pipeline so that the reduction becomes an explicit scf.for loop:
+
+    Before (StageCoarsening output):
+
+      ktdf.private: [fifo_in(R*C elements), fifo_out(C elements), ...]
+
+      load stage:    data_transfer  LX -> fifo_in   (full R*C slice)
+      compute stage: read_from_fifo -> tensor<1xRxCxf16>
+                     linalg.generic (reduction) -> tensor<1xCxf16>
+                     write_to_fifo
+      store stage:   data_transfer  fifo_out -> LX
+
+    After:
+
+      ktdf.private: all FifoSlotType results whose element count is a
+                    multiple of R are shrunk by dividing by R.
+                    (e.g. fifo_in: R*C -> C elements)
+
+      load stage:    scf.for %r = 0 to R           -- all original ops inside
+                       data_transfer LX -> fifo_in  (static dest size / R)
+      compute stage: %acc = memref.alloc : memref<1xCxf16, "SFU_REG">
+                     linalg.fill ins(0) outs(%acc)
+                     scf.for %r = 0 to R           {loop_type = reduction_loop}
+                       slice = read_from_fifo -> memref<1x1xCxf16>
+                       linalg.generic ins(slice) outs(%acc)   -- in place
+                       write_to_fifo %acc
+      store stage:   scf.for %r = 0 to R           -- all original ops inside
+                       data_transfer fifo_out -> LX
+
+    The accumulator is allocated here, before address assignment, so that it
+    is given a physical offset in the compute unit's register file.  Because it
+    is a buffer, the linalg.generic has buffer semantics and no result, so the
+    loop needs no iter_args.
+
+    Any data_transfer in any stage whose source or destination is a shrunken
+    FIFO has its static sizes divided by R automatically.
+
+    Stage identification is structural, not string-based:
+    - Load stage:    the sibling whose depends_out token matches the compute
+                     stage's depends_in token; must have exactly one
+                     FIFO-dest data_transfer (fails with error if > 1).
+    - Compute stage: contains a linalg.generic with a reduction iterator.
+    - Store stage:   the sibling whose depends_in token matches the compute
+                     stage's depends_out token (SSA identity check).
+    - All other stages: wrapped verbatim in scf.for, nothing else modified.
+
+    Preconditions (checked; pass skips cleanly if not met):
+    - A ktdf.stage somewhere in the module contains a linalg.generic with
+      at least one statically-sized reduction iterator.
+    - That stage is a direct child of a ktdf.pipeline with a ktdf.private.
+    - At least one FifoSlotType result in ktdf.private has element count
+      divisible by R (used to identify and shrink participating FIFOs).
+    - The load stage has exactly one FIFO-dest data_transfer; the compute
+      stage has exactly one write_to_fifo.
+  }];
+  let constructor = "::mlir::ktdf::createReductionLoopExposurePass()";
+  let dependentDialects = [
+    "mlir::ktdf::KTDFDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
+
+
 def SubsumeLinearizeIndexPass : Pass<"subsume-linearize-index", "mlir::ModuleOp"> {
   let summary = "Fold ktdf.tiling.linearize_index into ktdf.data_transfer affine maps";
   let description = [{

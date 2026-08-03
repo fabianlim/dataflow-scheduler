@@ -36,6 +36,8 @@ namespace mlir::ktdf {
 
 auto createBroadcastPromotionPass() -> std::unique_ptr<Pass>;
 
+auto createReductionLoopExposurePass() -> std::unique_ptr<Pass>;
+
 auto createStageCoarseningPass() -> std::unique_ptr<Pass>;
 
 auto createSubsumeLinearizeIndexPass() -> std::unique_ptr<Pass>;

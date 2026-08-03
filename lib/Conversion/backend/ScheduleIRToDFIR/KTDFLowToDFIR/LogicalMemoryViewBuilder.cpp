@@ -65,7 +65,15 @@ bool onlyDeallocUses(mlir::Value val) {
 /// casts.
 /// - Prune Source B casts whose only uses are memref.dealloc (delete cast +
 /// deallocs). Returns the set of needed memory space attributes.
-llvm::SetVector<ResourceType> discoverAndPrune(mlir::func::FuncOp func) {
+///
+/// Compute-unit-local spaces (memory-tree depth >= 2) are deliberately not
+/// collected: they get no logical memory view, because the compute unit that
+/// owns them resolves its own handle via dataflow.get_local_unit. Their cast
+/// survives into the operation lowerings, which read the assigned offset from
+/// it.
+llvm::SetVector<ResourceType> discoverAndPrune(
+    mlir::func::FuncOp func,
+    const scheduler::arch_view::MemoryTree& memory_tree) {
   llvm::SetVector<ResourceType> needed;
 
   func.walk([&](mlir::dataflow::ProgramUnitOp pu) {
@@ -96,7 +104,7 @@ llvm::SetVector<ResourceType> discoverAndPrune(mlir::func::FuncOp func) {
 
         if (onlyDeallocUses(ucc.getOutputs()[0])) {
           to_prune.push_back(op);
-        } else {
+        } else if (!memory_tree.isBelowScratchPad(*ms)) {
           needed.insert(*ms);
         }
       }
@@ -138,6 +146,9 @@ mlir::LogicalResult buildResolvedUnits(
       resolved_units[ms] = it->second;
     } else if (memory_tree.isPerCoreScratchPadMemory(ms)) {
       per_core.insert(ms);
+    } else if (memory_tree.isBelowScratchPad(ms)) {
+      // Compute-unit-local memory: no unit to resolve. The owning compute unit
+      // is its own handle (dataflow.get_local_unit), so no view is built here.
     }
   }
 
@@ -165,6 +176,11 @@ mlir::AffineMap buildLinearizationMap(mlir::MLIRContext* ctx,
 /// Phase 3b: replace Source A chains with get_logical_memory_view.
 /// Emits the view op and RAUWs the memref.cast result inline; does not
 /// populate `replacements` (Source A handles its own erasure).
+///
+/// A single ktdp.construct_memory_view may feed multiple memory_space_cast /
+/// reinterpret_cast chains (one per access-tile offset computed from the same
+/// base view). All such chains are replaced before the cmv is erased to avoid
+/// dangling uses.
 mlir::LogicalResult replaceSourceAChains(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::DenseMap<ResourceType, mlir::Value>& resolved_units,
@@ -177,32 +193,6 @@ mlir::LogicalResult replaceSourceAChains(
       [&](mlir::ktdp::ConstructMemoryViewOp cmv) { chains.push_back(cmv); });
 
   for (auto cmv : chains) {
-    // Find memory_space_cast user.
-    mlir::memref::MemorySpaceCastOp msc;
-    for (auto* user : cmv.getResult().getUsers()) {
-      msc = mlir::dyn_cast<mlir::memref::MemorySpaceCastOp>(user);
-      if (msc) break;
-    }
-    if (!msc)
-      return cmv.emitError(
-          "construct_memory_view: expected memory_space_cast user");
-
-    // Find reinterpret_cast user.
-    mlir::memref::ReinterpretCastOp rc;
-    for (auto* user : msc.getDest().getUsers()) {
-      rc = mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(user);
-      if (rc) break;
-    }
-    if (!rc)
-      return msc.emitError("memory_space_cast: expected reinterpret_cast user");
-
-    // Find memref.cast user (optional - may not exist).
-    mlir::memref::CastOp mc;
-    for (auto* user : rc.getResult().getUsers()) {
-      mc = mlir::dyn_cast<mlir::memref::CastOp>(user);
-      if (mc) break;
-    }
-
     // Validate static sizes.
     for (int64_t s : cmv.getStaticSizes()) {
       if (mlir::ShapedType::isDynamic(s))
@@ -218,68 +208,101 @@ mlir::LogicalResult replaceSourceAChains(
             "construct_memory_view: dynamic strides not supported");
     }
 
-    // Build layout map from static strides.
+    // Build layout map from static strides (shared by all chains off this cmv).
     auto layout_map = buildLinearizationMap(ctx, static_strides);
-
-    // Compute start_address = base_addr + reinterpret_offset, where the
-    // reinterpret offset may be a static constant OR a dynamic SSA value (e.g.
-    // a per-compute-tile offset). getConstifiedMixedOffset() yields an
-    // IntegerAttr for a static offset or the SSA Value for a dynamic one.
-    mlir::Value start_address = cmv.getOffset();
-    mlir::OpFoldResult reinterpret_offset = rc.getConstifiedMixedOffset();
-    builder.setInsertionPointAfter(rc);
-    if (auto offset_attr =
-            mlir::dyn_cast<mlir::Attribute>(reinterpret_offset)) {
-      // Static offset: add a constant, skipping the no-op zero case.
-      int64_t reinterpret_offset_val =
-          llvm::cast<mlir::IntegerAttr>(offset_attr).getInt();
-      if (reinterpret_offset_val != 0) {
-        mlir::Value offset_cst = mlir::arith::ConstantIndexOp::create(
-            builder, cmv.getLoc(), reinterpret_offset_val);
-        start_address = mlir::arith::AddIOp::create(builder, cmv.getLoc(),
-                                                    start_address, offset_cst);
-      }
-    } else {
-      // Non-constant offset: getConstifiedMixedOffset() returns an SSA Value
-      // only when the offset cannot be folded to a constant (a foldable
-      // operand would have been promoted to an IntegerAttr above). Add the
-      // runtime value directly.
-      auto offset_val = llvm::cast<mlir::Value>(reinterpret_offset);
-      start_address = mlir::arith::AddIOp::create(builder, cmv.getLoc(),
-                                                  start_address, offset_val);
-    }
-
-    // Get from_unit.
-    auto ms = getMemorySpaceAttr(msc.getDest().getType());
-    if (!ms) return msc.emitError("memory_space_cast: no memory space");
-    auto it = resolved_units.find(*ms);
-    if (it == resolved_units.end())
-      return cmv.emitError("no resolved unit for memory space");
-    mlir::Value from_unit = it->second;
-
-    // Emit get_logical_memory_view with plain result type (no memory space,
-    // no strided layout). The builder is already positioned after rc (and after
-    // any offset arithmetic just emitted), so no setInsertionPoint needed here.
     auto src_type = mlir::cast<mlir::MemRefType>(cmv.getResult().getType());
     auto plain_type =
         mlir::MemRefType::get(src_type.getShape(), src_type.getElementType());
-    auto view_op = mlir::dataflow::GetLogicalMemoryViewOp::create(
-        builder, cmv.getLoc(), plain_type, from_unit, start_address,
-        mlir::AffineMapAttr::get(layout_map));
 
-    // Replace all uses of the old chain tail with the new view.
-    // The tail is either memref.cast (if present) or reinterpret_cast.
-    if (mc) {
-      mc.getDest().replaceAllUsesWith(view_op.getData());
-      mc.erase();
-    } else {
-      rc.getResult().replaceAllUsesWith(view_op.getData());
+    // Collect all memory_space_cast users up front so we can iterate safely
+    // while modifying the use-list.
+    llvm::SmallVector<mlir::memref::MemorySpaceCastOp> msc_users;
+    for (auto* user : cmv.getResult().getUsers()) {
+      if (auto msc = mlir::dyn_cast<mlir::memref::MemorySpaceCastOp>(user))
+        msc_users.push_back(msc);
+    }
+    if (msc_users.empty())
+      return cmv.emitError(
+          "construct_memory_view: expected memory_space_cast user");
+
+    for (auto msc : msc_users) {
+      // Find reinterpret_cast user.
+      mlir::memref::ReinterpretCastOp rc;
+      for (auto* user : msc.getDest().getUsers()) {
+        rc = mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(user);
+        if (rc) break;
+      }
+      if (!rc)
+        return msc.emitError(
+            "memory_space_cast: expected reinterpret_cast user");
+
+      // Find memref.cast user (optional - may not exist).
+      mlir::memref::CastOp mc;
+      for (auto* user : rc.getResult().getUsers()) {
+        mc = mlir::dyn_cast<mlir::memref::CastOp>(user);
+        if (mc) break;
+      }
+
+      // Compute start_address = base_addr + reinterpret_offset, where the
+      // reinterpret offset may be a static constant OR a dynamic SSA value
+      // (e.g. a per-compute-tile offset). getConstifiedMixedOffset() yields an
+      // IntegerAttr for a static offset or the SSA Value for a dynamic one.
+      mlir::Value start_address = cmv.getOffset();
+      mlir::OpFoldResult reinterpret_offset = rc.getConstifiedMixedOffset();
+      builder.setInsertionPointAfter(rc);
+      if (auto offset_attr =
+              mlir::dyn_cast<mlir::Attribute>(reinterpret_offset)) {
+        // Static offset: add a constant, skipping the no-op zero case.
+        int64_t reinterpret_offset_val =
+            llvm::cast<mlir::IntegerAttr>(offset_attr).getInt();
+        if (reinterpret_offset_val != 0) {
+          mlir::Value offset_cst = mlir::arith::ConstantIndexOp::create(
+              builder, cmv.getLoc(), reinterpret_offset_val);
+          start_address = mlir::arith::AddIOp::create(
+              builder, cmv.getLoc(), start_address, offset_cst);
+        }
+      } else {
+        // Non-constant offset: getConstifiedMixedOffset() returns an SSA Value
+        // only when the offset cannot be folded to a constant (a foldable
+        // operand would have been promoted to an IntegerAttr above). Add the
+        // runtime value directly.
+        auto offset_val = llvm::cast<mlir::Value>(reinterpret_offset);
+        start_address = mlir::arith::AddIOp::create(builder, cmv.getLoc(),
+                                                    start_address, offset_val);
+      }
+
+      // Get from_unit.
+      auto ms = getMemorySpaceAttr(msc.getDest().getType());
+      if (!ms) return msc.emitError("memory_space_cast: no memory space");
+      auto it = resolved_units.find(*ms);
+      if (it == resolved_units.end())
+        return cmv.emitError("no resolved unit for memory space");
+      mlir::Value from_unit = it->second;
+
+      // Emit get_logical_memory_view with plain result type (no memory space,
+      // no strided layout). The builder is already positioned after rc (and
+      // after any offset arithmetic just emitted), so no setInsertionPoint
+      // needed here.
+      auto view_op = mlir::dataflow::GetLogicalMemoryViewOp::create(
+          builder, cmv.getLoc(), plain_type, from_unit, start_address,
+          mlir::AffineMapAttr::get(layout_map));
+
+      // Replace all uses of the old chain tail with the new view.
+      // The tail is either memref.cast (if present) or reinterpret_cast.
+      if (mc) {
+        mc.getDest().replaceAllUsesWith(view_op.getData());
+        mc.erase();
+      } else {
+        rc.getResult().replaceAllUsesWith(view_op.getData());
+      }
+
+      // Erase the now-dead chain ops for this msc: reinterpret_cast and
+      // memory_space_cast. The cmv is erased once all chains are done.
+      rc.erase();
+      msc.erase();
     }
 
-    // Erase the now-dead chain: reinterpret_cast, memory_space_cast,
-    // construct_memory_view.
-    rc.erase();
-    msc.erase();
+    // All chains sourced from this cmv have been replaced; erase it now.
     cmv.erase();
   }
   return mlir::success();
@@ -287,9 +310,14 @@ mlir::LogicalResult replaceSourceAChains(
 
 /// Phase 3c: replace Source B unrealized_conversion_casts with
 /// get_logical_memory_view. Dealloc-only casts were pruned in Phase 1.
+///
+/// Casts into compute-unit-local memory are left in place: no view is built for
+/// them and they are not pruned, since the operation lowerings recover the
+/// assigned offset from the cast operand.
 mlir::LogicalResult replaceSourceBCasts(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::DenseMap<ResourceType, mlir::Value>& resolved_units,
+    const scheduler::arch_view::MemoryTree& memory_tree,
     llvm::DenseMap<mlir::Value, mlir::Value>& replacements,
     mlir::OpBuilder& builder) {
   auto* ctx = pu.getContext();
@@ -300,7 +328,11 @@ mlir::LogicalResult replaceSourceBCasts(
         !mlir::isa<mlir::IndexType>(ucc.getInputs()[0].getType()))
       return;
     if (ucc.getOutputs().size() != 1) return;
-    if (!getMemorySpaceAttr(ucc.getOutputs()[0].getType())) return;
+    auto ms = getMemorySpaceAttr(ucc.getOutputs()[0].getType());
+    if (!ms) return;
+    // Compute-unit-local memory gets no view; leave the cast untouched so the
+    // operation lowerings can read the assigned offset off it.
+    if (memory_tree.isBelowScratchPad(*ms)) return;
     casts.push_back(ucc);
   });
 
@@ -414,7 +446,7 @@ mlir::LogicalResult scheduler::buildLogicalMemoryViews(
   LDBG(1) << "buildLogicalMemoryViews on " << func.getName();
 
   // Phase 1: discover needed memory spaces and prune dealloc-only casts.
-  auto needed_spaces = discoverAndPrune(func);
+  auto needed_spaces = discoverAndPrune(func, memory_tree);
   if (needed_spaces.empty()) {
     LDBG(1) << "  No memory spaces found; skipping";
     return mlir::success();
@@ -471,8 +503,8 @@ mlir::LogicalResult scheduler::buildLogicalMemoryViews(
       return mlir::failure();
 
     // Phase 3c: Source B casts.
-    if (mlir::failed(
-            replaceSourceBCasts(pu, resolved_units, replacements, builder)))
+    if (mlir::failed(replaceSourceBCasts(pu, resolved_units, memory_tree,
+                                         replacements, builder)))
       return mlir::failure();
 
     // Phase 3d: RAUW + type propagation.
