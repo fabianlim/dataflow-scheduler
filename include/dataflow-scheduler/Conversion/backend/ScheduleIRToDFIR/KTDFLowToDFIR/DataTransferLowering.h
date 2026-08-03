@@ -19,14 +19,18 @@
 #ifndef DATAFLOW_SCHEDULER_CONVERSION_KTDFLOWTODFIR_DATATRANSFERLOWERING_H_
 #define DATAFLOW_SCHEDULER_CONVERSION_KTDFLOWTODFIR_DATATRANSFERLOWERING_H_
 
+#include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/UnitTypeDiscovery.h"
 #include "mlir/IR/PatternMatch.h"
 
 namespace scheduler {
 
 /// Register LowerDataTransferPattern into the given pattern set.
-void populateDataTransferLoweringPatterns(mlir::RewritePatternSet& patterns,
-                                          const ResourceToUnits& components);
+/// `resource_kinds` supplies the hardware vector width used to decide whether a
+/// bulk transfer must be split across multiple AGEN vector transfers.
+void populateDataTransferLoweringPatterns(
+    mlir::RewritePatternSet& patterns, const ResourceToUnits& components,
+    arch_view::ResourceKinds& resource_kinds);
 
 }  // namespace scheduler
 
