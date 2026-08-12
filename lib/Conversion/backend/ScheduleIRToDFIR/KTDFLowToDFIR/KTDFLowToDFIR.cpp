@@ -24,6 +24,7 @@
 
 #include <mlir/Transforms/RegionUtils.h>
 
+#include "dataflow-scheduler/Analysis/ArchViews/GroupLocalMemory.h"
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/LogicalMemoryViewBuilder.h"
@@ -100,6 +101,8 @@ struct KTDFLowToDFIRPass
         device_manager.getOrCreateView<arch_view::MemoryTree>(*device);
     auto& resource_kinds =
         device_manager.getOrCreateView<arch_view::ResourceKinds>(*device);
+    auto& group_local_mem =
+        device_manager.getOrCreateView<arch_view::GroupLocalMemory>(*device);
 
     llvm::SmallVector<mlir::func::FuncOp, 4> funcs;
     module_op.walk([&](mlir::func::FuncOp func) { funcs.push_back(func); });
@@ -131,8 +134,8 @@ struct KTDFLowToDFIRPass
       mlir::IRRewriter rewriter(module_op.getContext());
       (void)mlir::runRegionDCE(rewriter, func.getBody());
 
-      if (mlir::failed(
-              buildLogicalMemoryViews(func, memory_tree, scheduler_ctx_))) {
+      if (mlir::failed(buildLogicalMemoryViews(
+              func, memory_tree, group_local_mem, scheduler_ctx_))) {
         return signalPassFailure();
       }
       // run arith folding into query maps after logical mem view is built to

@@ -40,8 +40,8 @@
   }
 }
 
-#SFU_REG = {
-  kind = "SFU_REG",
+#SFP_LRFREG = {
+  kind = "SFP_LRFREG",
   size = 2048 //2KB
 }
 
@@ -92,7 +92,7 @@ ktdf_arch.device @sample_device {
     group  share(%l1) {
       // Compute units.
       %sfu = group { kind = "SFU_Block" } share() {
-         %sfp_reg = memory #SFU_REG
+         %sfp_reg = memory #SFP_LRFREG
          %sfp_unit = exec_unit #SFU
          yield %sfp_unit
       } -> exec_unit
@@ -112,7 +112,7 @@ ktdf_arch.device @sample_device {
     group  share(%l1) {
       // Compute units.
       %sfu = group { kind = "SFU_Block" } share() {
-         %sfp_reg = memory #SFU_REG
+         %sfp_reg = memory #SFP_LRFREG
          %sfp_unit = exec_unit #SFU
          yield %sfp_unit
       } -> exec_unit

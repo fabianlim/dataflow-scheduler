@@ -120,6 +120,78 @@ void scheduler::emitVectorStore(mlir::OpBuilder& builder, mlir::Location loc,
                                     store_set, map);
 }
 
+mlir::LogicalResult scheduler::resolveComputeUnitLocalBuffer(
+    mlir::Operation* op, mlir::Value& target, mlir::OpBuilder& builder) {
+  auto ucc = mlir::dyn_cast_or_null<mlir::UnrealizedConversionCastOp>(
+      target.getDefiningOp());
+  if (!ucc || ucc.getInputs().size() != 1 ||
+      !mlir::isa<mlir::IndexType>(ucc.getInputs()[0].getType()))
+    return mlir::success();
+  auto memref_type = mlir::dyn_cast<mlir::MemRefType>(target.getType());
+  if (!memref_type || !memref_type.getMemorySpace()) return mlir::success();
+
+  // The kind the device description gives the memory is the name the backend
+  // knows the unit by, run through the same derivation every other unit name
+  // goes through.
+  mlir::StringAttr unit_name =
+      builder.getStringAttr(unitTypeTag(memref_type.getMemorySpace()));
+
+  llvm::ArrayRef<int64_t> shape = memref_type.getShape();
+  if (llvm::any_of(shape, mlir::ShapedType::isDynamic))
+    return op->emitError(
+        "compute-unit-local buffer must have a fully static shape");
+
+  auto program_unit = op->getParentOfType<mlir::dataflow::ProgramUnitOp>();
+  if (!program_unit)
+    return op->emitError(
+        "compute-unit-local buffer must be used inside a program_unit");
+
+  mlir::MLIRContext* ctx = builder.getContext();
+  mlir::Location loc = op->getLoc();
+  mlir::Value offset = ucc.getInputs()[0];
+  auto view_type = mlir::MemRefType::get(shape, memref_type.getElementType());
+
+  // Reuse the view built for an earlier consumer of the same buffer.  It is
+  // recognisable as a local-unit view of this buffer's offset in the block that
+  // holds the cast, and it dominates the cast's users by construction.
+  for (mlir::Operation* user : offset.getUsers()) {
+    auto view = mlir::dyn_cast<mlir::dataflow::GetLogicalMemoryViewOp>(user);
+    if (!view || view->getBlock() != ucc->getBlock()) continue;
+    if (view.getData().getType() != view_type) continue;
+    if (!mlir::isa_and_nonnull<mlir::dataflow::GetLocalUnitOp>(
+            view.getFromUnit().getDefiningOp()))
+      continue;
+    target = view.getData();
+    return mlir::success();
+  }
+
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointAfter(ucc);
+
+  // The compute unit is its own handle, parameterized by the program_unit
+  // iter_arg so that each instance addresses its own register file; only the
+  // offset is derived.
+  auto local_unit = mlir::dataflow::GetLocalUnitOp::create(
+      builder, loc, builder.getIndexType(),
+      program_unit.getRegion().front().getArgument(0), unit_name);
+
+  // Row-major linearization of the buffer shape.
+  llvm::SmallVector<int64_t> strides(shape.size(), 1);
+  for (int i = static_cast<int>(shape.size()) - 2; i >= 0; --i)
+    strides[i] = strides[i + 1] * shape[i + 1];
+  mlir::AffineExpr layout_expr = mlir::getAffineConstantExpr(0, ctx);
+  for (unsigned i = 0; i < shape.size(); ++i)
+    layout_expr = layout_expr + mlir::getAffineDimExpr(i, ctx) * strides[i];
+  mlir::AffineMap layout_map =
+      mlir::AffineMap::get(shape.size(), 0, layout_expr, ctx);
+
+  auto view = mlir::dataflow::GetLogicalMemoryViewOp::create(
+      builder, loc, view_type, local_unit.getUnit(), offset,
+      mlir::AffineMapAttr::get(layout_map));
+  target = view.getData();
+  return mlir::success();
+}
+
 mlir::VectorType scheduler::getFlattenedVectorType(
     mlir::Type type, arch_view::ResourceKinds& resource_kinds) {
   // FIXME: Get this info from somewhere else.

@@ -55,15 +55,15 @@
 // CHECK-NEXT:                 }
 // CHECK-NEXT:               } {applicable_units = ["L1LU"]}
 // CHECK-NEXT:               ktdf.stage depends_in(%[[VAL_7:.*]]#2) depends_out(%[[VAL_7]]#3) {
-// CHECK-NEXT:                 %[[ALLOC_2:.*]] = memref.alloc() : memref<64xf16, "SFU_REG">
+// CHECK-NEXT:                 %[[ALLOC_2:.*]] = memref.alloc() : memref<64xf16, "SFP_LRFREG">
 // CHECK-NEXT:                 %[[CONSTANT_10:.*]] = arith.constant 0.000000e+00 : f16
-// CHECK-NEXT:                 linalg.fill ins(%[[CONSTANT_10]] : f16) outs(%[[ALLOC_2]] : memref<64xf16, "SFU_REG">)
+// CHECK-NEXT:                 linalg.fill ins(%[[CONSTANT_10]] : f16) outs(%[[ALLOC_2]] : memref<64xf16, "SFP_LRFREG">)
 // CHECK-NEXT:                 %[[CONSTANT_11:.*]] = arith.constant 2 : index
 // CHECK-NEXT:                 %[[CONSTANT_12:.*]] = arith.constant 256 : index
 // CHECK-NEXT:                 scf.for %[[VAL_8:.*]] = %[[CONSTANT_4]] to %[[CONSTANT_11]] step %[[CONSTANT_5]] {
 // CHECK-NEXT:                   scf.for %[[VAL_9:.*]] = %[[CONSTANT_4]] to %[[CONSTANT_12]] step %[[CONSTANT_5]] {
 // CHECK-NEXT:                     %[[READ_FROM_FIFO_0:.*]] = ktdf.read_from_fifo %[[VAL_7]]#0 : <"L1LU" -> "SFU", 64xf16> -> memref<1x1x64xf16>
-// CHECK-NEXT:                     linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_1]]], iterator_types = ["reduction", "reduction", "parallel"]} ins(%[[READ_FROM_FIFO_0]] : memref<1x1x64xf16>) outs(%[[ALLOC_2]] : memref<64xf16, "SFU_REG">) {
+// CHECK-NEXT:                     linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_1]]], iterator_types = ["reduction", "reduction", "parallel"]} ins(%[[READ_FROM_FIFO_0]] : memref<1x1x64xf16>) outs(%[[ALLOC_2]] : memref<64xf16, "SFP_LRFREG">) {
 // CHECK-NEXT:                     ^bb0(%[[VAL_10:.*]]: f16, %[[VAL_11:.*]]: f16):
 // CHECK-NEXT:                       %[[ADDF_0:.*]] = arith.addf %[[VAL_10]], %[[VAL_11]] : f16
 // CHECK-NEXT:                       linalg.yield %[[ADDF_0]] : f16
@@ -72,7 +72,7 @@
 // CHECK-NEXT:                     %[[CMPI_1:.*]] = arith.cmpi eq, %[[VAL_9]], %[[CONSTANT_7]] : index
 // CHECK-NEXT:                     %[[ANDI_0:.*]] = arith.andi %[[CMPI_0]], %[[CMPI_1]] : i1
 // CHECK-NEXT:                     scf.if %[[ANDI_0]] {
-// CHECK-NEXT:                       ktdf.write_to_fifo %[[ALLOC_2]], %[[VAL_7]]#1 : memref<64xf16, "SFU_REG">, <"SFU" -> "L1SU", 64xf16>
+// CHECK-NEXT:                       ktdf.write_to_fifo %[[ALLOC_2]], %[[VAL_7]]#1 : memref<64xf16, "SFP_LRFREG">, <"SFU" -> "L1SU", 64xf16>
 // CHECK-NEXT:                     }
 // CHECK-NEXT:                   }
 // CHECK-NEXT:                 } {loop_type = #ktdf.loop_type<reduction_loop>}

@@ -20,7 +20,10 @@
 #define DATAFLOW_SCHEDULER_CONVERSION_KTDFTOKTDFLOW_UNITMATERIALIZER_H_
 
 #include <map>
+#include <string>
+#include <tuple>
 
+#include "dataflow-scheduler/Analysis/ArchViews/GroupLocalMemory.h"
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/ComponentClassifier.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
@@ -33,6 +36,19 @@
 #include "mlir/IR/Value.h"
 
 namespace scheduler {
+
+/// Lowercase unit-type tag for a resource attribute, as the emitted DFIR
+/// `name`/`type` strings spell it (code generation requires lowercase).
+///
+/// This is the single derivation of a backend-facing name from an architecture
+/// resource: compute resource tokens are lowercased directly, Spyre
+/// memory-space attributes become their lowercased kind ("l1"/"ddr"), and any
+/// other attribute falls back to its lowercased printed form so nothing is left
+/// uppercase.  Every consumer that has to name a unit — get_unit for an
+/// addressable space, get_local_unit for a compute-unit-local one — must go
+/// through here, so that a memory kind declared in the device description and
+/// the name the backend receives never drift apart.
+std::string unitTypeTag(ResourceType rt);
 
 /// Storage for unit SSA values: (component, core) -> Value for non-parallel,
 /// (parallel_op, component, corelet, core) -> Value for parallel
@@ -61,12 +77,22 @@ class UnitMaterializer {
                                   mlir::OpBuilder& builder);
 
   /// Emit dataflow.get_unit ops for memory-space components at func entry.
-  /// Global spaces (memory_tree.isGlobalMemory): one unit, key core = -1.
-  /// Per-core spaces (memory_tree.isPerCoreScratchPadMemory ||
-  /// memory_tree.isBelowScratchPad): one unit per core 0..grid_size-1.
+  /// The instance multiplicity of a space follows its role in the device:
+  /// - Global spaces (memory_tree.isGlobalMemory, depth 0): one unit, key
+  ///   core = -1.
+  /// - Per-core scratchpad spaces (memory_tree.isPerCoreScratchPadMemory,
+  ///   depth 1): one unit per core 0..grid_size-1.
+  /// - Compute-unit-local spaces (group_local_mem.isComputeUnitLocal): no unit
+  ///   is materialized, and none is needed — such memory is accessed only from
+  ///   the compute unit that owns it, which resolves its own handle via
+  ///   dataflow.get_local_unit. These spaces are normally filtered out before
+  ///   they reach here (discoverAndPrune); the branch is a guard against a
+  ///   caller that collects them anyway.
+  /// Any other space is an error.
   mlir::LogicalResult materializeMemoryUnits(
       const llvm::SetVector<ResourceType>& needed_spaces, int grid_size,
       const scheduler::arch_view::MemoryTree& memory_tree,
+      const scheduler::arch_view::GroupLocalMemory& group_local_mem,
       MemoryUnitSSAMap& memory_unit_ssa, mlir::OpBuilder& builder);
 
  private:

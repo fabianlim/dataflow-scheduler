@@ -51,23 +51,23 @@
 // CHECK-NEXT:             scf.for %[[VAL_32:.*]] = %[[VAL_5]] to %[[VAL_14]] step %[[VAL_6]] {
 // CHECK-NEXT:               scf.for %[[VAL_33:.*]] = %[[VAL_5]] to %[[VAL_18]] step %[[VAL_6]] {
 // CHECK-NEXT:                 ktdf.pipeline {
-// CHECK-NEXT:                   %[[VAL_34:.*]]:5 = ktdf.private -> (memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">, !ktdf.token, !ktdf.token) {
-// CHECK-NEXT:                     %[[VAL_35:.*]] = memref.alloc() : memref<64xf16, "SFU_REG">
-// CHECK-NEXT:                     %[[VAL_36:.*]] = memref.alloc() : memref<64xf16, "SFU_REG">
-// CHECK-NEXT:                     %[[VAL_37:.*]] = memref.alloc() : memref<64xf16, "SFU_REG">
+// CHECK-NEXT:                   %[[VAL_34:.*]]:5 = ktdf.private -> (memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">, !ktdf.token, !ktdf.token) {
+// CHECK-NEXT:                     %[[VAL_35:.*]] = memref.alloc() : memref<64xf16, "SFP_LRFREG">
+// CHECK-NEXT:                     %[[VAL_36:.*]] = memref.alloc() : memref<64xf16, "SFP_LRFREG">
+// CHECK-NEXT:                     %[[VAL_37:.*]] = memref.alloc() : memref<64xf16, "SFP_LRFREG">
 // CHECK-NEXT:                     %[[VAL_38:.*]] = ktdf.create_token : !ktdf.token
 // CHECK-NEXT:                     %[[VAL_39:.*]] = ktdf.create_token : !ktdf.token
-// CHECK-NEXT:                     ktdf.private_yield %[[VAL_35]], %[[VAL_36]], %[[VAL_37]], %[[VAL_38]], %[[VAL_39]] : memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">, !ktdf.token, !ktdf.token
+// CHECK-NEXT:                     ktdf.private_yield %[[VAL_35]], %[[VAL_36]], %[[VAL_37]], %[[VAL_38]], %[[VAL_39]] : memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">, !ktdf.token, !ktdf.token
 // CHECK-NEXT:                   }
 // CHECK-NEXT:                   ktdf.stage depends_in(none) depends_out(%[[VAL_34]]#3) {
-// CHECK-NEXT:                     ktdf.data_transfer from %[[VAL_19]]#0{{\[}}%[[VAL_33]], %[[VAL_5]]] size [1, 64] to %[[VAL_34]]#0{{\[}}%[[VAL_5]]] size [64] : memref<?x64xf16, "L1">, memref<64xf16, "SFU_REG">
-// CHECK-NEXT:                     ktdf.data_transfer from %[[VAL_19]]#1{{\[}}%[[VAL_32]], %[[VAL_33]], %[[VAL_5]]] size [1, 1, 64] to %[[VAL_34]]#1{{\[}}%[[VAL_5]]] size [64] : memref<?x?x64xf16, "L1">, memref<64xf16, "SFU_REG">
+// CHECK-NEXT:                     ktdf.data_transfer from %[[VAL_19]]#0{{\[}}%[[VAL_33]], %[[VAL_5]]] size [1, 64] to %[[VAL_34]]#0{{\[}}%[[VAL_5]]] size [64] : memref<?x64xf16, "L1">, memref<64xf16, "SFP_LRFREG">
+// CHECK-NEXT:                     ktdf.data_transfer from %[[VAL_19]]#1{{\[}}%[[VAL_32]], %[[VAL_33]], %[[VAL_5]]] size [1, 1, 64] to %[[VAL_34]]#1{{\[}}%[[VAL_5]]] size [64] : memref<?x?x64xf16, "L1">, memref<64xf16, "SFP_LRFREG">
 // CHECK-NEXT:                   }
 // CHECK-NEXT:                   ktdf.stage depends_in(%[[VAL_34]]#3) depends_out(%[[VAL_34]]#4) {
-// CHECK-NEXT:                     linalg.add ins(%[[VAL_34]]#0, %[[VAL_34]]#1 : memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">) outs(%[[VAL_34]]#2 : memref<64xf16, "SFU_REG">)
+// CHECK-NEXT:                     linalg.add ins(%[[VAL_34]]#0, %[[VAL_34]]#1 : memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">) outs(%[[VAL_34]]#2 : memref<64xf16, "SFP_LRFREG">)
 // CHECK-NEXT:                   }
 // CHECK-NEXT:                   ktdf.stage depends_in(%[[VAL_34]]#4) depends_out(none) {
-// CHECK-NEXT:                     ktdf.data_transfer from %[[VAL_34]]#2{{\[}}%[[VAL_5]]] size [64] to %[[VAL_19]]#2{{\[}}%[[VAL_32]], %[[VAL_33]], %[[VAL_5]]] size [1, 1, 64] : memref<64xf16, "SFU_REG">, memref<?x?x64xf16, "L1">
+// CHECK-NEXT:                     ktdf.data_transfer from %[[VAL_34]]#2{{\[}}%[[VAL_5]]] size [64] to %[[VAL_19]]#2{{\[}}%[[VAL_32]], %[[VAL_33]], %[[VAL_5]]] size [1, 1, 64] : memref<64xf16, "SFP_LRFREG">, memref<?x?x64xf16, "L1">
 // CHECK-NEXT:                   }
 // CHECK-NEXT:                 }
 // CHECK-NEXT:               }
@@ -112,19 +112,19 @@ module {
         scf.for %m1 = %c0 to %5 step %c1 {
           scf.for %n1 = %c0 to %8 step %c1 {
             ktdf.pipeline {
-              %9:11 = ktdf.private -> (memref<64xf16, "L1">, memref<64xf16, "L1">, memref<64xf16, "L1">, memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token) {
+              %9:11 = ktdf.private -> (memref<64xf16, "L1">, memref<64xf16, "L1">, memref<64xf16, "L1">, memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token) {
                 %alloc = memref.alloc() : memref<64xf16, "L1"> // this should get expanded in the %n1 dim only
                 %alloc_0 = memref.alloc() : memref<64xf16, "L1"> // other L1 buffers including this one should get expanded in %m1 and %n1
                 %alloc_1 = memref.alloc() : memref<64xf16, "L1">
-                %alloc_2 = memref.alloc() : memref<64xf16, "SFU_REG">
-                %alloc_3 = memref.alloc() : memref<64xf16, "SFU_REG">
-                %alloc_4 = memref.alloc() : memref<64xf16, "SFU_REG">
+                %alloc_2 = memref.alloc() : memref<64xf16, "SFP_LRFREG">
+                %alloc_3 = memref.alloc() : memref<64xf16, "SFP_LRFREG">
+                %alloc_4 = memref.alloc() : memref<64xf16, "SFP_LRFREG">
                 %10 = ktdf.create_token : !ktdf.token
                 %11 = ktdf.create_token : !ktdf.token
                 %12 = ktdf.create_token : !ktdf.token
                 %13 = ktdf.create_token : !ktdf.token
                 %14 = ktdf.create_token : !ktdf.token
-                ktdf.private_yield %alloc, %alloc_0, %alloc_1, %alloc_2, %alloc_3, %alloc_4, %10, %11, %12, %13, %14 : memref<64xf16, "L1">, memref<64xf16, "L1">, memref<64xf16, "L1">, memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token
+                ktdf.private_yield %alloc, %alloc_0, %alloc_1, %alloc_2, %alloc_3, %alloc_4, %10, %11, %12, %13, %14 : memref<64xf16, "L1">, memref<64xf16, "L1">, memref<64xf16, "L1">, memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token
               }
               ktdf.stage depends_in(none) depends_out(%9#6) {
                 %10 = affine.apply #map2(%n1)[%n0]
@@ -134,14 +134,14 @@ module {
                 ktdf.data_transfer from %arg1[%12, %11] size [1, 64] to %9#1[%c0] size [64] : memref<?x?xf16, "DDR">, memref<64xf16, "L1">
               }
               ktdf.stage depends_in(%9#6) depends_out(%9#7) {
-                ktdf.data_transfer from %9#0[%c0] size [64] to %9#3[%c0] size [64] : memref<64xf16, "L1">, memref<64xf16, "SFU_REG">
-                ktdf.data_transfer from %9#1[%c0] size [64] to %9#4[%c0] size [64] : memref<64xf16, "L1">, memref<64xf16, "SFU_REG">
+                ktdf.data_transfer from %9#0[%c0] size [64] to %9#3[%c0] size [64] : memref<64xf16, "L1">, memref<64xf16, "SFP_LRFREG">
+                ktdf.data_transfer from %9#1[%c0] size [64] to %9#4[%c0] size [64] : memref<64xf16, "L1">, memref<64xf16, "SFP_LRFREG">
               }
               ktdf.stage depends_in(%9#7) depends_out(%9#8) {
-                linalg.add ins(%9#3, %9#4 : memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">) outs(%9#5 : memref<64xf16, "SFU_REG">)
+                linalg.add ins(%9#3, %9#4 : memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">) outs(%9#5 : memref<64xf16, "SFP_LRFREG">)
               }
               ktdf.stage depends_in(%9#8) depends_out(%9#9) {
-                ktdf.data_transfer from %9#5[%c0] size [64] to %9#2[%c0] size [64] : memref<64xf16, "SFU_REG">, memref<64xf16, "L1">
+                ktdf.data_transfer from %9#5[%c0] size [64] to %9#2[%c0] size [64] : memref<64xf16, "SFP_LRFREG">, memref<64xf16, "L1">
               }
               ktdf.stage depends_in(%9#9) depends_out(%9#10) {
                 %10 = affine.apply #map2(%n1)[%n0]

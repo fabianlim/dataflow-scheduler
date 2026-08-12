@@ -20,11 +20,31 @@
 
 #include <llvm/ADT/SmallPtrSet.h>
 
-#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 
 using namespace scheduler::arch_view;
+
+namespace {
+
+/// Returns the kind of the memory that @p endpoint denotes, or nullptr if the
+/// endpoint is not a memory.  Groups are IsolatedFromAbove, so a memory shared
+/// into a group appears as a block argument and has to be traced back through
+/// the capture list of each group it was handed down through.
+mlir::Attribute resolveMemoryKind(mlir::Value endpoint) {
+  while (auto arg = mlir::dyn_cast<mlir::BlockArgument>(endpoint)) {
+    auto group =
+        mlir::dyn_cast<mlir::ktdf_arch::GroupOp>(arg.getOwner()->getParentOp());
+    if (!group || arg.getArgNumber() >= group.getSharedMemory().size())
+      return {};
+    endpoint = group.getSharedMemory()[arg.getArgNumber()];
+  }
+  auto mem_op = endpoint.getDefiningOp<mlir::ktdf_arch::MemoryOp>();
+  if (!mem_op) return {};
+  return mem_op.getKind();
+}
+
+}  // namespace
 
 GroupLocalMemory::GroupLocalMemory(const mlir::ktdf_arch::Device& device)
     : DeviceView(device) {
@@ -37,7 +57,18 @@ void GroupLocalMemory::initialize() {
   // kind the set of local memory kinds is intersected across all groups that
   // contain it — only memory kinds present in every such group are retained.
   // Ambiguity (intersection set size > 1) is not diagnosed here; it
-  // surfaces as an error in getLocalMemoryKindForStage if queried.
+  // surfaces as a nullptr result in getLocalMemoryKind if queried.
+  //
+  // The same walk records the inverse mapping, plus every memory kind that is
+  // named as a datapath endpoint anywhere.  Co-location with an exec_unit does
+  // not on its own make a memory private to it — a core-level scratchpad also
+  // sits alongside its load/store units — so a memory that anything can
+  // transfer through is not compute-unit-local, whatever its position in the
+  // hierarchy.  Datapaths are collected across all groups because a shared
+  // memory is reached through a capture, from a group below the one declaring
+  // it.
+  llvm::SmallPtrSet<mlir::Attribute, 4> transfer_endpoints;
+
   getDevice().getBodyRegion().walk([&](mlir::ktdf_arch::GroupOp group) {
     llvm::SmallVector<mlir::Attribute> exec_kinds;
     llvm::SmallPtrSet<mlir::Attribute, 1> mem_kinds;
@@ -48,20 +79,29 @@ void GroupLocalMemory::initialize() {
         if (mlir::Attribute k = exec_op.getKind()) exec_kinds.push_back(k);
       } else if (auto mem_op = mlir::dyn_cast<mlir::ktdf_arch::MemoryOp>(&op)) {
         if (mlir::Attribute k = mem_op.getKind()) mem_kinds.insert(k);
+      } else if (auto path = mlir::dyn_cast<mlir::ktdf_arch::DatapathOp>(&op)) {
+        for (mlir::Value endpoint : {path.getSource(), path.getTarget()})
+          if (mlir::Attribute k = resolveMemoryKind(endpoint))
+            transfer_endpoints.insert(k);
       }
     }
 
-    // TODO: only record exec_units that have an explicit ktdf_arch.datapath
-    // to/from the memory — co-location alone does not imply access.
+    // The forward direction records co-location only. TODO: restrict it to
+    // exec_units with an explicit ktdf_arch.datapath to/from the memory —
+    // co-location alone does not imply access. The inverse direction below
+    // already applies that test, via the transfer_endpoints erase at the end.
     for (mlir::Attribute ek : exec_kinds) {
       auto [it, inserted] = exec_to_mem_kinds_.try_emplace(ek, mem_kinds);
       if (!inserted)
         it->second.remove_if(
             [&](mlir::Attribute mk) { return !mem_kinds.count(mk); });
+      for (mlir::Attribute mk : mem_kinds) mem_to_exec_kinds_[mk].insert(ek);
     }
 
     return mlir::WalkResult::advance();
   });
+
+  for (mlir::Attribute mk : transfer_endpoints) mem_to_exec_kinds_.erase(mk);
 }
 
 mlir::Attribute GroupLocalMemory::getLocalMemoryKind(
@@ -71,19 +111,6 @@ mlir::Attribute GroupLocalMemory::getLocalMemoryKind(
   return *it->second.begin();
 }
 
-mlir::Attribute GroupLocalMemory::getLocalMemoryKindForStage(
-    mlir::ktdf::StageOp stage) const {
-  const auto applicable_units = stage.getApplicableUnits();
-  if (!applicable_units || applicable_units->size() != 1) {
-    stage->emitError("expected exactly one applicable exec_unit on ktdf.stage");
-    return {};
-  }
-  mlir::Attribute exec_kind = applicable_units->getValue().front();
-  mlir::Attribute mem_kind = getLocalMemoryKind(exec_kind);
-  if (!mem_kind) {
-    stage->emitError("no unambiguous local memory found for exec_unit kind '")
-        << exec_kind << "' in device description";
-    return {};
-  }
-  return mem_kind;
+bool GroupLocalMemory::isComputeUnitLocal(mlir::Attribute memory_kind) const {
+  return mem_to_exec_kinds_.contains(memory_kind);
 }

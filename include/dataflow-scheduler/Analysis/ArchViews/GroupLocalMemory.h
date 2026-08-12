@@ -19,7 +19,8 @@
 // GroupLocalMemory
 //
 // Captures the local memory resource present directly inside of a
-// ktdf_arch.group across the different groups.
+// ktdf_arch.group across the different groups, in both directions: which
+// memory an exec_unit owns, and which exec_unit owns a memory.
 //
 //===----------------------------------------------------------------------===//
 
@@ -30,18 +31,23 @@
 #include <llvm/ADT/SmallPtrSet.h>
 #include <mlir/IR/Attributes.h>
 
-#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 
 namespace scheduler::arch_view {
 
-/// Maps exec_unit kind -> local memory kind for groups that contain both.
+/// Maps exec_unit kind -> local memory kind for groups that contain both, and
+/// the inverse.
 ///
 /// During construction the set of memory kinds for each exec_unit kind is
 /// intersected across all groups that contain it — only memory kinds present
 /// in every such group are retained.  Ambiguity (intersection size > 1) is
-/// not diagnosed at construction time; it becomes a hard error only if that
-/// exec_unit kind is queried via getLocalMemoryKindForStage.
+/// not diagnosed at construction time; getLocalMemoryKind simply returns
+/// nullptr, and it is the caller's business whether that is an error.
+///
+/// The inverse direction is unioned rather than intersected, so that whether a
+/// memory is compute-unit-local never depends on how consistently the device
+/// description declares it; only the owner lookup degrades under ambiguity, by
+/// returning nullptr the same way the forward direction does.
 ///
 /// Constructed as a DeviceView child of a DeviceOp.
 class GroupLocalMemory : public mlir::ktdf_arch::DeviceView {
@@ -54,20 +60,25 @@ class GroupLocalMemory : public mlir::ktdf_arch::DeviceView {
   [[nodiscard]] mlir::Attribute getLocalMemoryKind(
       mlir::Attribute exec_unit_kind) const;
 
-  /// Returns the local memory kind for the single exec_unit kind declared on
-  /// @p stage.
+  /// Returns true if @p memory_kind is private to a compute unit: declared
+  /// inside a group that also declares an exec_unit, and never named as a
+  /// datapath endpoint, so nothing can transfer into or out of it and the
+  /// exec_unit executing an operation is itself the access handle.
   ///
-  /// Emits an error on @p stage and returns nullptr if:
-  ///   - the stage does not have exactly one applicable exec_unit, or
-  ///   - no unambiguous local memory is mapped to that exec_unit kind.
-  [[nodiscard]] mlir::Attribute getLocalMemoryKindForStage(
-      mlir::ktdf::StageOp stage) const;
+  /// Lowering asks this to decide whether a memory space needs a device-global
+  /// unit and a logical memory view at all.
+  [[nodiscard]] bool isComputeUnitLocal(mlir::Attribute memory_kind) const;
 
  private:
   /// exec_unit kind -> set of all memory kinds seen for that exec_unit kind.
   /// SmallPtrSet<1> keeps the common single-element case inline.
   llvm::DenseMap<mlir::Attribute, llvm::SmallPtrSet<mlir::Attribute, 1>>
       exec_to_mem_kinds_;
+
+  /// memory kind -> set of exec_unit kinds co-located with it, restricted to
+  /// memory that no datapath reaches.
+  llvm::DenseMap<mlir::Attribute, llvm::SmallPtrSet<mlir::Attribute, 1>>
+      mem_to_exec_kinds_;
 
   void initialize();
 };

@@ -55,15 +55,15 @@
 // CHECK-NEXT:         scf.for %[[VAL_4:.*]] = %[[CONSTANT_0]] to %[[CONSTANT_1]] step %[[CONSTANT_1]] {
 // CHECK-NEXT:           scf.for %[[VAL_5:.*]] = %[[CONSTANT_0]] to %[[CONSTANT_2]] step %[[CONSTANT_2]] {
 // CHECK-NEXT:             ktdf.pipeline {
-// CHECK-NEXT:               %[[PRIVATE_1:.*]]:8 = ktdf.private -> (memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, !ktdf.token, !ktdf.token) {
-// CHECK-NEXT:                 %[[ALLOC_3:.*]] = memref.alloc() : memref<64xf16, "SFU_REG">
-// CHECK-NEXT:                 %[[ALLOC_4:.*]] = memref.alloc() : memref<64xf16, "SFU_REG">
-// CHECK-NEXT:                 %[[ALLOC_5:.*]] = memref.alloc() : memref<64xf16, "SFU_REG">
+// CHECK-NEXT:               %[[PRIVATE_1:.*]]:8 = ktdf.private -> (memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, !ktdf.token, !ktdf.token) {
+// CHECK-NEXT:                 %[[ALLOC_3:.*]] = memref.alloc() : memref<64xf16, "SFP_LRFREG">
+// CHECK-NEXT:                 %[[ALLOC_4:.*]] = memref.alloc() : memref<64xf16, "SFP_LRFREG">
+// CHECK-NEXT:                 %[[ALLOC_5:.*]] = memref.alloc() : memref<64xf16, "SFP_LRFREG">
 // CHECK-NEXT:                 %[[FIFO_0:.*]]:2 = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
 // CHECK-NEXT:                 %[[FIFO_1:.*]] = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>
 // CHECK-NEXT:                 %[[CREATE_TOKEN_2:.*]] = ktdf.create_token : !ktdf.token
 // CHECK-NEXT:                 %[[CREATE_TOKEN_3:.*]] = ktdf.create_token : !ktdf.token
-// CHECK-NEXT:                 ktdf.private_yield %[[ALLOC_3]], %[[ALLOC_4]], %[[ALLOC_5]], %[[FIFO_0]]#0, %[[FIFO_0]]#1, %[[FIFO_1]], %[[CREATE_TOKEN_2]], %[[CREATE_TOKEN_3]] : memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, !ktdf.token, !ktdf.token
+// CHECK-NEXT:                 ktdf.private_yield %[[ALLOC_3]], %[[ALLOC_4]], %[[ALLOC_5]], %[[FIFO_0]]#0, %[[FIFO_0]]#1, %[[FIFO_1]], %[[CREATE_TOKEN_2]], %[[CREATE_TOKEN_3]] : memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, !ktdf.token, !ktdf.token
 // CHECK-NEXT:               }
 // CHECK-NEXT:               ktdf.stage depends_in(none) depends_out(%[[PRIVATE_1]]#6) {
 // CHECK-NEXT:                 %[[SUBI_4:.*]] = arith.subi %[[VAL_4]], %[[CONSTANT_0]] : index
@@ -78,10 +78,10 @@
 // CHECK-NEXT:                 ktdf.data_transfer from %[[PRIVATE_0]]#1{{\[}}%[[DIVSI_6]], %[[DIVSI_7]], %[[CONSTANT_0]]] size [1, 1, 64] to %[[PRIVATE_1]]#4 size [64] : memref<1x1x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
 // CHECK-NEXT:               }
 // CHECK-NEXT:               ktdf.stage depends_in(%[[PRIVATE_1]]#6) depends_out(%[[PRIVATE_1]]#7) {
-// CHECK-NEXT:                 ktdf.data_transfer from %[[PRIVATE_1]]#3 to %[[PRIVATE_1]]#0{{\[}}%[[CONSTANT_0]]] size [64] : !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, memref<64xf16, "SFU_REG">
-// CHECK-NEXT:                 ktdf.data_transfer from %[[PRIVATE_1]]#4 to %[[PRIVATE_1]]#1{{\[}}%[[CONSTANT_0]]] size [64] : !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, memref<64xf16, "SFU_REG">
-// CHECK-NEXT:                 linalg.add ins(%[[PRIVATE_1]]#0, %[[PRIVATE_1]]#1 : memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">) outs(%[[PRIVATE_1]]#2 : memref<64xf16, "SFU_REG">)
-// CHECK-NEXT:                 ktdf.data_transfer from %[[PRIVATE_1]]#2{{\[}}%[[CONSTANT_0]]] size [64] to %[[PRIVATE_1]]#5 size [64] : memref<64xf16, "SFU_REG">, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>
+// CHECK-NEXT:                 ktdf.data_transfer from %[[PRIVATE_1]]#3 to %[[PRIVATE_1]]#0{{\[}}%[[CONSTANT_0]]] size [64] : !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, memref<64xf16, "SFP_LRFREG">
+// CHECK-NEXT:                 ktdf.data_transfer from %[[PRIVATE_1]]#4 to %[[PRIVATE_1]]#1{{\[}}%[[CONSTANT_0]]] size [64] : !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, memref<64xf16, "SFP_LRFREG">
+// CHECK-NEXT:                 linalg.add ins(%[[PRIVATE_1]]#0, %[[PRIVATE_1]]#1 : memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">) outs(%[[PRIVATE_1]]#2 : memref<64xf16, "SFP_LRFREG">)
+// CHECK-NEXT:                 ktdf.data_transfer from %[[PRIVATE_1]]#2{{\[}}%[[CONSTANT_0]]] size [64] to %[[PRIVATE_1]]#5 size [64] : memref<64xf16, "SFP_LRFREG">, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>
 // CHECK-NEXT:               }
 // CHECK-NEXT:               ktdf.stage depends_in(%[[PRIVATE_1]]#7) depends_out(none) {
 // CHECK-NEXT:                 %[[SUBI_8:.*]] = arith.subi %[[VAL_4]], %[[CONSTANT_0]] : index
@@ -159,7 +159,7 @@ module {
               %res_fifo_slot_a, %res_fifo_slot_b, %res_fifo_slot_c,
               %res_t1, %res_t2, %res_t3, %res_t4, %res_t5 = ktdf.private -> (
                 memref<64xf16, "L1">, memref<64xf16, "L1">, memref<64xf16, "L1">,
-                memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">,
+                memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">,
                 !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>,
                 !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>,
                 !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token
@@ -167,9 +167,9 @@ module {
                 %l1_A    = memref.alloc() : memref<64xf16, "L1">
                 %l1_B    = memref.alloc() : memref<64xf16, "L1">
                 %l1_C    = memref.alloc() : memref<64xf16, "L1">
-                %sfu_A   = memref.alloc() : memref<64xf16, "SFU_REG">
-                %sfu_B   = memref.alloc() : memref<64xf16, "SFU_REG">
-                %sfu_out = memref.alloc() : memref<64xf16, "SFU_REG">
+                %sfu_A   = memref.alloc() : memref<64xf16, "SFP_LRFREG">
+                %sfu_B   = memref.alloc() : memref<64xf16, "SFP_LRFREG">
+                %sfu_out = memref.alloc() : memref<64xf16, "SFP_LRFREG">
                 %fifo_slot_a, %fifo_slot_b = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>,
                                                                     !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
                 %fifo_slot_c = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>
@@ -182,7 +182,7 @@ module {
                                    %fifo_slot_a, %fifo_slot_b, %fifo_slot_c,
                                    %t1, %t2, %t3, %t4, %t5
                     : memref<64xf16, "L1">, memref<64xf16, "L1">, memref<64xf16, "L1">,
-                      memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">,
+                      memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">,
                       !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>,
                       !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>,
                       !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token
@@ -199,10 +199,10 @@ module {
               }
 
               ktdf.stage depends_in(%res_t2) depends_out(%res_t3) {
-                ktdf.data_transfer from %res_fifo_slot_a to %res_sfu_A[%c0] size [64] : !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, memref<64xf16, "SFU_REG">
-                ktdf.data_transfer from %res_fifo_slot_b to %res_sfu_B[%c0] size [64] : !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, memref<64xf16, "SFU_REG">
-                linalg.add ins(%res_sfu_A, %res_sfu_B : memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">) outs(%res_sfu_out : memref<64xf16, "SFU_REG">)
-                ktdf.data_transfer from %res_sfu_out[%c0] size [64] to %res_fifo_slot_c size [64] : memref<64xf16, "SFU_REG">, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>
+                ktdf.data_transfer from %res_fifo_slot_a to %res_sfu_A[%c0] size [64] : !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, memref<64xf16, "SFP_LRFREG">
+                ktdf.data_transfer from %res_fifo_slot_b to %res_sfu_B[%c0] size [64] : !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, memref<64xf16, "SFP_LRFREG">
+                linalg.add ins(%res_sfu_A, %res_sfu_B : memref<64xf16, "SFP_LRFREG">, memref<64xf16, "SFP_LRFREG">) outs(%res_sfu_out : memref<64xf16, "SFP_LRFREG">)
+                ktdf.data_transfer from %res_sfu_out[%c0] size [64] to %res_fifo_slot_c size [64] : memref<64xf16, "SFP_LRFREG">, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>
               }
 
               ktdf.stage depends_in(%res_t3) depends_out(%res_t4) {

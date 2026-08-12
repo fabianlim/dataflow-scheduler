@@ -25,17 +25,17 @@
 // CHECK-NEXT:       }
 // CHECK-NEXT:     }
 // CHECK-NEXT:     dataflow.program_unit iter_arg : %[[VAL_2:.*]] -> (%[[GET_UNIT_2]], %[[GET_UNIT_3]]) : {
-// CHECK-NEXT:       %[[ALLOC_1:.*]] = memref.alloc() : memref<1x64xf16, "SFU_REG">
+// CHECK-NEXT:       %[[ALLOC_1:.*]] = memref.alloc() : memref<1x64xf16, "SFP_LRFREG">
 // CHECK-NEXT:       %[[CONSTANT_BITSTREAM_0:.*]] = vectorchain.constant_bitstream {value = [0x0]} : vector<1xf16>
 // CHECK-NEXT:       %[[SHUFFLE_0:.*]] = vectorchain.shuffle input(%[[CONSTANT_BITSTREAM_0]]) {indices = [0 : i32], repetition = 64 : i32} : vector<1xf16>, vector<64xf16>
-// CHECK-NEXT:       agen.vector_store %[[SHUFFLE_0]], %[[ALLOC_1]]{{\[}}%[[CONSTANT_2]], %[[CONSTANT_2]]] {store_order = #[[$ATTR_1]], store_set = #[[$ATTR_4]]} : memref<1x64xf16, "SFU_REG">, vector<64xf16>
+// CHECK-NEXT:       agen.vector_store %[[SHUFFLE_0]], %[[ALLOC_1]]{{\[}}%[[CONSTANT_2]], %[[CONSTANT_2]]] {store_order = #[[$ATTR_1]], store_set = #[[$ATTR_4]]} : memref<1x64xf16, "SFP_LRFREG">, vector<64xf16>
 // CHECK-NEXT:       scf.for %[[VAL_3:.*]] = %[[CONSTANT_2]] to %[[CONSTANT_0]] step %[[CONSTANT_1]] {
 // CHECK-NEXT:         %[[DEF_IMMUTABLE_MAPPING_1:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_2]] -> %[[GET_UNIT_0]]], {{\[}}%[[GET_UNIT_3]] -> %[[GET_UNIT_1]]]):index
 // CHECK-NEXT:         %[[QUERY_MAP_1:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_1]], key:%[[VAL_2]]) : index
 // CHECK-NEXT:         %[[RECEIVE_0:.*]] = dataflow.receive %[[QUERY_MAP_1]] : vector<64xf16>
-// CHECK-NEXT:         %[[VECTOR_LOAD_1:.*]] = agen.vector_load %[[ALLOC_1]]{{\[}}%[[CONSTANT_2]], %[[CONSTANT_2]]] {load_order = #[[$ATTR_1]], load_set = #[[$ATTR_4]]} : memref<1x64xf16, "SFU_REG">, vector<64xf16>
+// CHECK-NEXT:         %[[VECTOR_LOAD_1:.*]] = agen.vector_load %[[ALLOC_1]]{{\[}}%[[CONSTANT_2]], %[[CONSTANT_2]]] {load_order = #[[$ATTR_1]], load_set = #[[$ATTR_4]]} : memref<1x64xf16, "SFP_LRFREG">, vector<64xf16>
 // CHECK-NEXT:         %[[BINARY_0:.*]] = vectorchain.binary %[[RECEIVE_0]], %[[VECTOR_LOAD_1]] {binary_op = #vectorchain<binary_operator add>, op_specific_map = #[[$ATTR_2]]} : vector<64xf16>, vector<64xf16>, vector<64xf16>
-// CHECK-NEXT:         agen.vector_store %[[BINARY_0]], %[[ALLOC_1]]{{\[}}%[[CONSTANT_2]], %[[CONSTANT_2]]] {store_order = #[[$ATTR_1]], store_set = #[[$ATTR_4]]} : memref<1x64xf16, "SFU_REG">, vector<64xf16>
+// CHECK-NEXT:         agen.vector_store %[[BINARY_0]], %[[ALLOC_1]]{{\[}}%[[CONSTANT_2]], %[[CONSTANT_2]]] {store_order = #[[$ATTR_1]], store_set = #[[$ATTR_4]]} : memref<1x64xf16, "SFP_LRFREG">, vector<64xf16>
 // CHECK-NEXT:       } {loop_type = #ktdf.loop_type<reduction_loop>}
 // CHECK-NEXT:     }
 // CHECK-NEXT:     return
@@ -78,15 +78,15 @@ module {
       }
     }
     ktdf_lowering.execute_on %u_sfu {
-      %alloc = memref.alloc() : memref<1x64xf16, "SFU_REG">
+      %alloc = memref.alloc() : memref<1x64xf16, "SFP_LRFREG">
       %zero = arith.constant 0.0 : f16
-      linalg.fill ins(%zero : f16) outs(%alloc : memref<1x64xf16, "SFU_REG">)
+      linalg.fill ins(%zero : f16) outs(%alloc : memref<1x64xf16, "SFP_LRFREG">)
       scf.for %i = %c0 to %c256 step %c1 {
         %input = ktdf.read_from_fifo %fifo : !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16> -> memref<1x1x64xf16>
         linalg.generic {
           indexing_maps = [#map_in, #map_out],
           iterator_types = ["parallel", "reduction", "parallel"]
-        } ins(%input : memref<1x1x64xf16>) outs(%alloc : memref<1x64xf16, "SFU_REG">) {
+        } ins(%input : memref<1x1x64xf16>) outs(%alloc : memref<1x64xf16, "SFP_LRFREG">) {
         ^bb0(%in: f16, %out: f16):
           %sum = arith.addf %in, %out : f16
           linalg.yield %sum : f16

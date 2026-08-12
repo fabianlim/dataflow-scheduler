@@ -30,9 +30,9 @@ module {
     %map = uniform.def_immutable_mapping([%c0 -> %0], [%c1 -> %1]):index
     %unit = uniform.query_map(map:%map, key:%tile_id) : index
     ktdf_lowering.execute_on %unit {
-      %alloc = memref.alloc() : memref<1x64xf16, "SFU_REG">
+      %alloc = memref.alloc() : memref<1x64xf16, "SFP_LRFREG">
       %zero = arith.constant 0.0 : f16
-      linalg.fill ins(%zero : f16) outs(%alloc : memref<1x64xf16, "SFU_REG">)
+      linalg.fill ins(%zero : f16) outs(%alloc : memref<1x64xf16, "SFP_LRFREG">)
     }
     return
   }

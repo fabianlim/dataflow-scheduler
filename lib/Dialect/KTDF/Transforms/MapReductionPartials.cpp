@@ -207,9 +207,19 @@ static LogicalResult rewriteGeneric(
   auto stage = generic_op->getParentOfType<ktdf::StageOp>();
   assert(stage && "expected enclosing ktdf.stage");
 
-  // Stage 1: decide which memory kind backs the accumulator.
-  Attribute mem_space = group_local_mem.getLocalMemoryKindForStage(stage);
-  if (!mem_space) return failure();
+  // Stage 1: decide which memory kind backs the accumulator. The arch view is
+  // keyed by exec_unit kind and knows nothing about stages, so the stage's
+  // single applicable unit is resolved here.
+  const auto applicable_units = stage.getApplicableUnits();
+  if (!applicable_units || applicable_units->size() != 1)
+    return stage->emitError(
+        "expected exactly one applicable exec_unit on ktdf.stage");
+  Attribute exec_kind = applicable_units->getValue().front();
+  Attribute mem_space = group_local_mem.getLocalMemoryKind(exec_kind);
+  if (!mem_space)
+    return stage->emitError(
+               "no unambiguous local memory found for exec_unit kind '")
+           << exec_kind << "' in device description";
 
   // Stage 2: rewrite the generic to buffer semantics using `mem_space`.
   OpBuilder builder(generic_op);
