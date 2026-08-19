@@ -26,6 +26,7 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
 #include "dataflow-scheduler/Dialect/Agen/Agen.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "dataflow-scheduler/Dialect/KTDF/Utils/OpaqueTemplates.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -529,6 +530,248 @@ struct LowerLinalgFillPattern
   arch_view::ResourceKinds& resource_kinds_;
 };
 
+/// Lowers an on-stick (lane-axis) reduction, carried as `ktdf.opaque
+/// "LANE_REDUCE"`, into an in-register reduction: the lanes of one vector
+/// register are collapsed, so unlike lowerReductionGenericOp's cross-register
+/// form it needs no loop and no FIFO.
+///
+/// Runs memory-to-memory, not as an SSA chain: an arithmetic operand must be
+/// something an address generator can name -- a load, or a lane permutation of
+/// one -- which another arithmetic op's result is not. The staging buffer is the
+/// extra input operand when the op carries one, else the input rewritten in
+/// place; a vector input with no buffer cannot be lowered.
+///
+/// Phase 1 is a butterfly over each group of kGroupSize lanes, using two fixed
+/// permutations:
+///
+///   p1 = [2, 3, 0, 1, 6, 7, 6, 7]      p2 = [4, 5, 3, 3, 5, 5, 6, 7]
+///
+///   v1 = shuffle(v,  p1) + v
+///   v2 = v1 + shuffle(v1, p2)
+///   v3 = shuffle(v2, p1) + shuffle(v2, p2)
+///
+/// leaving group g's sum in v3[8g] and junk in the group's other lanes. Each
+/// stage loads what the previous stored, which is also what orders them.
+///
+/// Two operand rules are load-bearing. The backend fuses each shuffle into its
+/// consumer as a per-operand NFWD modifier and SILENTLY drops any it cannot
+/// place, so violating either yields a wrong sum whose total still looks right:
+///   * p1 fuses only onto operand 0, p2 only onto operand 1 (the `nfwd0` and
+///     `nfwd2` ports). Hence `shuffle(v, p1) + v`, not `v + shuffle(v, p1)` --
+///     do not normalise these to a uniform order.
+///   * Each operand needs its own load, which is why stage 3 loads twice for
+///     what is arithmetically the same value.
+///
+/// Phase 2 broadcasts each group's lane 0 across its group, then one
+/// scan_with_gap with gap = kGroupSize combines the groups, leaving the total at
+/// lane 0 and the rest unspecified. The broadcast is its own stage because the
+/// scan has no operand slot to fold a permutation into.
+///
+/// A narrower result is absorbed here rather than by reducing a linalg
+/// dimension: both widths reduce at the input width, and a closing shuffle reads
+/// lane 0 once for a single-element result, once per lane for a full-width one.
+struct LowerLaneReducePattern
+    : public mlir::OpRewritePattern<mlir::ktdf::OpaqueOp> {
+  LowerLaneReducePattern(mlir::MLIRContext* context,
+                         arch_view::ResourceKinds& resource_kinds)
+      : OpRewritePattern(context), resource_kinds_(resource_kinds) {}
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::ktdf::OpaqueOp opaque_op,
+      mlir::PatternRewriter& rewriter) const override {
+    if (opaque_op.getTemplateName() != mlir::ktdf::kLaneReduceTemplateName)
+      return mlir::failure();
+
+    if (opaque_op.getInputs().empty() || opaque_op->getNumResults() != 1)
+      return opaque_op.emitError(
+          "lane reduction expects at least one input and exactly one result");
+
+    // Only the first input carries data. A further memref input is the staging
+    // buffer, threaded onto the op so that address assignment has already
+    // placed it by the time this runs.
+    mlir::Value input = opaque_op.getInputs().front();
+    mlir::Value staging;
+    for (mlir::Value extra : opaque_op.getInputs().drop_front()) {
+      if (mlir::isa<mlir::MemRefType>(extra.getType())) {
+        staging = extra;
+        break;
+      }
+    }
+
+    // Three input forms reach this arm:
+    //
+    //   vector -- already in a register; combine its lanes as is.
+    //   memref -- a preceding reduction's running total; load it first.
+    //   anything else -- defer. A tensor operand means the producer is not
+    //             lowered yet; the greedy driver revisits once it is. Letting
+    //             one through would hand a tensor to the shuffles.
+    //
+    // The reduction runs at the input width throughout -- that is the register
+    // whose lanes are being combined.
+    auto input_memref_type = mlir::dyn_cast<mlir::MemRefType>(input.getType());
+    auto vec_type = mlir::dyn_cast<mlir::VectorType>(input.getType());
+    if (!vec_type && input_memref_type)
+      vec_type = getFlattenedVectorType(input_memref_type, resource_kinds_);
+    if (!vec_type) return mlir::failure();
+
+    mlir::VectorType result_vec_type = getFlattenedVectorType(
+        opaque_op->getResult(0).getType(), resource_kinds_);
+    if (!result_vec_type) return mlir::failure();
+    if (result_vec_type.getElementType() != vec_type.getElementType())
+      return opaque_op.emitError(
+          "lane reduction input and result must have the same element type");
+
+    // The butterfly reduces groups of kGroupSize lanes and the scan then
+    // combines kGroupSize groups, so together they cover kGroupSize^2 lanes.
+    const int64_t num_lanes = vec_type.getNumElements();
+    if (num_lanes != kGroupSize * kGroupSize)
+      return opaque_op.emitError("lane reduction requires a ")
+             << kGroupSize * kGroupSize << "-lane vector, got " << num_lanes;
+
+    // Only two result widths are meaningful: the single reduced value, or the
+    // whole register it sits in. Anything between names lanes the reduction says
+    // nothing about, so the shuffle's result would be partly undefined.
+    const int64_t num_result_lanes = result_vec_type.getNumElements();
+    if (num_result_lanes != 1 && num_result_lanes != num_lanes)
+      return opaque_op.emitError(
+                 "lane reduction result must hold either 1 element or the "
+                 "full ")
+             << num_lanes << " of the input, got " << num_result_lanes;
+
+    // Pick the buffer the stages are staged through, and reject the one input
+    // form that leaves none: a register with no buffer alongside it.
+    if (!staging) {
+      if (!input_memref_type)
+        return opaque_op.emitError(
+            "lane reduction of a value already in a register needs a buffer "
+            "operand to stage its intermediates through");
+      staging = input;
+    }
+    mlir::VectorType staging_vec_type = getFlattenedVectorType(
+        mlir::cast<mlir::MemRefType>(staging.getType()), resource_kinds_);
+    if (!staging_vec_type || staging_vec_type != vec_type)
+      return opaque_op.emitError(
+                 "lane reduction staging buffer must hold exactly the register "
+                 "being reduced, ")
+             << vec_type << ", got " << staging.getType();
+
+    mlir::Location loc = opaque_op.getLoc();
+    rewriter.setInsertionPoint(opaque_op);
+
+    // Seed the staging buffer. A register input has to be written out first; a
+    // buffer input that is not itself the staging buffer is copied across; and a
+    // buffer input that *is* the staging buffer already holds the value.
+    if (!input_memref_type) {
+      scheduler::emitVectorStore(rewriter, loc, input, staging);
+    } else if (input != staging) {
+      scheduler::emitVectorStore(
+          rewriter, loc,
+          scheduler::emitVectorLoad(rewriter, loc, vec_type, input), staging);
+    }
+
+    static constexpr int64_t kP1[kGroupSize] = {2, 3, 0, 1, 6, 7, 6, 7};
+    static constexpr int64_t kP2[kGroupSize] = {4, 5, 3, 3, 5, 5, 6, 7};
+    static constexpr int64_t kBroadcastLane0[kGroupSize] = {0, 0, 0, 0,
+                                                            0, 0, 0, 0};
+
+    auto shuffle = [&](mlir::Value in,
+                       llvm::ArrayRef<int64_t> indices) -> mlir::Value {
+      llvm::SmallVector<mlir::Attribute> index_attrs;
+      index_attrs.reserve(indices.size());
+      for (int64_t index : indices)
+        index_attrs.push_back(
+            mlir::IntegerAttr::get(rewriter.getI32Type(), index));
+      return mlir::vectorchain::ShuffleOp::create(
+                 rewriter, loc, vec_type, in, /*variable=*/mlir::ValueRange{},
+                 /*pad=*/mlir::ValueRange{}, /*mask=*/nullptr,
+                 /*dbgName=*/nullptr, rewriter.getArrayAttr(index_attrs),
+                 static_cast<uint32_t>(kGroupSize))
+          .getOutput();
+    };
+
+    // All lane movement happens in the shuffles, so the arithmetic op must do
+    // no cross-lane work of its own: identity op_specific_map.
+    mlir::AffineMap identity_map =
+        mlir::AffineMap::getMultiDimIdentityMap(1, rewriter.getContext());
+    auto add = [&](mlir::Value lhs, mlir::Value rhs) -> mlir::Value {
+      return mlir::vectorchain::BinaryOp::create(
+                 rewriter, loc, vec_type, lhs, rhs, /*mask=*/nullptr,
+                 /*dbgName=*/nullptr,
+                 mlir::vectorchain::VectorChainBinaryOperator::add,
+                 identity_map)
+          .getData();
+    };
+
+    auto load = [&]() -> mlir::Value {
+      return scheduler::emitVectorLoad(rewriter, loc, vec_type, staging);
+    };
+    auto store = [&](mlir::Value value) {
+      scheduler::emitVectorStore(rewriter, loc, value, staging);
+    };
+
+    // Phase 1: butterfly, reducing each group of kGroupSize lanes into lane 0 of
+    // that group. Each stage reloads what the previous one stored.
+    //
+    // Every value gets its own statement: C++ argument evaluation order is
+    // unspecified, so inlining these would make the emitted op order
+    // compiler-dependent. Per the operand rules above, p1 goes on operand 0, p2
+    // on operand 1, and each operand gets its own load.
+    mlir::Value s1_shuffled = shuffle(load(), kP1);
+    mlir::Value s1_plain = load();
+    store(add(s1_shuffled, s1_plain));
+
+    mlir::Value s2_shuffled = shuffle(load(), kP2);
+    mlir::Value s2_plain = load();
+    store(add(s2_plain, s2_shuffled));
+
+    mlir::Value s3_lhs = shuffle(load(), kP1);
+    mlir::Value s3_rhs = shuffle(load(), kP2);
+    store(add(s3_lhs, s3_rhs));
+
+    // Phase 2: broadcast each group's lane 0 across its group, then combine the
+    // groups. This eval_order leaves the total at lane 0, as the store path
+    // expects; it does not match the op's own prefix-scan description, so do not
+    // "correct" it from that text.
+    mlir::Value v3 = load();
+    store(shuffle(v3, kBroadcastLane0));
+
+    mlir::Value broadcast = load();
+    auto scan = mlir::vectorchain::ScanWithGapOp::create(
+        rewriter, loc, vec_type, broadcast, /*dbgName=*/nullptr,
+        mlir::vectorchain::VectorChainBinaryOperator::add,
+        llvm::APInt(64, kGroupSize),
+        mlir::vectorchain::VectorChainScanOpEvalOrders::left_to_right);
+    store(scan.getOutput());
+
+    mlir::Value total = load();
+
+    // One shuffle reading lane 0, where the total landed, repeated as many times
+    // as the result holds. A full-width result must replicate the total rather
+    // than pass the register through: leaving the butterfly's partial sums in
+    // lanes 1..63 would contradict what that width claims.
+    const int64_t repetition = num_result_lanes;
+    mlir::Value result = mlir::vectorchain::ShuffleOp::create(
+                             rewriter, loc, result_vec_type, total,
+                             /*variable=*/mlir::ValueRange{},
+                             /*pad=*/mlir::ValueRange{}, /*mask=*/nullptr,
+                             /*dbgName=*/nullptr,
+                             rewriter.getArrayAttr({mlir::IntegerAttr::get(
+                                 rewriter.getI32Type(), 0)}),
+                             static_cast<uint32_t>(repetition))
+                             .getOutput();
+
+    rewriter.replaceOp(opaque_op, result);
+    return mlir::success();
+  }
+
+ private:
+  /// Lanes reduced per butterfly group, and equally the number of groups the
+  /// scan combines.  Both permutations above are indexed within one group.
+  static constexpr int64_t kGroupSize = 8;
+
+  arch_view::ResourceKinds& resource_kinds_;
+};
+
 }  // namespace
 
 void scheduler::populateLinalgLoweringPatterns(
@@ -537,4 +780,5 @@ void scheduler::populateLinalgLoweringPatterns(
   patterns.add<LowerLinalgGenericPattern>(patterns.getContext(),
                                           resource_kinds);
   patterns.add<LowerLinalgFillPattern>(patterns.getContext(), resource_kinds);
+  patterns.add<LowerLaneReducePattern>(patterns.getContext(), resource_kinds);
 }

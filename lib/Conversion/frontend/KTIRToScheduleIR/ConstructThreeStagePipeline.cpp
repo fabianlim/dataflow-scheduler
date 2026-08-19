@@ -425,9 +425,39 @@ llvm::SmallVector<int64_t> ConstructThreeStagePipelinePass::determineTileSizes(
     }
   }
 
+  // The budget is how many of a SIMD register's `vector_length` lanes the
+  // parallel dims may tile across; `computeTileSizesFromShape` spends it
+  // right-to-left, and a budget of 1 makes every parallel tile 1.
+  //
+  // Spending it all is only correct when one register holds a contiguous run of
+  // the output, which is exactly when the output's fastest-varying axis -- the
+  // last result of its indexing map -- is the innermost loop dim. Otherwise the
+  // innermost dim already is the register, and giving the budget to an outer
+  // parallel dim sizes a non-unit-stride axis to the full vector: the load
+  // becomes a strided gather and the FIFO is oversized by that factor. Nothing
+  // downstream rejects that shape, so it becomes wrong code far from here.
+  //
+  // Iterator types are the wrong thing to key on. An op may reduce one lane axis
+  // while a parallel axis remains the output's fastest; that form does store
+  // contiguously and must keep the full budget.
+  int64_t parallel_budget = vector_length;
+  if (num_loops > 0) {
+    mlir::AffineMap out_map =
+        linalg_op.getMatchingIndexingMap(linalg_op.getDpsInitOperand(0));
+    bool innermost_is_output_fastest = false;
+    if (out_map.getNumResults() > 0) {
+      auto last_dim = mlir::dyn_cast<mlir::AffineDimExpr>(
+          out_map.getResult(out_map.getNumResults() - 1));
+      innermost_is_output_fastest =
+          last_dim &&
+          static_cast<int64_t>(last_dim.getPosition()) == num_loops - 1;
+    }
+    if (!innermost_is_output_fastest) parallel_budget = 1;
+  }
+
   // Compute tile sizes for the parallel dimensions.
   llvm::SmallVector<int64_t> parallel_tile_sizes =
-      computeTileSizesFromShape(parallel_shape, vector_length);
+      computeTileSizesFromShape(parallel_shape, parallel_budget);
 
   // Assemble the final vector: 0 for reduction dims, computed size for
   // parallel dims.

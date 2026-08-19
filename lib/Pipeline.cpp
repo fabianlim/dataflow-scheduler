@@ -31,6 +31,29 @@
 #include "dataflow-scheduler/Dialect/KTDFArch/Transforms/Passes.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
+#include "llvm/Support/CommandLine.h"
+
+namespace {
+
+// MLIR's canonicalizer + LICM. Safe on KTIR/KTDF, NOT safe on input that is already DFIR:
+// agen.composite_load has no results and no declared memory effects, so dead-op elimination
+// deletes it together with the dataflow.send in its region, and the matching receive then
+// waits forever on hardware. Only a driver feeding an existing DFIR through the pipeline
+// needs this off.
+static llvm::cl::opt<bool> DisableCleanupPasses(
+    "disable-pipeline-cleanup-passes",
+    llvm::cl::desc("Disable the pipeline's generic canonicalize/LICM cleanup passes. For "
+                   "driving already-lowered DFIR through the pipeline; a normal KTIR run "
+                   "wants them on"),
+    llvm::cl::init(false));
+
+/// Adds one of those cleanup passes, unless they are switched off.
+void addCleanupPass(mlir::OpPassManager& pm, std::unique_ptr<mlir::Pass> pass) {
+  if (DisableCleanupPasses) return;
+  pm.addPass(std::move(pass));
+}
+
+}  // unnamed namespace
 
 using namespace scheduler;
 
@@ -50,13 +73,17 @@ void scheduler::buildSchedulerOptimizationPipeline(
   pm.addPass(createScalarBroadcastLegalizationPass());
   pm.addPass(createNormalizeSCFForLoopsPass());
   // Canonicalize to get rid of intervening code and single iteration loops
-  pm.addPass(mlir::createCanonicalizerPass());
+  addCleanupPass(pm, mlir::createCanonicalizerPass());
   pm.addPass(createTileSCFForLoopsPass());
   // Canonicalize to simplify tiling arith ops
   // (probably not needed for custom tiling regime)
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::createLoopInvariantCodeMotionPass());
+  addCleanupPass(pm, mlir::createCanonicalizerPass());
+  addCleanupPass(pm, mlir::createLoopInvariantCodeMotionPass());
   pm.addPass(mlir::ktdf::createStageCoarseningPass());
+  // Must precede ReductionLoopExposure: it is what removes the innermost
+  // (register-lane) dimension from the reduction set, so that pass only ever
+  // materialises loop-axis reductions.
+  pm.addPass(mlir::ktdf::createReductionLaneCollapsePass());
   pm.addPass(mlir::ktdf::createReductionLoopExposurePass());
   pm.addPass(mlir::ktdf::createMapReductionPartialsPass());
   pm.addPass(mlir::ktdf::createBroadcastPromotionPass());
@@ -66,7 +93,7 @@ void scheduler::buildSchedulerOptimizationPipeline(
   // determining tile sizes.
   pm.addPass(createParallelizeLoopsAcrossInstancesPass(scheduler_ctx));
   pm.addPass(mlir::ktdf::createTileSizeSelectionPass());
-  pm.addPass(mlir::createCanonicalizerPass());
+  addCleanupPass(pm, mlir::createCanonicalizerPass());
   pm.addPass(createAffineMinCanonicalizationPass());
   pm.addPass(mlir::ktdf::createSubsumeLinearizeIndexPass());
   pm.addPass(createAddressAssignmentPass(scheduler_ctx));
