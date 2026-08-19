@@ -41,6 +41,7 @@
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -51,6 +52,15 @@
 
 #define PASS_NAME "ktdflowering-to-dfir"
 #define DEBUG_TYPE PASS_NAME
+
+// Not idempotent: on a function that is already DFIR it rebuilds the logical
+// memory views, re-wraps bodies in a nested dataflow.program_unit and re-bases
+// addresses. Disabling it is how a driver feeds an existing DFIR through
+// unchanged.
+static llvm::cl::opt<bool> DisableThisPass(
+    "disable-" PASS_NAME,
+    llvm::cl::desc("Disable KTDFLowering to DFIR lowering pass"),
+    llvm::cl::init(false));
 
 using namespace scheduler;
 
@@ -84,6 +94,7 @@ struct KTDFLowToDFIRPass
       : scheduler_ctx_(scheduler_ctx) {}
 
   void runOnOperation() override {
+    if (DisableThisPass) return;
     LDBG(1) << "========= " PASS_NAME " =========";
     mlir::ModuleOp module_op = getOperation();
 
