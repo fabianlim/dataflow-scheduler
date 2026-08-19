@@ -124,8 +124,20 @@ if(DataflowScheduler_ENABLE_WERROR)
   message(STATUS "DataflowScheduler: -Werror enabled for first-party sources")
 endif()
 
-set(CMAKE_CXX_VISIBILITY_PRESET hidden)
-set(CMAKE_VISIBILITY_INLINES_HIDDEN YES)
+# Hiding symbols by default is only viable for static archives. When building
+# shared libraries, the per-component .so files must export their symbols so
+# that sibling components (and external consumers) can link against them.
+if(NOT BUILD_SHARED_LIBS)
+  set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+  set(CMAKE_VISIBILITY_INLINES_HIDDEN YES)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  # The CRTP attribute helpers in KTDFArchIntrinsics.h derive from templates
+  # that GCC gives hidden visibility (inherited from their hidden mlir:: type
+  # parameters), while the concrete derived structs get default visibility.
+  # GCC reports the mismatch; Clang does not. It is benign for these
+  # header-only, vtable-free types.
+  add_compile_options(-Wno-attributes)
+endif()
 
 # Include DataflowScheduler CMake module.
 set(DataflowScheduler_INCLUDE_DIRS 
