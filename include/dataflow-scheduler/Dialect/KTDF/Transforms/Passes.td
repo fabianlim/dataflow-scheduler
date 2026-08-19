@@ -72,6 +72,36 @@ def StageCoarseningPass : Pass<"stage-coarsening", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::ktdf::KTDFDialect"];
 }
 
+def ReductionLaneCollapsePass : Pass<"reduction-lane-collapse", "mlir::ModuleOp"> {
+  let summary = "Take the innermost dimension of a linalg.generic out of its reduction set";
+  let description = [{
+    The innermost dimension is the stride-1 run of elements occupying one SIMD
+    register, so reducing it combines lanes inside one register. The downstream
+    reduction machinery implements only the cross-register kind -- it turns a
+    reduction dimension into a loop and divides the input FIFO by its extent --
+    which applied to the innermost dimension is correct but degenerate: the FIFO
+    shrinks to one element and the loop steps a scalar at a time, discarding the
+    vector the hardware was going to operate on.
+
+    For each linalg.generic whose innermost iterator is a reduction, this pass:
+      1. Makes that iterator parallel, leaving other reduction dimensions alone.
+      2. Appends the dimension to the output indexing map and shape, so the
+         lanes to be combined stay live.
+      3. Emits a ktdf.opaque carrying the lane-reduce template name, consuming
+         the widened result.
+
+    Invariant established here: afterwards the reduction set of any
+    linalg.generic contains only non-innermost dimensions, which is what lets
+    the later reduction passes stay free of a special case.
+  }];
+  let constructor = "::mlir::ktdf::createReductionLaneCollapsePass()";
+  let dependentDialects = [
+    "mlir::ktdf::KTDFDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::tensor::TensorDialect"
+  ];
+}
+
 def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"> {
   let summary = "Expose the reduction loop of a linalg.generic as an explicit scf.for with a loop-carry accumulator";
   let description = [{

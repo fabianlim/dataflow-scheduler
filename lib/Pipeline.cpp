@@ -80,6 +80,10 @@ void scheduler::buildSchedulerOptimizationPipeline(
   addCleanupPass(pm, mlir::createCanonicalizerPass());
   addCleanupPass(pm, mlir::createLoopInvariantCodeMotionPass());
   pm.addPass(mlir::ktdf::createStageCoarseningPass());
+  // Must precede ReductionLoopExposure: it is what removes the innermost
+  // (register-lane) dimension from the reduction set, so that pass only ever
+  // materialises loop-axis reductions.
+  pm.addPass(mlir::ktdf::createReductionLaneCollapsePass());
   pm.addPass(mlir::ktdf::createReductionLoopExposurePass());
   pm.addPass(mlir::ktdf::createMapReductionPartialsPass());
   pm.addPass(mlir::ktdf::createBroadcastPromotionPass());
