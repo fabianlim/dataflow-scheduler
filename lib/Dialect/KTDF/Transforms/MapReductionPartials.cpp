@@ -90,6 +90,7 @@
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -135,13 +136,14 @@ static bool hasReductionIterator(linalg::GenericOp generic_op) {
 // are irrelevant.
 //
 // Neutral elements per combiner:
-//   addf / subf  →  0.0
-//   mulf         →  1.0
-//   maximumf     → -inf
-//   minimumf     → +inf
-//   maxnumf      → -inf
-//   addi / subi  →  0
-//   muli         →  1
+//   addf / subf       →  0.0
+//   mulf              →  1.0
+//   maximumf          → -inf
+//   minimumf          → +inf
+//   maxnumf           → -inf
+//   absf + maxnumf    →  0.0   ("absmax", looked through below)
+//   addi / subi       →  0
+//   muli              →  1
 //
 // Returns failure() (with an emitted error) if the output block argument has
 // zero or multiple users, the combiner is unrecognised, or the element type is
@@ -163,6 +165,51 @@ static FailureOr<TypedAttr> getNeutralAttr(linalg::GenericOp generic_op,
   // ── Floating-point combiners ───────────────────────────────────────────────
   if (auto ftype = dyn_cast<FloatType>(elem_type)) {
     const llvm::fltSemantics& sem = ftype.getFloatSemantics();
+
+    // ── "absmax": look through the accumulator's absf ────────────────────────
+    //
+    // The device's absmax body is math.absf on each block argument and an
+    // arith.maxnumf over the pair, so out_arg's user is an absf and the
+    // accumulation is one step past it.
+    //
+    // The neutral is 0.0, NOT the -inf a bare maxnumf takes: the accumulator
+    // goes through absf before the max, so a -inf seed arrives as +inf and wins
+    // every comparison.  Measured with -inf: fp16 returns 65504 and fp32
+    // 3.4028235e+38 where the answer is ~1.0.
+    //
+    // The shape below is the same three-op body ktdfIsReductionKind
+    // (ApplyDevicePatterns) and matchAbsMaxOperands (KTDFLowToDFIR) match; they
+    // must agree, or a body filled with 0.0 here lowers as a plain max.
+    if (auto abs_acc = dyn_cast<math::AbsFOp>(combiner)) {
+      Value abs_res = abs_acc.getResult();
+      if (!abs_res.hasOneUse())
+        return abs_acc->emitError(
+            "MapReductionPartials: absf on the output block argument must have "
+            "exactly one user (the maxnumf of an absmax reduction)");
+      auto maxf =
+          dyn_cast<arith::MaxNumFOp>(abs_res.getUses().begin()->getOwner());
+      if (!maxf)
+        return abs_acc->emitError(
+            "MapReductionPartials: absf on the output block argument does not "
+            "feed an arith.maxnumf — not an absmax reduction");
+      // Both sides must be absf, or this merely starts with an abs.
+      Value other = maxf.getLhs() == abs_res ? maxf.getRhs() : maxf.getLhs();
+      if (!other.getDefiningOp<math::AbsFOp>())
+        return maxf->emitError(
+            "MapReductionPartials: absmax reduction expects both arith.maxnumf "
+            "operands to be math.absf results");
+      // Yielded directly, so an epilogue on the max (a negf, say) cannot land
+      // here and take a neutral that is wrong for what it computes.
+      Value max_res = maxf.getResult();
+      if (!max_res.hasOneUse() ||
+          !isa<linalg::YieldOp>(max_res.getUses().begin()->getOwner()))
+        return maxf->emitError(
+            "MapReductionPartials: absmax reduction expects the arith.maxnumf "
+            "result to be yielded directly by the linalg.generic body");
+      return cast<TypedAttr>(
+          FloatAttr::get(elem_type, APFloat::getZero(sem, /*negative=*/false)));
+    }
+
     if (isa<arith::AddFOp, arith::SubFOp>(combiner))
       return cast<TypedAttr>(
           FloatAttr::get(elem_type, APFloat::getZero(sem, /*negative=*/false)));
