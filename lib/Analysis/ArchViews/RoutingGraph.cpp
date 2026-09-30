@@ -43,8 +43,11 @@ struct DeviceInitContext {
   // Maps SSA values (from memory/exec_unit ops) to their corresponding NodeIds
   llvm::DenseMap<mlir::Value, RoutingGraph::NodeId> value_to_node_id;
 
-  // Tracks which group kinds we've already processed (for flattening)
-  llvm::DenseSet<mlir::Attribute> processed_group_kinds;
+  // Maps each group kind already processed (for flattening) to the nodes of
+  // its first instance's results, which stand in for the results of every
+  // later instance of that kind.
+  llvm::DenseMap<mlir::Attribute, llvm::SmallVector<RoutingGraph::NodeId>>
+      group_kind_results;
 
   // Collects memory node sizes to apply after traversal
   // Key: NodeId of memory node
@@ -137,20 +140,21 @@ void processRegion(mlir::Region& region, DeviceInitContext& ctx);
 void processGroupOp(mlir::ktdf_arch::GroupOp group_op, DeviceInitContext& ctx) {
   auto group_kind = group_op.getKind();
 
-  // Flatten groups: only process first instance of each kind.
-  // For skipped (deduplicated) groups, still add nodes for any yielded
-  // exec_unit results so that datapaths referencing them can be resolved.
-  if (group_kind && ctx.processed_group_kinds.contains(group_kind)) {
-    for (auto result : group_op.getResults()) {
-      auto node_id = ctx.graph.addNode(
-          group_kind, RoutingGraph::ResourceNode::ResourceKind::Compute);
-      ctx.value_to_node_id[result] = node_id;
-    }
-    return;
-  }
-
+  // Flatten groups: only process first instance of each kind. The results of
+  // a skipped (deduplicated) instance map to the nodes of the first
+  // instance's results, so that datapaths referencing them resolve to the
+  // same resources.
   if (group_kind) {
-    ctx.processed_group_kinds.insert(group_kind);
+    auto it = ctx.group_kind_results.find(group_kind);
+    if (it != ctx.group_kind_results.end()) {
+      assert(it->second.size() == group_op.getNumResults() &&
+             "Groups of the same kind must yield the same number of results");
+      for (auto [result, node_id] :
+           llvm::zip(group_op.getResults(), it->second)) {
+        ctx.value_to_node_id[result] = node_id;
+      }
+      return;
+    }
   }
 
   // Map shared memory block arguments to their operands
@@ -177,6 +181,13 @@ void processGroupOp(mlir::ktdf_arch::GroupOp group_op, DeviceInitContext& ctx) {
       assert(it != ctx.value_to_node_id.end() &&
              "Yielded value must be defined in group body");
       ctx.value_to_node_id[result] = it->second;
+    }
+  }
+
+  if (group_kind) {
+    auto& result_nodes = ctx.group_kind_results[group_kind];
+    for (auto result : group_op.getResults()) {
+      result_nodes.push_back(ctx.value_to_node_id.lookup(result));
     }
   }
 }

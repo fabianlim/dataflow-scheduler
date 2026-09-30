@@ -5,15 +5,18 @@
 
 // All four ring stops fold into one RING_STOP node, so an L1 -> L1 transfer
 // between cores is the path L1 -> MNISU -> RING_STOP -> MNILU -> L1. The ring
-// links between stops collapse into a self edge on RING_STOP.
+// links between stops collapse into a self edge on RING_STOP. The MNILU and
+// MNISU yielded by cores 1..3 resolve to the nodes of core 0's, so the graph
+// has no other nodes.
 
 // CHECK-LABEL: RoutingGraph {
-// CHECK:         - [[L1:[0-9]+]]: "L1" [Memory]
+// CHECK-NEXT:  Nodes:
+// CHECK-NEXT:    - {{[0-9]+}}: "DDR" [Memory]
+// CHECK-NEXT:    - [[L1:[0-9]+]]: "L1" [Memory]
 // CHECK-NEXT:    - [[MNILU:[0-9]+]]: "MNILU" [LoadStoreUnit]
 // CHECK-NEXT:    - [[MNISU:[0-9]+]]: "MNISU" [LoadStoreUnit]
-// CHECK:         - [[STOP:[0-9]+]]: "RING_STOP" [Switch]
-// CHECK-NOT:     "RING_STOP" [Switch]
-// CHECK:       Edges:
+// CHECK-NEXT:    - [[STOP:[0-9]+]]: "RING_STOP" [Switch]
+// CHECK-NEXT:  Edges:
 // CHECK-DAG:     - [[L1]]: "L1" -> [[MNISU]]: "MNISU" [cost=1]
 // CHECK-DAG:     - [[MNISU]]: "MNISU" -> [[STOP]]: "RING_STOP" [cost=1]
 // CHECK-DAG:     - [[STOP]]: "RING_STOP" -> [[MNILU]]: "MNILU" [cost=1]
