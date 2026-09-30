@@ -716,6 +716,11 @@ static llvm::FailureOr<llvm::SmallVector<StageNode*>> buildExpandedStageList(
       case RK::Compute:
         i = handleComputeNode(i, node);
         break;
+      case RK::Switch:
+        // A switch only relays data between the load/store units on either
+        // side of it; it has no stage of its own.
+        ++i;
+        break;
     }
   }
 

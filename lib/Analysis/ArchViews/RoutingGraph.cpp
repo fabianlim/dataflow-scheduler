@@ -27,6 +27,7 @@
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -49,6 +50,17 @@ struct DeviceInitContext {
   // Key: NodeId of memory node
   // Value: Size in bytes
   llvm::DenseMap<RoutingGraph::NodeId, size_t> node_sizes;
+
+  // Maps each switch kind to the node that represents all its instances.
+  llvm::DenseMap<mlir::Attribute, RoutingGraph::NodeId> switch_kind_nodes;
+
+  // Every switch instance seen, with the node it was resolved to.
+  llvm::SmallVector<std::pair<mlir::ktdf_arch::SwitchOp, RoutingGraph::NodeId>>
+      switches;
+
+  // Datapaths with a switch port on either end. They are resolved once the
+  // whole switch fabric is known (see resolveSwitchDatapaths).
+  llvm::SmallVector<mlir::ktdf_arch::DatapathOp> port_datapaths;
 
   explicit DeviceInitContext(RoutingGraph& g) : graph(g) {}
 };
@@ -89,6 +101,33 @@ void processExecutionUnitOp(mlir::ktdf_arch::ExecutionUnitOp exec_op,
                        : RoutingGraph::ResourceNode::ResourceKind::Compute;
   auto node_id = ctx.graph.addNode(kind, node_kind);
   ctx.value_to_node_id[exec_op.getResult()] = node_id;
+}
+
+// Process a switch operation. Like groups, switches are deduplicated by kind:
+// all instances of a kind share one node. A switch without a kind is its own
+// class and gets its own node.
+void processSwitchOp(mlir::ktdf_arch::SwitchOp switch_op,
+                     DeviceInitContext& ctx) {
+  constexpr auto node_kind = RoutingGraph::ResourceNode::ResourceKind::Switch;
+  auto kind = switch_op.getKind();
+  if (!kind) {
+    auto node_id = ctx.graph.addNode(
+        mlir::StringAttr::get(switch_op.getContext(), "switch"), node_kind);
+    ctx.switches.emplace_back(switch_op, node_id);
+    return;
+  }
+
+  auto it = ctx.switch_kind_nodes.find(kind);
+  if (it == ctx.switch_kind_nodes.end()) {
+    it = ctx.switch_kind_nodes
+             .try_emplace(kind, ctx.graph.addNode(kind, node_kind))
+             .first;
+  }
+  ctx.switches.emplace_back(switch_op, it->second);
+}
+
+bool isSwitchPort(mlir::Value value) {
+  return mlir::isa<mlir::ktdf_arch::PortType>(value.getType());
 }
 
 // Forward declaration for mutual recursion
@@ -149,6 +188,11 @@ void processDatapathOp(mlir::ktdf_arch::DatapathOp datapath_op,
   auto source_val = datapath_op.getSource();
   auto target_val = datapath_op.getTarget();
 
+  if (isSwitchPort(source_val) || isSwitchPort(target_val)) {
+    ctx.port_datapaths.push_back(datapath_op);
+    return;
+  }
+
   auto source_it = ctx.value_to_node_id.find(source_val);
   auto target_it = ctx.value_to_node_id.find(target_val);
 
@@ -177,12 +221,117 @@ void processRegion(mlir::Region& region, DeviceInitContext& ctx) {
       processExecutionUnitOp(exec_op, ctx);
     } else if (auto group_op = mlir::dyn_cast<mlir::ktdf_arch::GroupOp>(&op)) {
       processGroupOp(group_op, ctx);
+    } else if (auto switch_op =
+                   mlir::dyn_cast<mlir::ktdf_arch::SwitchOp>(&op)) {
+      processSwitchOp(switch_op, ctx);
     } else if (auto datapath_op =
                    mlir::dyn_cast<mlir::ktdf_arch::DatapathOp>(&op)) {
       processDatapathOp(datapath_op, ctx);
     }
     // Ignore other operations (like YieldOp, which is handled in
     // processGroupOp)
+  }
+}
+
+// Resolve the datapaths that touch switch ports into kind-level edges.
+//
+// Routing is first worked out on a port-level graph, whose nodes are the
+// switch ports of every instance: a port reaches another port of the same
+// switch if the switch's connectivity allows it, and a port of a different
+// switch if a datapath links the two. Entries are datapaths from a resource
+// into a port, exits are datapaths from a port to a resource. A kind-level
+// edge is added only for datapaths that lie on some entry-to-exit route:
+//
+//   - resource -> port:  the port reaches some exit;
+//   - port -> resource:  the port is reached from some entry;
+//   - port -> port:      the source is reached from some entry and the target
+//                        reaches some exit.
+//
+// Endpoints are mapped to the node of their switch's kind. A port -> port
+// link between two instances of the same kind therefore becomes a self edge
+// on that node. Duplicate edges (one per instance) are added once.
+void resolveSwitchDatapaths(DeviceInitContext& ctx) {
+  if (ctx.port_datapaths.empty()) return;
+
+  llvm::DenseMap<mlir::Value, RoutingGraph::NodeId> port_to_node_id;
+  llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value>> successors;
+  llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value>> predecessors;
+  auto addPortLink = [&](mlir::Value from, mlir::Value to) {
+    successors[from].push_back(to);
+    predecessors[to].push_back(from);
+  };
+
+  for (auto [switch_op, node_id] : ctx.switches) {
+    auto connectivity = switch_op.getConnectivity();
+    auto ports = switch_op.getResults();
+    for (auto [source_index, source] : llvm::enumerate(ports)) {
+      port_to_node_id[source] = node_id;
+      for (auto [target_index, target] : llvm::enumerate(ports)) {
+        if (connectivity.contains(source_index, target_index)) {
+          addPortLink(source, target);
+        }
+      }
+    }
+  }
+
+  llvm::SmallVector<mlir::Value> entry_ports, exit_ports;
+  for (auto datapath_op : ctx.port_datapaths) {
+    auto source = datapath_op.getSource();
+    auto target = datapath_op.getTarget();
+    bool source_is_port = isSwitchPort(source);
+    bool target_is_port = isSwitchPort(target);
+    if (source_is_port && target_is_port) {
+      addPortLink(source, target);
+    } else if (target_is_port) {
+      entry_ports.push_back(target);
+    } else {
+      exit_ports.push_back(source);
+    }
+  }
+
+  // Ports reachable from @p roots along @p links (roots included).
+  auto reachable =
+      [](llvm::ArrayRef<mlir::Value> roots,
+         const llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value>>&
+             links) {
+        llvm::DenseSet<mlir::Value> seen(roots.begin(), roots.end());
+        llvm::SmallVector<mlir::Value> worklist(roots.begin(), roots.end());
+        while (!worklist.empty()) {
+          mlir::Value port = worklist.pop_back_val();
+          auto it = links.find(port);
+          if (it == links.end()) continue;
+          for (mlir::Value next : it->second) {
+            if (seen.insert(next).second) worklist.push_back(next);
+          }
+        }
+        return seen;
+      };
+  llvm::DenseSet<mlir::Value> from_entry = reachable(entry_ports, successors);
+  llvm::DenseSet<mlir::Value> to_exit = reachable(exit_ports, predecessors);
+
+  auto lookupNode = [&](mlir::Value value) {
+    if (isSwitchPort(value)) {
+      auto it = port_to_node_id.find(value);
+      assert(it != port_to_node_id.end() &&
+             "Datapath port must belong to a defined switch");
+      return it->second;
+    }
+    auto it = ctx.value_to_node_id.find(value);
+    assert(it != ctx.value_to_node_id.end() &&
+           "Datapath endpoint must be a defined resource");
+    return it->second;
+  };
+
+  llvm::SetVector<std::pair<RoutingGraph::NodeId, RoutingGraph::NodeId>> edges;
+  for (auto datapath_op : ctx.port_datapaths) {
+    auto source = datapath_op.getSource();
+    auto target = datapath_op.getTarget();
+    bool routed = (!isSwitchPort(source) || from_entry.contains(source)) &&
+                  (!isSwitchPort(target) || to_exit.contains(target));
+    if (routed) edges.insert({lookupNode(source), lookupNode(target)});
+  }
+  for (auto [source_id, target_id] : edges) {
+    ctx.graph.addEdge(source_id, target_id, 1);
   }
 }
 
@@ -202,9 +351,14 @@ RoutingGraph::RoutingGraph(const mlir::ktdf_arch::Device& device)
 // group kind. This creates a representative view of the hierarchical structure
 // where symmetric groups are deduplicated.
 //
+// Switches are deduplicated the same way, by kind; see
+// resolveSwitchDatapaths for how datapaths on their ports become edges.
+//
 // Properties currently extracted:
 //   - Memory nodes: kind (memory space), size (if specified)
 //   - Execution unit nodes: kind (compute unit type)
+//   - Switch nodes: kind; connectivity restricts which port datapaths become
+//     edges
 //   - Datapath edges: kind (transfer unit), source, target
 //
 // Properties currently skipped:
@@ -220,6 +374,7 @@ void RoutingGraph::initialize() {
 
   // Process the device body
   processRegion(getDevice().getBodyRegion(), ctx);
+  resolveSwitchDatapaths(ctx);
 
   // Apply node sizes collected during traversal
   for (const auto& [node_id, size] : ctx.node_sizes) {
@@ -427,6 +582,8 @@ llvm::StringRef RoutingGraph::stringifyResourceKind(
       return "Compute";
     case ResourceNode::ResourceKind::LoadStoreUnit:
       return "LoadStoreUnit";
+    case ResourceNode::ResourceKind::Switch:
+      return "Switch";
   }
   llvm_unreachable("unknown RoutingGraph::ResourceNode::ResourceKind");
 }

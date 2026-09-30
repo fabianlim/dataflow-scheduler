@@ -22,6 +22,23 @@
 // by path expansion. The graph models legal resource-to-resource routing hops.
 // Load/store units are represented as first-class nodes (LoadStoreUnit kind).
 //
+// The graph is kind-level: symmetric groups are deduplicated by kind, and so
+// are switches. A switch becomes a single Switch node per kind, and datapaths
+// between switch ports are resolved to that node:
+//
+//   - The switch's port connectivity is honoured by resolving datapaths on a
+//     port-level graph first: an edge into or out of a switch node, or between
+//     two switch nodes, is only added if it lies on some route from a
+//     non-switch resource through the switch fabric to another non-switch
+//     resource. What the kind-level graph cannot express is which entry
+//     reaches which exit: any edge into a switch node composes with any edge
+//     out of it.
+//   - Links between two switches of the same kind (e.g. between the stops of
+//     a ring) collapse into a self edge on that kind's node. It records that
+//     the fabric forwards between instances; shortest paths never take it, so
+//     a path crosses each switch kind once, whatever the instance-level hop
+//     count.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef DATAFLOW_SCHEDULER_ANALYSIS_ARCHVIEWS_ROUTINGGRAPH_H_
@@ -55,6 +72,7 @@ class RoutingGraph : public mlir::ktdf_arch::DeviceView {
       Memory,
       Compute,
       LoadStoreUnit,
+      Switch,
     };
 
     NodeId id;
