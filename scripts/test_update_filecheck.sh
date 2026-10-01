@@ -201,11 +201,14 @@ function process_run_line() {
   # lines with the bare "// CHECK:" prefix even when --check-prefix is set.
   # Replace them with the actual prefix so each run is self-contained.
   if [[ "${prefix}" != "CHECK" ]]; then
-    sed -i '' -e "s|^// CHECK: #|// ${prefix}: #|g" "${tmp_checks}"
+    sed -e "s|^// CHECK: #|// ${prefix}: #|g" "${tmp_checks}" \
+      > /tmp/out && mv /tmp/out "${tmp_checks}"
   fi
 
   # Convert CHECK:      (6 spaces) → CHECK-NEXT: for body lines.
-  sed -i '' -e "s|// ${prefix}:      |// ${prefix}-NEXT:|g" "${tmp_checks}"
+  # (No in-place sed: BSD and GNU sed disagree on the -i syntax.)
+  sed -e "s|// ${prefix}:      |// ${prefix}-NEXT:|g" "${tmp_checks}" \
+    > /tmp/out && mv /tmp/out "${tmp_checks}"
 
   # The output always contains a top-level wrapper module { ... } that has a
   # nested module { on the very next line.  CHECK-NEXT on that first nested
@@ -242,8 +245,8 @@ function process_run_line() {
          print "// " p ":   module {"
          done=1; next
        } {print}' "${tmp_checks}" > /tmp/out && mv /tmp/out "${tmp_checks}"
-    sed -i '' -e "s|^// ${prefix}-LABEL:   module {$|// ${prefix}:   module {|" \
-        "${tmp_checks}"
+    sed -e "s|^// ${prefix}-LABEL:   module {$|// ${prefix}:   module {|" \
+        "${tmp_checks}" > /tmp/out && mv /tmp/out "${tmp_checks}"
     printf "// %s: }" "${prefix}" >> "${tmp_checks}"
   fi
 
