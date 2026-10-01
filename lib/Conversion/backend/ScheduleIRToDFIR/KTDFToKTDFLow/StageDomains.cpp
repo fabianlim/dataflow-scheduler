@@ -18,9 +18,14 @@
 
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/StageDomains.h"
 
+#include <string>
+
 #include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/Sequence.h>
+#include <llvm/ADT/SetVector.h>
+#include <llvm/ADT/SmallPtrSet.h>
+#include <llvm/Support/InterleavedRange.h>
 #include <mlir/IR/Diagnostics.h>
 
 #include "dataflow-scheduler/Analysis/CrossCoreChannels.h"
@@ -32,14 +37,59 @@ using namespace scheduler;
 
 namespace {
 
-/// Gets the tiles @p stage executes on: those of its domain, verified to be a
-/// non-empty set over the tile within the grid, or every tile of the grid if
-/// it has none.
-mlir::FailureOr<llvm::SmallVector<int64_t>> getStageTiles(
-    mlir::ktdf::StageOp stage, int grid_size) {
+/// The stages that write and the stages that read each fifo slot. A stage is
+/// the innermost one around the fifo access.
+struct FifoAccesses {
+  llvm::MapVector<mlir::Value, llvm::SmallVector<mlir::ktdf::StageOp, 1>>
+      writers;
+  llvm::MapVector<mlir::Value, llvm::SmallVector<mlir::ktdf::StageOp, 1>>
+      readers;
+};
+
+FifoAccesses collectFifoAccesses(llvm::ArrayRef<mlir::ktdf::StageOp> stages) {
+  FifoAccesses accesses;
+  for (mlir::ktdf::StageOp stage : stages) {
+    stage.walk([&](mlir::Operation* op) {
+      if (op->getParentOfType<mlir::ktdf::StageOp>() != stage) {
+        return;
+      }
+      if (auto transfer = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op)) {
+        if (transfer.isDestFifo()) {
+          accesses.writers[transfer.getDestination()].push_back(stage);
+        }
+        if (transfer.isSourceFifo()) {
+          accesses.readers[transfer.getSource()].push_back(stage);
+        }
+      } else if (auto write = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(op)) {
+        accesses.writers[write.getFifoSlot()].push_back(stage);
+      } else if (auto read = mlir::dyn_cast<mlir::ktdf::ReadFromFifoOp>(op)) {
+        accesses.readers[read.getFifoSlot()].push_back(stage);
+      }
+    });
+  }
+  return accesses;
+}
+
+/// Gets the cross-core fifos among those in @p fifos, in order.
+llvm::SetVector<mlir::Value> getCrossCoreFifos(
+    const llvm::MapVector<mlir::Value,
+                          llvm::SmallVector<mlir::ktdf::StageOp, 1>>& fifos) {
+  llvm::SetVector<mlir::Value> cross_core;
+  for (const auto& [fifo, unused_stages] : fifos) {
+    if (getFifoGroups(fifo)) {
+      cross_core.insert(fifo);
+    }
+  }
+  return cross_core;
+}
+
+/// Gets the domain of @p stage, verified to be an integer set over the tile
+/// with at most one symbol, the group, or nullptr if it has none.
+mlir::FailureOr<mlir::IntegerSetAttr> getStageDomain(
+    mlir::ktdf::StageOp stage) {
   const mlir::Attribute attr = stage->getAttr(kStageDomainAttrName);
   if (!attr) {
-    return llvm::to_vector(llvm::seq<int64_t>(0, grid_size));
+    return mlir::IntegerSetAttr();
   }
 
   auto domain_attr = mlir::dyn_cast<mlir::IntegerSetAttr>(attr);
@@ -49,13 +99,23 @@ mlir::FailureOr<llvm::SmallVector<int64_t>> getStageTiles(
     return mlir::failure();
   }
   const mlir::IntegerSet domain = domain_attr.getValue();
-  if (domain.getNumDims() != 1 || domain.getNumSymbols() != 0) {
-    stage.emitError() << "domain must be a set over the compute tile alone, "
-                         "with one dimension and no symbols, but it has "
+  if (domain.getNumDims() != 1 || domain.getNumSymbols() > 1) {
+    stage.emitError() << "domain must be a set over the compute tile, with "
+                         "one dimension and at most one symbol, the group, "
+                         "but it has "
                       << domain.getNumDims() << " dimensions and "
                       << domain.getNumSymbols() << " symbols";
     return mlir::failure();
   }
+  return domain_attr;
+}
+
+/// Gets the tiles of the plain domain @p domain_attr of @p stage, verified to
+/// be non-empty and within the grid.
+mlir::FailureOr<llvm::SmallVector<int64_t>> getPlainDomainTiles(
+    mlir::ktdf::StageOp stage, mlir::IntegerSetAttr domain_attr,
+    int grid_size) {
+  const mlir::IntegerSet domain = domain_attr.getValue();
   if (!isDomainWithinGrid(domain, grid_size)) {
     stage.emitError() << "domain " << domain_attr
                       << " has tiles outside the grid [0, " << grid_size
@@ -71,80 +131,102 @@ mlir::FailureOr<llvm::SmallVector<int64_t>> getStageTiles(
   return tiles;
 }
 
-/// Prints @p tiles as a set, e.g. `{0, 1, 2}`.
-std::string printTiles(llvm::ArrayRef<int64_t> tiles) {
-  std::string printed;
-  llvm::raw_string_ostream os(printed);
-  os << "{";
-  llvm::interleaveComma(tiles, os);
-  os << "}";
-  return printed;
+/// Prints the groups of the cross-core fifo @p fifo for debugging, with what
+/// is derived from them.
+void debugPrintGroups(mlir::Value fifo,
+                      llvm::ArrayRef<ChannelGroup> channel_groups) {
+  LDBG(1) << "Groups of the cross-core fifo " << getFifoGroups(fifo);
+  for (const ChannelGroup& group : channel_groups) {
+    LDBG(1) << "  group " << group.id << ": producers {"
+            << llvm::interleaved(group.producers) << "}, consumers {"
+            << llvm::interleaved(group.consumers) << "}";
+  }
+  LDBG(1) << "  producer tiles {"
+          << llvm::interleaved(getProducerTiles(channel_groups))
+          << "}, consumer tiles {"
+          << llvm::interleaved(getConsumerTiles(channel_groups)) << "}";
+  LDBG(1) << "  producer of each consumer: "
+          << llvm::interleaved(llvm::map_range(
+                 getConsumerTiles(channel_groups), [&](int64_t consumer) {
+                   return std::to_string(consumer) + " <- " +
+                          std::to_string(
+                              *getProducerOf(channel_groups, consumer));
+                 }));
+  LDBG(1) << "  self-feeding consumers {"
+          << llvm::interleaved(getSelfFeedingConsumers(channel_groups)) << "}";
 }
 
-/// Verifies that the stage writing each peer fifo executes on the tiles that
-/// feed the stage reading it: the image of the peer map over the reader's
-/// tiles.
-mlir::LogicalResult verifyPeerFifos(
-    llvm::ArrayRef<mlir::ktdf::StageOp> stages,
-    const llvm::DenseMap<mlir::Operation*, llvm::SmallVector<int64_t>>&
+/// Resolves the groups of each cross-core fifo in @p accesses from its group
+/// domain and the domains of the stages that write and read it, and sets the
+/// tiles of those stages in @p stage_tiles: the producers or the consumers of
+/// all groups.
+mlir::LogicalResult resolveCrossCoreFifos(
+    const FifoAccesses& accesses,
+    const llvm::DenseMap<mlir::Operation*, mlir::IntegerSetAttr>& domains,
+    int grid_size,
+    llvm::DenseMap<mlir::Operation*, llvm::SmallVector<int64_t>>&
         stage_tiles) {
-  // Fifo slot -> the stages that write it and the stages that read it. A
-  // stage is the innermost one around the fifo access.
-  llvm::MapVector<mlir::Value, llvm::SmallVector<mlir::ktdf::StageOp, 1>>
-      writers;
-  llvm::MapVector<mlir::Value, llvm::SmallVector<mlir::ktdf::StageOp, 1>>
-      readers;
-  for (mlir::ktdf::StageOp stage : stages) {
-    stage.walk([&](mlir::Operation* op) {
-      if (op->getParentOfType<mlir::ktdf::StageOp>() != stage) {
-        return;
-      }
-      if (auto transfer = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op)) {
-        if (transfer.isDestFifo()) {
-          writers[transfer.getDestination()].push_back(stage);
-        }
-        if (transfer.isSourceFifo()) {
-          readers[transfer.getSource()].push_back(stage);
-        }
-      } else if (auto write = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(op)) {
-        writers[write.getFifoSlot()].push_back(stage);
-      } else if (auto read = mlir::dyn_cast<mlir::ktdf::ReadFromFifoOp>(op)) {
-        readers[read.getFifoSlot()].push_back(stage);
-      }
-    });
-  }
+  llvm::SetVector<mlir::Value> fifos = getCrossCoreFifos(accesses.writers);
+  fifos.insert_range(getCrossCoreFifos(accesses.readers));
 
-  for (auto& [fifo, fifo_writers] : writers) {
-    const mlir::AffineMapAttr peer = getFifoPeer(fifo);
-    if (!peer) {
-      continue;
+  // The domain of a stage that writes or reads a cross-core fifo selects its
+  // tiles by group.
+  const auto getParametricDomain =
+      [&](mlir::ktdf::StageOp stage,
+          llvm::StringRef access) -> mlir::FailureOr<mlir::IntegerSetAttr> {
+    const mlir::IntegerSetAttr domain = domains.lookup(stage.getOperation());
+    if (!domain || domain.getValue().getNumSymbols() != 1) {
+      stage.emitError() << "stage " << access
+                        << " a cross-core fifo, so its domain must have one "
+                           "symbol, the group, that selects its tiles in "
+                           "each group";
+      return mlir::failure();
     }
-    const mlir::AffineMap peer_map = peer.getValue();
-    if (peer_map.getNumDims() != 1 || peer_map.getNumSymbols() != 0 ||
-        peer_map.getNumResults() != 1) {
-      return fifo_writers.front().emitError()
-             << "the peer relation " << peer
-             << " of the fifo this stage writes must map one tile to one "
-                "tile, with no symbols";
+    return domain;
+  };
+
+  for (mlir::Value fifo : fifos) {
+    auto writers = accesses.writers.lookup(fifo);
+    auto readers = accesses.readers.lookup(fifo);
+    if (writers.empty()) {
+      return readers.front().emitError()
+             << "stage reads a cross-core fifo that no stage writes";
+    }
+    if (readers.empty()) {
+      return writers.front().emitError()
+             << "stage writes a cross-core fifo that no stage reads";
     }
 
-    for (mlir::ktdf::StageOp reader : readers.lookup(fifo)) {
-      const auto feeding_tiles =
-          getPeerImage(peer_map, stage_tiles.at(reader.getOperation()));
-      for (mlir::ktdf::StageOp writer : fifo_writers) {
-        const auto& writer_tiles = stage_tiles.at(writer.getOperation());
-        if (writer_tiles == feeding_tiles) {
-          continue;
+    for (mlir::ktdf::StageOp writer : writers) {
+      auto producer_domain = getParametricDomain(writer, "writes");
+      if (mlir::failed(producer_domain)) {
+        return mlir::failure();
+      }
+      for (mlir::ktdf::StageOp reader : readers) {
+        auto consumer_domain = getParametricDomain(reader, "reads");
+        if (mlir::failed(consumer_domain)) {
+          return mlir::failure();
         }
-        auto diag = writer.emitError()
-                    << "stage writes a peer fifo on the tiles "
-                    << printTiles(writer_tiles)
-                    << ", but the tiles that feed the stage reading it are "
-                    << printTiles(feeding_tiles)
-                    << ": its domain must be the image of the peer relation "
-                    << peer << " over the domain of the reading stage";
-        diag.attachNote(reader.getLoc()) << "the stage reading it";
-        return diag;
+
+        auto channel_groups = resolveChannelGroups(
+            getFifoGroups(fifo), *producer_domain, *consumer_domain,
+            grid_size, [&] {
+              auto diag = writer.emitError()
+                          << "invalid groups of the cross-core fifo this "
+                             "stage writes: ";
+              diag.attachNote(reader.getLoc())
+                  << "the stage reading the fifo";
+              return diag;
+            });
+        if (mlir::failed(channel_groups)) {
+          return mlir::failure();
+        }
+        LLVM_DEBUG(debugPrintGroups(fifo, *channel_groups));
+
+        stage_tiles[writer.getOperation()] =
+            getProducerTiles(*channel_groups);
+        stage_tiles[reader.getOperation()] =
+            getConsumerTiles(*channel_groups);
       }
     }
   }
@@ -158,16 +240,53 @@ mlir::LogicalResult scheduler::resolveComponentTiles(
     ComponentTiles& component_tiles) {
   LDBG(1) << "Step 2b: Resolve stage domains";
 
+  const FifoAccesses accesses = collectFifoAccesses(stages);
+
+  // A stage without a domain executes on the whole grid and a stage with a
+  // plain domain on its tiles. A domain with the group symbol selects the
+  // tiles of the groups of the one cross-core fifo the stage writes or reads,
+  // which are resolved below.
+  llvm::DenseMap<mlir::Operation*, mlir::IntegerSetAttr> domains;
   llvm::DenseMap<mlir::Operation*, llvm::SmallVector<int64_t>> stage_tiles;
   for (mlir::ktdf::StageOp stage : stages) {
-    auto tiles = getStageTiles(stage, grid_size);
-    if (mlir::failed(tiles)) {
+    auto domain = getStageDomain(stage);
+    if (mlir::failed(domain)) {
       return mlir::failure();
     }
-    stage_tiles[stage.getOperation()] = std::move(*tiles);
+    domains[stage.getOperation()] = *domain;
+    if (!*domain) {
+      stage_tiles[stage.getOperation()] =
+          llvm::to_vector(llvm::seq<int64_t>(0, grid_size));
+      continue;
+    }
+    if (domain->getValue().getNumSymbols() == 0) {
+      auto tiles = getPlainDomainTiles(stage, *domain, grid_size);
+      if (mlir::failed(tiles)) {
+        return mlir::failure();
+      }
+      stage_tiles[stage.getOperation()] = std::move(*tiles);
+      continue;
+    }
+
+    llvm::SmallPtrSet<mlir::Value, 2> stage_fifos;
+    for (const auto* fifos : {&accesses.writers, &accesses.readers}) {
+      for (const auto& [fifo, fifo_stages] : *fifos) {
+        if (getFifoGroups(fifo) && llvm::is_contained(fifo_stages, stage)) {
+          stage_fifos.insert(fifo);
+        }
+      }
+    }
+    if (stage_fifos.size() != 1) {
+      stage.emitError() << "a domain with the group symbol is only valid on a "
+                           "stage that writes or reads exactly one cross-core "
+                           "fifo, but this stage writes or reads "
+                        << stage_fifos.size();
+      return mlir::failure();
+    }
   }
 
-  if (mlir::failed(verifyPeerFifos(stages, stage_tiles))) {
+  if (mlir::failed(
+          resolveCrossCoreFifos(accesses, domains, grid_size, stage_tiles))) {
     return mlir::failure();
   }
 

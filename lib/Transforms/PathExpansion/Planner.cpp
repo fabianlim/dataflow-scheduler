@@ -385,25 +385,26 @@ static llvm::SetVector<mlir::Value> getSharedValues(StageNode* source,
   return shared;
 }
 
-/// Return the type of a fifo with a peer relation that joins \p source and
-/// \p target, or nullptr if the two stages share no such fifo.
-static mlir::ktdf::FifoSlotType getPeerFifo(StageNode* source,
-                                            StageNode* target) {
+/// Return the type of a cross-core fifo that joins \p source and \p target,
+/// or nullptr if the two stages share no such fifo.
+static mlir::ktdf::FifoSlotType getCrossCoreFifo(StageNode* source,
+                                                 StageNode* target) {
   for (mlir::Value value : getSharedValues(source, target)) {
     auto type = mlir::dyn_cast<mlir::ktdf::FifoSlotType>(value.getType());
-    if (type && getFifoPeer(value)) return type;
+    if (type && getFifoGroups(value)) return type;
   }
   return nullptr;
 }
 
-/// For each pair of consecutive stages, the peer fifo that joins them, or
-/// nullptr if they are not joined by one.
-static llvm::SmallVector<mlir::ktdf::FifoSlotType> collectPeerFifos(
+/// For each pair of consecutive stages, the cross-core fifo that joins them,
+/// or nullptr if they are not joined by one.
+static llvm::SmallVector<mlir::ktdf::FifoSlotType> collectCrossCoreFifos(
     llvm::ArrayRef<StageNode*> sorted_stages) {
-  llvm::SmallVector<mlir::ktdf::FifoSlotType> peer_fifos;
+  llvm::SmallVector<mlir::ktdf::FifoSlotType> cross_core_fifos;
   for (size_t i = 0; i + 1 < sorted_stages.size(); ++i)
-    peer_fifos.push_back(getPeerFifo(sorted_stages[i], sorted_stages[i + 1]));
-  return peer_fifos;
+    cross_core_fifos.push_back(
+        getCrossCoreFifo(sorted_stages[i], sorted_stages[i + 1]));
+  return cross_core_fifos;
 }
 
 /// Find a path from some node of \p source to some node of \p target that
@@ -449,16 +450,16 @@ findCrossCorePath(ResourceType source, ResourceType target,
 /// This correctly handles round-trip pipelines (e.g. DDR→SFU→DDR) where
 /// start == end, which a single findShortestPath(DDR, DDR) call cannot resolve.
 ///
-/// A segment whose two stages are joined by a peer fifo (\p peer_fifos holds
-/// one entry per segment) is routed across cores instead: to the fifo's source
-/// unit, through switches only to its destination unit, and on to the next
-/// stage's resource.
+/// A segment whose two stages are joined by a cross-core fifo
+/// (\p cross_core_fifos holds one entry per segment) is routed across cores
+/// instead: to the fifo's source unit, through switches only to its
+/// destination unit, and on to the next stage's resource.
 static std::optional<scheduler::arch_view::RoutingGraph::Path>
 buildFullShortestPath(llvm::ArrayRef<ResourceType> original_resource_path,
-                      llvm::ArrayRef<mlir::ktdf::FifoSlotType> peer_fifos,
+                      llvm::ArrayRef<mlir::ktdf::FifoSlotType> cross_core_fifos,
                       const scheduler::arch_view::RoutingGraph& arch_graph) {
-  assert(peer_fifos.size() + 1 == original_resource_path.size() &&
-         "expected one peer fifo entry per segment");
+  assert(cross_core_fifos.size() + 1 == original_resource_path.size() &&
+         "expected one cross-core fifo entry per segment");
   scheduler::arch_view::RoutingGraph::Path full_path;
 
   // Append seg, skipping its first node if it duplicates the tail of the path
@@ -477,13 +478,15 @@ buildFullShortestPath(llvm::ArrayRef<ResourceType> original_resource_path,
     scheduler::arch_view::RoutingGraph::NodeId dst =
         arch_graph.getNodeIdForResource(original_resource_path[i + 1]);
 
-    if (mlir::ktdf::FifoSlotType peer_fifo = peer_fifos[i]) {
+    if (mlir::ktdf::FifoSlotType cross_core_fifo = cross_core_fifos[i]) {
       std::optional<scheduler::arch_view::RoutingGraph::Path> cross =
           findCrossCorePath(
-              llvm::dyn_cast<ResourceType>(peer_fifo.getSrc()),
-              llvm::dyn_cast<ResourceType>(peer_fifo.getDest()), arch_graph);
+              llvm::dyn_cast<ResourceType>(cross_core_fifo.getSrc()),
+              llvm::dyn_cast<ResourceType>(cross_core_fifo.getDest()),
+              arch_graph);
       if (!cross) {
-        LDBG(1) << "No cross-core path for peer fifo " << peer_fifo;
+        LDBG(1) << "No cross-core path for cross-core fifo "
+                << cross_core_fifo;
         return std::nullopt;
       }
       std::optional<scheduler::arch_view::RoutingGraph::Path> to_fifo =
@@ -1219,17 +1222,18 @@ static mlir::LogicalResult populateIntermediateStageTransfers(
 //===----------------------------------------------------------------------===//
 
 /// Return true if the pipeline has something to plan the route from: a stage
-/// whose unit is given, or a peer fifo between two of its stages, which fixes
-/// the units the route crosses cores between.
-static bool hasAnchor(llvm::ArrayRef<StageNode*> sorted_stages,
-                      llvm::ArrayRef<mlir::ktdf::FifoSlotType> peer_fifos) {
+/// whose unit is given, or a cross-core fifo between two of its stages, which
+/// fixes the units the route crosses cores between.
+static bool hasAnchor(
+    llvm::ArrayRef<StageNode*> sorted_stages,
+    llvm::ArrayRef<mlir::ktdf::FifoSlotType> cross_core_fifos) {
   return llvm::any_of(sorted_stages,
                       [](StageNode* stage) {
                         auto op = mlir::dyn_cast_or_null<mlir::ktdf::StageOp>(
                             stage->getOperation());
                         return op && op.getApplicableUnits().has_value();
                       }) ||
-         llvm::any_of(peer_fifos, [](mlir::ktdf::FifoSlotType fifo) {
+         llvm::any_of(cross_core_fifos, [](mlir::ktdf::FifoSlotType fifo) {
            return static_cast<bool>(fifo);
          });
 }
@@ -1264,16 +1268,16 @@ static bool hasDirectLink(
 }
 
 /// Return true if the data that two consecutive mapped stages exchange can
-/// legally travel from \p source_unit to \p target_unit: a fifo with a peer
-/// relation crosses cores through switches only, any other fifo connects the
-/// units directly, and a memory buffer is written by one unit and read by the
+/// legally travel from \p source_unit to \p target_unit: a cross-core fifo
+/// crosses cores through switches only, any other fifo connects the units
+/// directly, and a memory buffer is written by one unit and read by the
 /// other.
 static bool isLegalJoin(StageNode* source, ResourceType source_unit,
                         StageNode* target, ResourceType target_unit,
                         const scheduler::arch_view::RoutingGraph& arch_graph) {
   return llvm::all_of(getSharedValues(source, target), [&](mlir::Value value) {
     if (mlir::isa<mlir::ktdf::FifoSlotType>(value.getType())) {
-      if (getFifoPeer(value))
+      if (getFifoGroups(value))
         return findCrossCorePath(source_unit, target_unit, arch_graph)
             .has_value();
       return hasDirectLink(source_unit, target_unit, arch_graph);
@@ -1414,10 +1418,10 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
     return nullptr;
   }
 
-  // PREP 3: Verify pipeline has an anchor stage or a peer fifo
-  llvm::SmallVector<mlir::ktdf::FifoSlotType> peer_fifos =
-      collectPeerFifos(sorted_stages);
-  if (!hasAnchor(sorted_stages, peer_fifos)) {
+  // PREP 3: Verify pipeline has an anchor stage or a cross-core fifo
+  llvm::SmallVector<mlir::ktdf::FifoSlotType> cross_core_fifos =
+      collectCrossCoreFifos(sorted_stages);
+  if (!hasAnchor(sorted_stages, cross_core_fifos)) {
     return nullptr;
   }
 
@@ -1435,7 +1439,7 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
 
   // PREP 5: Build full shortest path across architecture graph
   std::optional<scheduler::arch_view::RoutingGraph::Path> full_path_opt =
-      buildFullShortestPath(endpoint_path, peer_fifos, arch_graph);
+      buildFullShortestPath(endpoint_path, cross_core_fifos, arch_graph);
   if (!full_path_opt) {
     LDBG(1) << "No resource path found\n";
     return nullptr;

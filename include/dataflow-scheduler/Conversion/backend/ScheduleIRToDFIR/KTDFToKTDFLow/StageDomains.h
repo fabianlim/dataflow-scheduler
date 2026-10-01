@@ -43,10 +43,13 @@ using ComponentTiles = llvm::DenseMap<ResourceType, llvm::SmallVector<int64_t>>;
 /// Reads and verifies the domain of each of @p stages, and gets the tiles of
 /// each component they use.
 ///
-/// A domain must be a set over the tile alone, non-empty and within the grid
-/// [0, @p grid_size). The producer stage of a peer fifo must execute on the
-/// image of the peer map over the domain of its consumer stage. All stages of
-/// a component must have the same domain.
+/// A plain domain must be a set over the tile alone, non-empty and within the
+/// grid [0, @p grid_size). A domain with one symbol, the group, is only valid
+/// on a stage that writes or reads exactly one cross-core fifo, and the
+/// stages that write and read a cross-core fifo must have one: the groups of
+/// the fifo are resolved from its group domain and the two stage domains, and
+/// the stages execute on the producers and on the consumers of all groups.
+/// All stages of a component must execute on the same tiles.
 mlir::LogicalResult resolveComponentTiles(
     llvm::ArrayRef<mlir::ktdf::StageOp> stages, int grid_size,
     ComponentTiles& component_tiles);

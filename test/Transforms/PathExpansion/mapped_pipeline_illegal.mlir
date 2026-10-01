@@ -5,9 +5,9 @@
 // between their units (see mapped_pipeline_legal.mlir for the rule and the
 // legal cases).
 
-// A fifo from MNISU to MNILU without a peer relation stays on one core, where
+// A fifo from MNISU to MNILU without a group domain stays on one core, where
 // MNISU and MNILU have no direct link: the ring is a cross-core link, which a
-// same-core fifo cannot use. (With a peer relation it is the legal
+// same-core fifo cannot use. (With a group domain it is the legal
 // @ring_fifo.)
 
 module {

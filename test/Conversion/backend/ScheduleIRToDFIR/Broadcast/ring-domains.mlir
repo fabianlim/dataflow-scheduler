@@ -1,24 +1,44 @@
 // RUN: dataflow-scheduler-opt --path-expansion --ktdf-to-ktdflowering %s | FileCheck %s
+// RUN: dataflow-scheduler-opt --path-expansion --ktdf-to-ktdflowering --debug-only=ktdf-to-operand-lowering %s 2>&1 >/dev/null | FileCheck %s --check-prefix=GROUPS
 
 // The frontend form of the broadcast relayout on the 32-core ring device:
-// producer core k sends its slice to the consumer cores c with
-// c floordiv 4 == k. The producer stage has the domain cores 0..7, the
-// consumer stage cores 0..31, and the producer domain is the image of the
-// peer relation over the consumer domain. Path expansion maps the stages to
-// MNISU and MNILU and keeps their domains.
+// the cross-core fifo has the groups g = 0..7, and producer core g sends its
+// slice to the consumer cores 4g..4g+3. The producer stage's domain selects
+// the producer of each group, P(g) = {g}, and the consumer stage's domain
+// its consumers, C(g) = {4g..4g+3}. Path expansion maps the stages to MNISU
+// and MNILU and keeps their domains.
 //
-// Units are materialized per kind on the tiles of the domain of its stages:
-// MNISU on cores 0..7 and MNILU on cores 0..31, and each kind's map from tile
-// to unit lists exactly those tiles: after lowering to DFIR, they are the
-// units the kind's program unit runs on.
+// ktdf-to-ktdflowering resolves the groups (checked under GROUPS, from the
+// debug output): the producer stage executes on cores 0..7, the union of
+// P(g), and the consumer stage on cores 0..31, the union of C(g). Consumer c
+// is fed by producer c floordiv 4, and core 0 is the one consumer that feeds
+// itself.
+//
+// Units are materialized per kind on the tiles of its stages: MNISU on cores
+// 0..7 and MNILU on cores 0..31, and each kind's map from tile to unit lists
+// exactly those tiles: after lowering to DFIR, they are the units the kind's
+// program unit runs on.
 //
 // The test stops before DFIR: that lowering pairs the units of the two stages
 // core by core (for the signal and for the send and receive of the fifo),
 // which consumers 8..31 cannot do, having no producer unit on their core. Ring
-// lowering will pair them through the peer relation instead.
+// lowering will pair each consumer with the producer of its group instead.
 
-// CHECK: #[[$PEER:.+]] = affine_map<(d0) -> (d0 floordiv 4)>
+// GROUPS:      Groups of the cross-core fifo affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>
+// GROUPS-NEXT: group 0: producers {0}, consumers {0, 1, 2, 3}
+// GROUPS-NEXT: group 1: producers {1}, consumers {4, 5, 6, 7}
+// GROUPS-NEXT: group 2: producers {2}, consumers {8, 9, 10, 11}
+// GROUPS-NEXT: group 3: producers {3}, consumers {12, 13, 14, 15}
+// GROUPS-NEXT: group 4: producers {4}, consumers {16, 17, 18, 19}
+// GROUPS-NEXT: group 5: producers {5}, consumers {20, 21, 22, 23}
+// GROUPS-NEXT: group 6: producers {6}, consumers {24, 25, 26, 27}
+// GROUPS-NEXT: group 7: producers {7}, consumers {28, 29, 30, 31}
+// GROUPS-NEXT: producer tiles {0, 1, 2, 3, 4, 5, 6, 7}, consumer tiles {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}
+// GROUPS-NEXT: producer of each consumer: 0 <- 0, 1 <- 0, 2 <- 0, 3 <- 0, 4 <- 1, 5 <- 1, 6 <- 1, 7 <- 1, 8 <- 2, 9 <- 2, 10 <- 2, 11 <- 2, 12 <- 3, 13 <- 3, 14 <- 3, 15 <- 3, 16 <- 4, 17 <- 4, 18 <- 4, 19 <- 4, 20 <- 5, 21 <- 5, 22 <- 5, 23 <- 5, 24 <- 6, 25 <- 6, 26 <- 6, 27 <- 6, 28 <- 7, 29 <- 7, 30 <- 7, 31 <- 7
+// GROUPS-NEXT: self-feeding consumers {0}
+
 // CHECK: #[[$SET:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+// CHECK: #[[$GROUP_DOMAIN:.+]] = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>
 // CHECK-LABEL:   ktdf_arch.device @ring32_device import("../../../../Dialect/KTDFArch/ring32_device.mlir")
 
 // CHECK-LABEL:   func.func @ring_broadcast() attributes {grid = [32]} {
@@ -117,7 +137,7 @@
 // CHECK-NEXT:     %[[DST:.*]] = memref.memory_space_cast %[[DST_VIEW]] : memref<64x64xf16, #ktdp.memory_space<ct_local>> to memref<64x64xf16, "L1">
 // CHECK-NEXT:     scf.for %[[I:.*]] = %[[C0]] to %[[C64]] step %[[C1]] {
 // CHECK-NEXT:       ktdf_lowering.execute_on %[[SU]], %[[LU]] {
-// CHECK-NEXT:         %[[CH:.*]] = ktdf.fifo.allocate() {dataflow_scheduler.peer = #[[$PEER]]} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+// CHECK-NEXT:         %[[CH:.*]] = ktdf.fifo.allocate() {dataflow_scheduler.groups = #[[$GROUP_DOMAIN]]} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
 // CHECK-NEXT:         %[[TOKEN:.*]] = ktdf.create_token : !ktdf.token
 // CHECK-NEXT:         ktdf_lowering.execute_on %[[SU]] {
 // CHECK-NEXT:           ktdf.data_transfer from %[[SRC]]{{\[}}%[[I]], %[[C0]]] size [1, 64] to %[[CH]] size [64] : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
@@ -131,9 +151,9 @@
 // CHECK-NEXT:     return
 // CHECK-NEXT:   }
 
-#peer = affine_map<(c) -> (c floordiv 4)>
-#producers = affine_set<(c) : (c >= 0, 7 - c >= 0)>
-#consumers = affine_set<(c) : (c >= 0, 31 - c >= 0)>
+#groups = affine_set<(g) : (g >= 0, 7 - g >= 0)>
+#producers = affine_set<(c)[g] : (c - g == 0)>
+#consumers = affine_set<(c)[g] : (c - 4 * g >= 0, 4 * g + 3 - c >= 0)>
 #set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
 module {
   ktdf_arch.device @ring32_device import("../../../../Dialect/KTDFArch/ring32_device.mlir")
@@ -149,7 +169,7 @@ module {
     scf.for %i = %c0 to %c64 step %c1 {
       ktdf.pipeline {
         %p:3 = ktdf.private -> (!ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token, !ktdf.token) {
-          %ch = ktdf.fifo.allocate() {dataflow_scheduler.peer = #peer} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+          %ch = ktdf.fifo.allocate() {dataflow_scheduler.groups = #groups} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
           %t0 = ktdf.create_token : !ktdf.token
           %t1 = ktdf.create_token : !ktdf.token
           ktdf.private_yield %ch, %t0, %t1 : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token, !ktdf.token

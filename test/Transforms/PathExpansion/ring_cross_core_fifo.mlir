@@ -1,20 +1,21 @@
 // RUN: dataflow-scheduler-opt --path-expansion %s | FileCheck %s
 // RUN: dataflow-scheduler-opt --path-expansion --path-expansion %s | FileCheck %s
 
-// A fifo with a peer relation crosses cores. In the frontend form no stage
-// has a unit; the peer fifo is what path expansion plans from. It routes the
-// pair of stages through the fifo's units and the switch between them,
+// A fifo with a group domain crosses cores. In the frontend form no stage has
+// a unit; the cross-core fifo is what path expansion plans from. It routes
+// the pair of stages through the fifo's units and the switch between them,
 // L1 -> MNISU -> RING_STOP -> MNILU -> L1, rather than through DDR, and
 // assigns MNISU to the producer stage and MNILU to the consumer stage. The
-// stages keep their domains (the producer on core 0, which feeds the
-// consumers on cores 0..3), and the fifo and the transfers are unchanged;
-// the materializer rebuilds the token chain as usual, which drops the
-// trailing token, so the consumer stage depends out on none. A second run finds the mapped pipeline legal and
-// leaves it unchanged, so both runs share the same checks.
+// stages keep their domains (one group, g = 0, whose producer is core 0 and
+// whose consumers are cores 0..3), and the fifo and the transfers are
+// unchanged; the materializer rebuilds the token chain as usual, which drops
+// the trailing token, so the consumer stage depends out on none. A second
+// run finds the mapped pipeline legal and leaves it unchanged, so both runs
+// share the same checks.
 
-// CHECK: #[[$ATTR_0:.+]] = affine_map<(d0) -> (d0 floordiv 4)>
-// CHECK: #[[$ATTR_1:.+]] = affine_set<(d0) : (d0 == 0)>
-// CHECK: #[[$ATTR_2:.+]] = affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0)>
+// CHECK: #[[$ATTR_0:.+]] = affine_set<(d0) : (d0 == 0)>
+// CHECK: #[[$ATTR_1:.+]] = affine_set<(d0)[s0] : (d0 - s0 == 0)>
+// CHECK: #[[$ATTR_2:.+]] = affine_set<(d0)[s0] : (d0 - s0 * 4 >= 0, -d0 + s0 * 4 + 3 >= 0)>
 // CHECK-LABEL:   ktdf_arch.device @ring_device import("../../Dialect/KTDFArch/ring_device.mlir")
 
 // CHECK-LABEL:   func.func @ring_broadcast(
@@ -22,7 +23,7 @@
 // CHECK-SAME:      %[[ARG1:.*]]: memref<1x64xf16, "L1">) {
 // CHECK-NEXT:     ktdf.pipeline {
 // CHECK-NEXT:       %[[PRIVATE_0:.*]]:2 = ktdf.private -> (!ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token) {
-// CHECK-NEXT:         %[[FIFO_0:.*]] = ktdf.fifo.allocate() {dataflow_scheduler.peer = #[[$ATTR_0]]} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+// CHECK-NEXT:         %[[FIFO_0:.*]] = ktdf.fifo.allocate() {dataflow_scheduler.groups = #[[$ATTR_0]]} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
 // CHECK-NEXT:         %[[CREATE_TOKEN_0:.*]] = ktdf.create_token : !ktdf.token
 // CHECK-NEXT:         ktdf.private_yield %[[FIFO_0]], %[[CREATE_TOKEN_0]] : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token
 // CHECK-NEXT:       }
@@ -36,15 +37,15 @@
 // CHECK-NEXT:     return
 // CHECK-NEXT:   }
 
-#peer = affine_map<(c) -> (c floordiv 4)>
-#producers = affine_set<(c) : (c == 0)>
-#consumers = affine_set<(c) : (c >= 0, 3 - c >= 0)>
+#groups = affine_set<(g) : (g == 0)>
+#producers = affine_set<(c)[g] : (c - g == 0)>
+#consumers = affine_set<(c)[g] : (c - 4 * g >= 0, 4 * g + 3 - c >= 0)>
 module {
   ktdf_arch.device @ring_device import("../../Dialect/KTDFArch/ring_device.mlir")
   func.func @ring_broadcast(%src: memref<1x64xf16, "L1">, %dst: memref<1x64xf16, "L1">) {
     ktdf.pipeline {
       %p:3 = ktdf.private -> (!ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token, !ktdf.token) {
-        %ch = ktdf.fifo.allocate() {dataflow_scheduler.peer = #peer} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+        %ch = ktdf.fifo.allocate() {dataflow_scheduler.groups = #groups} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
         %t0 = ktdf.create_token : !ktdf.token
         %t1 = ktdf.create_token : !ktdf.token
         ktdf.private_yield %ch, %t0, %t1 : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token, !ktdf.token
