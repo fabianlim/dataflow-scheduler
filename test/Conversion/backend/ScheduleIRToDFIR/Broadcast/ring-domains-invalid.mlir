@@ -456,3 +456,50 @@ module {
     return
   }
 }
+
+// -----
+
+// A cross-core fifo joins a producer stage and a consumer stage: one that is
+// written but never read has no consumers.
+#groups = affine_set<(g) : (g >= 0, 7 - g >= 0)>
+#producers = affine_set<(c)[g] : (c - g == 0)>
+module {
+  ktdf_arch.device @ring32_device import("../../../../Dialect/KTDFArch/ring32_device.mlir")
+  func.func @cross_core_fifo_without_reader(%src: memref<1x64xf16, "L1">) attributes {grid = [32]} {
+    ktdf.pipeline {
+      %p:2 = ktdf.private -> (!ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token) {
+        %ch = ktdf.fifo.allocate() {dataflow_scheduler.groups = #groups} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+        %t0 = ktdf.create_token : !ktdf.token
+        ktdf.private_yield %ch, %t0 : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token
+      }
+      // expected-error @+1 {{stage writes a cross-core fifo that no stage reads}}
+      ktdf.stage depends_in(none) depends_out(%p#1) {
+        ktdf.data_transfer from %src[0, 0] size [1, 64] to %p#0 size [64] : memref<1x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+      } {applicable_units = ["MNISU"], dataflow_scheduler.domain = #producers}
+    }
+    return
+  }
+}
+
+// -----
+
+// Likewise, one that is read but never written has no producers.
+#groups = affine_set<(g) : (g >= 0, 7 - g >= 0)>
+#consumers = affine_set<(c)[g] : (c - 4 * g >= 0, 4 * g + 3 - c >= 0)>
+module {
+  ktdf_arch.device @ring32_device import("../../../../Dialect/KTDFArch/ring32_device.mlir")
+  func.func @cross_core_fifo_without_writer(%dst: memref<1x64xf16, "L1">) attributes {grid = [32]} {
+    ktdf.pipeline {
+      %p:2 = ktdf.private -> (!ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token) {
+        %ch = ktdf.fifo.allocate() {dataflow_scheduler.groups = #groups} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+        %t0 = ktdf.create_token : !ktdf.token
+        ktdf.private_yield %ch, %t0 : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token
+      }
+      // expected-error @+1 {{stage reads a cross-core fifo that no stage writes}}
+      ktdf.stage depends_in(none) depends_out(%p#1) {
+        ktdf.data_transfer from %p#0 size [64] to %dst[0, 0] size [1, 64] : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<1x64xf16, "L1">
+      } {applicable_units = ["MNILU"], dataflow_scheduler.domain = #consumers}
+    }
+    return
+  }
+}
