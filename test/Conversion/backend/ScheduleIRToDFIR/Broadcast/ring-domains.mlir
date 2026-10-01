@@ -22,10 +22,13 @@
 // exactly those tiles: after lowering to DFIR, they are the units the kind's
 // program unit runs on.
 //
+// The token between the two stages gets no signal: the producer stage writes
+// no memory, only the fifo, so the stages have no memory conflict.
+//
 // The test stops before DFIR: that lowering pairs the units of the two stages
-// core by core (for the signal and for the send and receive of the fifo),
-// which consumers 8..31 cannot do, having no producer unit on their core. Ring
-// lowering will pair each consumer with the producer of its group instead.
+// core by core (for the send and receive of the fifo), which consumers 8..31
+// cannot do, having no producer unit on their core. Ring lowering will pair
+// each consumer with the producer of its group instead.
 
 // GROUPS:      Groups of the cross-core fifo affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>
 // GROUPS-NEXT: group 0: producers {0}, consumers {0, 1, 2, 3}
@@ -143,7 +146,6 @@
 // CHECK-NEXT:         ktdf_lowering.execute_on %[[SU]] {
 // CHECK-NEXT:           ktdf.data_transfer from %[[SRC]]{{\[}}%[[I]], %[[C0]]] size [1, 64] to %[[CH]] size [64] : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
 // CHECK-NEXT:         }
-// CHECK-NEXT:         ktdf_lowering.signal %[[SU]], %[[LU]]
 // CHECK-NEXT:         ktdf_lowering.execute_on %[[LU]] {
 // CHECK-NEXT:           ktdf.data_transfer from %[[CH]] size [64] to %[[DST]]{{\[}}%[[I]], %[[C0]]] size [1, 64] : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<64x64xf16, "L1">
 // CHECK-NEXT:         }

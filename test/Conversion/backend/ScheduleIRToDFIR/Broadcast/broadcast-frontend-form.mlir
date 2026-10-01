@@ -15,9 +15,11 @@
 // and the local copy are not counted for the tiles; they execute on the units
 // of the stages they wrap.
 //
-// The ring stages still pair their units core by core (the signal and, in
-// DFIR, the send and receive of the fifo); ring lowering will pair each
-// consumer with the producer of its group, so the test stops before DFIR.
+// The token between the ring stages gets no signal: the producer stage
+// writes no memory, only the fifo, so the stages have no memory conflict. In
+// DFIR the send and receive of the fifo would still pair the ring stages'
+// units core by core; ring lowering will pair each consumer with the producer
+// of its group, so the test stops before DFIR.
 
 // CHECK-DAG: #[[$MAP:.+]] = affine_map<(d0) -> (d0)>
 // CHECK-DAG: #[[$SET:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
@@ -137,7 +139,6 @@
 // CHECK-NEXT:             ktdf_lowering.execute_on %[[SU]] {
 // CHECK-NEXT:               ktdf.data_transfer from %[[SRC]]{{\[}}%[[I]], %[[C0]]] size [1, 64] to %[[CH]] size [64] : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
 // CHECK-NEXT:             }
-// CHECK-NEXT:             ktdf_lowering.signal %[[SU]], %[[LU]]
 // CHECK-NEXT:             ktdf_lowering.execute_on %[[LU]] {
 // CHECK-NEXT:               ktdf.data_transfer from %[[CH]] size [64] to %[[DST]]{{\[}}%[[I]], %[[C0]]] size [1, 64] : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<64x64xf16, "L1">
 // CHECK-NEXT:             }

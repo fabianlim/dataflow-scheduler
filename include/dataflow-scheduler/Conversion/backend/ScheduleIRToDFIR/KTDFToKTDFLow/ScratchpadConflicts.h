@@ -26,15 +26,16 @@
 #include "dataflow-scheduler/Analysis/Mapping.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/StageToUnitsMap.h"
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/GlobalStageDAG.h"
-#include "dataflow-scheduler/Dialect/KTDFArch/Analysis/ResourceKinds.h"
 
 namespace scheduler {
 
-/// Step 3: Compute scratchpad conflicts between ordered stage pairs
+/// Step 3: Compute scratchpad conflicts between ordered stage pairs. A
+/// producer stage and a consumer stage conflict if the producer writes a
+/// memory that the consumer reads, as given by the memory spaces of the
+/// memrefs their ops access. Fifos are not memory.
 mlir::LogicalResult computeScratchpadConflicts(
     const StageToUnitsMap& stage_to_units,
     const mlir::ktdf::StageDependencyDAG& dag,
-    const mlir::ktdf_arch::ResourceKinds& resource_kinds,
     std::map<std::pair<mlir::Operation*, mlir::Operation*>,
              llvm::SmallVector<scheduler::ResourceType, 2>>& conflicts);
 

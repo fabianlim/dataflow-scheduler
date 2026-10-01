@@ -42,7 +42,6 @@
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
-#include "dataflow-scheduler/Dialect/KTDFArch/Analysis/ResourceKinds.h"
 #include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLowering.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Transforms/Utils/Utils.h"
@@ -315,8 +314,6 @@ struct KTDFToKTDFLoweringPass
       signalPassFailure();
       return;
     }
-    auto& resource_kinds =
-        device_manager.getOrCreateView<mlir::ktdf_arch::ResourceKinds>(*device);
 
     llvm::SmallVector<mlir::func::FuncOp, 4> funcs;
     module_op.walk([&](mlir::func::FuncOp func) {
@@ -471,7 +468,7 @@ struct KTDFToKTDFLoweringPass
                llvm::SmallVector<scheduler::ResourceType, 2>>
           conflicts;
       if (mlir::failed(computeScratchpadConflicts(stage_to_units, global_dag,
-                                                  resource_kinds, conflicts))) {
+                                                  conflicts))) {
         func.emitError("failed to compute scratchpad conflicts");
         return signalPassFailure();
       }

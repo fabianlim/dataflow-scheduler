@@ -18,16 +18,17 @@
 
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/ScratchpadConflicts.h"
 
+#include <optional>
+
 #include <llvm/ADT/DenseSet.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/LogicalResult.h>
 #include <mlir/IR/Attributes.h>
 #include <mlir/IR/Block.h>
+#include <mlir/IR/BuiltinTypes.h>
+#include <mlir/Interfaces/SideEffectInterfaces.h>
 
 #include "dataflow-scheduler/Conversion/Utils/Utils.h"
-#include "dataflow-scheduler/Dialect/KTDFArch/Analysis/NodeLinks.h"
-#include "dataflow-scheduler/Dialect/KTDFArch/Analysis/ResourceKinds.h"
-#include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "llvm/Support/DebugLog.h"
 
@@ -37,48 +38,48 @@ using namespace scheduler;
 
 namespace {
 
-void getNodeAccesses(mlir::ktdf_arch::Node node,
-                     llvm::SmallDenseSet<mlir::Attribute>& read_kinds,
-                     llvm::SmallDenseSet<mlir::Attribute>& write_kinds) {
-  const auto visit = [](mlir::Value value,
-                        llvm::SmallDenseSet<mlir::Attribute>& result) {
-    auto resource = mlir::ktdf_arch::getNode(value);
-    if (!resource || !resource.getKind()) {
-      return;
+/// Gets the memories that the ops of @p stage read and write: the memory
+/// spaces of the memrefs they access, from their memory effects. An op with
+/// unknown effects may read and write each of its memref operands. Fifos are
+/// not memory.
+void getStageAccesses(mlir::Operation* stage,
+                      llvm::SmallDenseSet<mlir::Attribute>& read_memories,
+                      llvm::SmallDenseSet<mlir::Attribute>& write_memories) {
+  const auto getMemory =
+      [](mlir::Value value) -> std::optional<mlir::Attribute> {
+    auto type =
+        value ? llvm::dyn_cast<mlir::MemRefType>(value.getType()) : nullptr;
+    if (!type) {
+      return std::nullopt;
     }
-
-    if (!llvm::isa<mlir::ktdf_arch::MemoryOp>(resource)) {
-      return;
-    }
-
-    result.insert(resource.getKind());
+    return type.getMemorySpace();
   };
-
-  mlir::ktdf_arch::visitLinks(
-      node,
-      [&](mlir::ktdf_arch::Link link,
-          mlir::ktdf_arch::LinkDirection direction) -> bool {
-        if (!mlir::ktdf_arch::isIncoming(direction)) {
-          return true;
+  stage->walk([&](mlir::Operation* op) {
+    auto effects_op = llvm::dyn_cast<mlir::MemoryEffectOpInterface>(op);
+    if (!effects_op) {
+      for (mlir::Value operand : op->getOperands()) {
+        if (auto memory = getMemory(operand)) {
+          read_memories.insert(*memory);
+          write_memories.insert(*memory);
         }
-        for (auto source : link.getSources()) {
-          visit(source, read_kinds);
-        }
-        return true;
-      });
-
-  mlir::ktdf_arch::visitLinks(
-      node,
-      [&](mlir::ktdf_arch::Link link,
-          mlir::ktdf_arch::LinkDirection direction) -> bool {
-        if (!mlir::ktdf_arch::isOutgoing(direction)) {
-          return true;
-        }
-        for (auto source : link.getTargets()) {
-          visit(source, write_kinds);
-        }
-        return true;
-      });
+      }
+      return;
+    }
+    llvm::SmallVector<mlir::MemoryEffects::EffectInstance> effects;
+    effects_op.getEffects(effects);
+    for (const auto& effect : effects) {
+      auto memory = getMemory(effect.getValue());
+      if (!memory) {
+        continue;
+      }
+      if (llvm::isa<mlir::MemoryEffects::Read>(effect.getEffect())) {
+        read_memories.insert(*memory);
+      }
+      if (llvm::isa<mlir::MemoryEffects::Write>(effect.getEffect())) {
+        write_memories.insert(*memory);
+      }
+    }
+  });
 }
 
 }  // namespace
@@ -86,7 +87,6 @@ void getNodeAccesses(mlir::ktdf_arch::Node node,
 mlir::LogicalResult scheduler::computeScratchpadConflicts(
     const StageToUnitsMap& stage_to_units,
     const mlir::ktdf::StageDependencyDAG& dag,
-    const mlir::ktdf_arch::ResourceKinds& resource_kinds,
     std::map<std::pair<mlir::Operation*, mlir::Operation*>,
              llvm::SmallVector<scheduler::ResourceType, 2>>& conflicts) {
   LDBG(1) << "Step 3: Compute scratchpad conflicts";
@@ -101,6 +101,10 @@ mlir::LogicalResult scheduler::computeScratchpadConflicts(
 
     const auto& producer_units = producer_it->second;
 
+    llvm::SmallDenseSet<mlir::Attribute> producer_reads_unused;
+    llvm::SmallDenseSet<mlir::Attribute> producer_writes;
+    getStageAccesses(producer_op, producer_reads_unused, producer_writes);
+
     for (auto consumer_op : successors) {
       assert(llvm::isa<mlir::ktdf::StageOp>(consumer_op) &&
              "consumer op has to be a stage operation");
@@ -111,6 +115,19 @@ mlir::LogicalResult scheduler::computeScratchpadConflicts(
 
       const auto& consumer_units = consumer_it->second;
 
+      llvm::SmallDenseSet<mlir::Attribute> consumer_reads;
+      llvm::SmallDenseSet<mlir::Attribute> consumer_writes_unused;
+      getStageAccesses(consumer_op, consumer_reads, consumer_writes_unused);
+
+      // The stages conflict if the producer writes a memory the consumer
+      // reads.
+      const auto written = llvm::find_if(producer_writes, [&](auto memory) {
+        return consumer_reads.contains(memory);
+      });
+      if (written == producer_writes.end()) {
+        continue;
+      }
+
       llvm::SmallVector<scheduler::ResourceType, 2> conflicting_units;
 
       for (auto producer_unit_val : producer_units) {
@@ -118,15 +135,6 @@ mlir::LogicalResult scheduler::computeScratchpadConflicts(
             scheduler::getUnitResourceType(producer_unit_val);
         if (!producer_comp_opt.has_value()) continue;
         scheduler::ResourceType producer_comp = producer_comp_opt.value();
-        auto producer =
-            resource_kinds.getInstance<mlir::ktdf_arch::Node>(producer_comp);
-        if (!producer) {
-          return llvm::failure();
-        }
-
-        llvm::SmallDenseSet<mlir::Attribute> producer_writes;
-        llvm::SmallDenseSet<mlir::Attribute> producer_reads_unused;
-        getNodeAccesses(producer, producer_reads_unused, producer_writes);
 
         for (auto consumer_unit_val : consumer_units) {
           auto consumer_comp_opt =
@@ -135,30 +143,10 @@ mlir::LogicalResult scheduler::computeScratchpadConflicts(
                  "Consumer unit should have a component");
 
           scheduler::ResourceType consumer_comp = consumer_comp_opt.value();
-          auto consumer =
-              resource_kinds.getInstance<mlir::ktdf_arch::Node>(consumer_comp);
-          if (!consumer) {
-            return llvm::failure();
-          }
-
-          llvm::SmallDenseSet<mlir::Attribute> consumer_reads;
-          llvm::SmallDenseSet<mlir::Attribute> consumer_writes_unused;
-          getNodeAccesses(consumer, consumer_reads, consumer_writes_unused);
-
-          bool has_conflict = false;
-          for (const auto& written : producer_writes) {
-            if (consumer_reads.contains(written)) {
-              LDBG(1) << "  Found conflict between " << producer_comp << " and "
-                      << consumer_comp << " in " << written;
-              has_conflict = true;
-              break;
-            }
-          }
-
-          if (has_conflict) {
-            conflicting_units.push_back(producer_comp);
-            conflicting_units.push_back(consumer_comp);
-          }
+          LDBG(1) << "  Found conflict between " << producer_comp << " and "
+                  << consumer_comp << " in " << *written;
+          conflicting_units.push_back(producer_comp);
+          conflicting_units.push_back(consumer_comp);
         }
       }
 
