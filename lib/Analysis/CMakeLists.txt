@@ -1,6 +1,7 @@
 add_subdirectory(ArchViews)
 
 add_dataflow_scheduler_library(DataflowSchedulerAnalysis
+    CrossCoreChannels.cpp
     InvarianceCheck.cpp
     MemoryTracker.cpp
     MemoryTrackerAnalysis.cpp

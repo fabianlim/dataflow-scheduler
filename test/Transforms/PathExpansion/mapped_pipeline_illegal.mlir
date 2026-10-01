@@ -1,26 +1,20 @@
-// RUN: dataflow-scheduler-opt --path-expansion -split-input-file -verify-diagnostics %s | FileCheck %s
+// RUN: dataflow-scheduler-opt --path-expansion -split-input-file -verify-diagnostics %s
 
-// A pipeline whose stages all have a unit has nothing left for path expansion
-// to assign. It is legal if the data two consecutive stages exchange can
-// travel between their units: a fifo directly or through switches only, a
-// memory buffer through that memory. A legal pipeline comes out unchanged; an
-// illegal one is an error, because stages cannot be inserted into it.
+// A pipeline whose stages all have a unit cannot have stages inserted into
+// it, so it is an error if two consecutive stages cannot exchange their data
+// between their units (see mapped_pipeline_legal.mlir for the rule and the
+// legal cases).
 
-// A fifo from MNISU to MNILU over the ring: the units are joined through the
-// RING_STOP switch, so the pipeline is legal.
+// A fifo from MNISU to MNILU without a peer relation stays on one core, where
+// MNISU and MNILU have no direct link: the ring is a cross-core link, which a
+// same-core fifo cannot use. (With a peer relation it is the legal
+// @ring_fifo.)
 
-// CHECK-LABEL: func.func @ring_fifo
-// CHECK:         ktdf.private -> (!ktdf.fifo.slot<"MNISU" -> "MNILU", 4096xf16>, !ktdf.token, !ktdf.token)
-// CHECK:         ktdf.stage depends_in(none)
-// CHECK-NEXT:      ktdf.data_transfer {{.*}} : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 4096xf16>
-// CHECK-NEXT:    } {applicable_units = ["MNISU"]}
-// CHECK-NEXT:    ktdf.stage
-// CHECK-NEXT:      ktdf.data_transfer {{.*}} : !ktdf.fifo.slot<"MNISU" -> "MNILU", 4096xf16>, memref<64x64xf16, "L1">
-// CHECK-NEXT:    } {applicable_units = ["MNILU"]}
-// CHECK-NEXT:  }
 module {
-  ktdf_arch.device @ring32_device import("../../Dialect/KTDFArch/ring32_device.mlir")
-  func.func @ring_fifo(%src: memref<64x64xf16, "L1">, %dst: memref<64x64xf16, "L1">) {
+  ktdf_arch.device @ring_device import("../../Dialect/KTDFArch/ring_device.mlir")
+  func.func @same_core_ring_fifo(%src: memref<64x64xf16, "L1">, %dst: memref<64x64xf16, "L1">) {
+    // expected-error @+2 {{path-expansion: two consecutive stages of this fully mapped pipeline are not connected, and stages cannot be inserted into a fully mapped pipeline}}
+    // expected-error @+1 {{path-expansion: failed to plan path expansion}}
     ktdf.pipeline {
       %p:3 = ktdf.private -> (!ktdf.fifo.slot<"MNISU" -> "MNILU", 4096xf16>, !ktdf.token, !ktdf.token) {
         %ch = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 4096xf16>
@@ -73,7 +67,7 @@ module {
 // stage is missing between them.
 
 module {
-  ktdf_arch.device @ring32_device import("../../Dialect/KTDFArch/ring32_device.mlir")
+  ktdf_arch.device @ring_device import("../../Dialect/KTDFArch/ring_device.mlir")
   func.func @missing_compute(%src: memref<1x64xf16, "L1">, %dst: memref<1x64xf16, "L1">) {
     // expected-error @+2 {{path-expansion: two consecutive stages of this fully mapped pipeline are not connected, and stages cannot be inserted into a fully mapped pipeline}}
     // expected-error @+1 {{path-expansion: failed to plan path expansion}}
@@ -89,52 +83,6 @@ module {
       } {applicable_units = ["L1LU"]}
       ktdf.stage depends_in(%p#1) depends_out(%p#2) {
         ktdf.data_transfer from %p#0 size [64] to %dst[0, 0] size [1, 64] : !ktdf.fifo.slot<"L1LU" -> "L1SU", 64xf16>, memref<1x64xf16, "L1">
-      } {applicable_units = ["L1SU"]}
-    }
-    return
-  }
-}
-
-// -----
-
-// The local identity chain with every stage mapped: each fifo is a direct
-// link, so the pipeline is legal.
-
-// CHECK-LABEL: func.func @local_chain
-// CHECK:         ktdf.stage depends_in(none)
-// CHECK:         } {applicable_units = ["L1LU"]}
-// CHECK-NEXT:    ktdf.stage
-// CHECK:         } {applicable_units = ["SFU"]}
-// CHECK-NEXT:    ktdf.stage
-// CHECK:         } {applicable_units = ["L1SU"]}
-// CHECK-NEXT:  }
-#id = affine_map<(d0) -> (d0)>
-module {
-  ktdf_arch.device @ring32_device import("../../Dialect/KTDFArch/ring32_device.mlir")
-  func.func @local_chain(%src: memref<1x64xf16, "L1">, %dst: memref<1x64xf16, "L1">) {
-    ktdf.pipeline {
-      %p:5 = ktdf.private -> (!ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, !ktdf.token, !ktdf.token, !ktdf.token) {
-        %f0 = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
-        %f1 = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>
-        %t0 = ktdf.create_token : !ktdf.token
-        %t1 = ktdf.create_token : !ktdf.token
-        %t2 = ktdf.create_token : !ktdf.token
-        ktdf.private_yield %f0, %f1, %t0, %t1, %t2 : !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, !ktdf.token, !ktdf.token, !ktdf.token
-      }
-      ktdf.stage depends_in(none) depends_out(%p#2) {
-        ktdf.data_transfer from %src[0, 0] size [1, 64] to %p#0 size [64] : memref<1x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
-      } {applicable_units = ["L1LU"]}
-      ktdf.stage depends_in(%p#2) depends_out(%p#3) {
-        %v = ktdf.read_from_fifo %p#0 : <"L1LU" -> "SFU", 64xf16> -> tensor<64xf16>
-        %e = tensor.empty() : tensor<64xf16>
-        %o = linalg.generic {indexing_maps = [#id, #id], iterator_types = ["parallel"]} ins(%v : tensor<64xf16>) outs(%e : tensor<64xf16>) {
-        ^bb0(%in: f16, %out: f16):
-          linalg.yield %in : f16
-        } -> tensor<64xf16>
-        ktdf.write_to_fifo %o, %p#1 : tensor<64xf16>, <"SFU" -> "L1SU", 64xf16>
-      } {applicable_units = ["SFU"]}
-      ktdf.stage depends_in(%p#3) depends_out(%p#4) {
-        ktdf.data_transfer from %p#1 size [64] to %dst[0, 0] size [1, 64] : !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, memref<1x64xf16, "L1">
       } {applicable_units = ["L1SU"]}
     }
     return
