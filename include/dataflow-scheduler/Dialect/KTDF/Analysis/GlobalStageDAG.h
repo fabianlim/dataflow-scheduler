@@ -46,6 +46,9 @@ struct StageDependencyDAG {
   DenseMap<Operation*, SmallVector<Operation*, 4>> successors;
 };
 
+/// Whether @p stage is a leaf stage: one that contains no nested PipelineOp.
+auto isLeafStage(StageOp stage) -> bool;
+
 /// Build a flat stage DAG spanning all nesting levels of all pipelines in
 /// func. Nodes are leaf StageOps only. Edges are stitched across pipeline
 /// boundaries by resolving the root/leaf stages of each nested pipeline.

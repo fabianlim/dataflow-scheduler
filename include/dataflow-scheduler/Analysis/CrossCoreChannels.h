@@ -33,12 +33,19 @@
 // consumers group g delivers to. For each g in G, P(g) sends to C(g). Any
 // other domain has no symbol and is a plain set of tiles.
 //
+// A tile in both C(g) and P(g) is a self-delivery: group g delivers to its
+// own producer. The ring cannot carry it (a ring stop never ejects what it
+// injected), so the ring consumers of group g are C(g) without P(g), and the
+// HandleCrossCoreStages pass realizes the self-deliveries as a local copy on
+// each such tile. The groups keep the self-deliveries: they describe the
+// logical transfer, not how it is carried.
+//
 // Groups and domains are small, so they are evaluated by enumeration: the
 // constant bounds of G, then each value in between, then each tile of the
 // grid. The analysis resolves the groups of a channel from its group domain
 // and its two stage domains, and derives from them the tiles of each stage,
-// the producer of each consumer and the consumers that feed themselves. It
-// will grow to derive what lowering needs beyond these, such as the ring
+// the ring consumers, the producer of each consumer and the self-deliveries.
+// It will grow to derive what lowering needs beyond these, such as the ring
 // direction each producer sends in.
 //
 //===----------------------------------------------------------------------===//
@@ -145,11 +152,16 @@ auto getConsumerTiles(llvm::ArrayRef<ChannelGroup> groups)
 auto getProducerOf(llvm::ArrayRef<ChannelGroup> groups, int64_t consumer)
     -> std::optional<int64_t>;
 
-/// Gets the consumers of a channel with the groups @p groups that feed
-/// themselves: the tiles in both C(g) and P(g) for some g, in increasing
-/// order.
+/// Gets the tiles the ring delivers to in a channel with the groups
+/// @p groups: the union of C(g) without P(g), in increasing order.
 [[nodiscard]]
-auto getSelfFeedingConsumers(llvm::ArrayRef<ChannelGroup> groups)
+auto getRingConsumerTiles(llvm::ArrayRef<ChannelGroup> groups)
+    -> llvm::SmallVector<int64_t>;
+
+/// Gets the self-deliveries of a channel with the groups @p groups: the tiles
+/// in both C(g) and P(g) for some g, in increasing order.
+[[nodiscard]]
+auto getSelfDeliveries(llvm::ArrayRef<ChannelGroup> groups)
     -> llvm::SmallVector<int64_t>;
 
 }  // namespace scheduler

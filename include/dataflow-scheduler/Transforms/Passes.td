@@ -52,6 +52,39 @@ def NormalizeGridTo1DPass : Pass<"normalize-grid-to-1d", "mlir::ModuleOp"> {
   ];
 }
 
+def HandleCrossCoreStagesPass
+    : Pass<"handle-cross-core-stages", "mlir::ModuleOp"> {
+  let summary = "Realize the self-deliveries of cross-core channels as local copies";
+  let description = [{
+    A cross-core channel is a pipeline whose producer stage writes a fifo with
+    a group domain, `dataflow_scheduler.groups`, and whose consumer stage reads
+    it: for each group g, the producers P(g) send to the consumers C(g). The
+    ring that carries the channel cannot deliver a tile's data to the tile
+    itself, so lowering carries only C(g) without P(g) over it. The tiles in
+    both C(g) and P(g) are self-deliveries, and this pass realizes them.
+
+    A channel pipeline with self-deliveries is replaced by an outer pipeline
+    with no token between its stages, so that they run concurrently: one
+    stage wraps the channel pipeline unchanged, and one wraps a local copy on
+    the self-delivering tiles. The local copy moves the data of the
+    producer's transfer to the destination of the consumer's transfer along
+    the same-core route of the architecture graph, memory -> load unit ->
+    compute unit -> store unit -> memory, with an identity `linalg.generic`
+    on the compute unit. Its stages are mapped, and their domain is the
+    self-delivering tiles. As in stage coarsening, a stage that wraps a
+    pipeline carries the union of the `applicable_units` of its stages.
+
+    The pass runs last before `ktdf-to-ktdflowering`, after address
+    assignment: it creates fifos, tokens and stages over the existing
+    memrefs, and nothing that needs an address.
+  }];
+  let dependentDialects = [
+    "mlir::ktdf::KTDFDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::tensor::TensorDialect"
+  ];
+}
+
 def NormalizeSCFForLoopsPass : Pass<"normalize-scf-for-loops", "mlir::ModuleOp"> {
   let summary = "Normalize scf.for loops to lb=0, step=1";
   let description = [{

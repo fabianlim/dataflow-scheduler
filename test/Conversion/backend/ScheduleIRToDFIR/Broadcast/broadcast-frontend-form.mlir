@@ -1,47 +1,27 @@
-// RUN: dataflow-scheduler-opt --path-expansion --ktdf-to-ktdflowering %s | FileCheck %s
-// RUN: dataflow-scheduler-opt --path-expansion --ktdf-to-ktdflowering --debug-only=ktdf-to-operand-lowering %s 2>&1 >/dev/null | FileCheck %s --check-prefix=GROUPS
+// RUN: dataflow-scheduler-opt --path-expansion --handle-cross-core-stages --ktdf-to-ktdflowering %s | FileCheck %s
 
-// The frontend form of the broadcast relayout on the 32-core ring device:
-// the cross-core fifo has the groups g = 0..7, and producer core g sends its
-// slice to the consumer cores 4g..4g+3. The producer stage's domain selects
-// the producer of each group, P(g) = {g}, and the consumer stage's domain
-// its consumers, C(g) = {4g..4g+3}. Path expansion maps the stages to MNISU
-// and MNILU and keeps their domains.
+// The broadcast relayout as the frontend writes it, on the 32-core ring
+// device, through the scheduling steps it needs so far: path expansion maps
+// the channel's stages to MNISU and MNILU, handle-cross-core-stages realizes
+// the self-delivery of core 0 as a local copy L1LU -> SFU -> L1SU, and
+// ktdf-to-ktdflowering materializes the units on the tiles of the leaf
+// stages of each kind.
 //
-// ktdf-to-ktdflowering resolves the groups (checked under GROUPS, from the
-// debug output): the producer stage executes on cores 0..7, the union of
-// P(g). The consumers are cores 0..31, the union of C(g), and consumer c is
-// fed by producer c floordiv 4. Core 0 is the one self-delivery, in both
-// C(0) and P(0), which the ring cannot carry: the consumer stage executes on
-// the ring consumers, C(g) without P(g), cores 1..31. Without
-// handle-cross-core-stages, which carries the self-delivery by a local copy,
-// nothing delivers core 0's slice to core 0 here.
+// The channel has the groups g = 0..7: producer core g sends its slice to the
+// consumer cores 4g..4g+3. The ring carries C(g) without P(g), so MNISU is on
+// cores 0..7 and MNILU on cores 1..31; the local copy carries core 0's slice
+// to core 0, so L1LU, SFU and L1SU are on core 0 only. Each kind's map from
+// tile to unit lists exactly those tiles. The stages that wrap the channel
+// and the local copy are not counted for the tiles; they execute on the units
+// of the stages they wrap.
 //
-// Units are materialized per kind on the tiles of its stages: MNISU on cores
-// 0..7 and MNILU on cores 1..31, and each kind's map from tile to unit lists
-// exactly those tiles: after lowering to DFIR, they are the units the kind's
-// program unit runs on.
-//
-// The test stops before DFIR: that lowering pairs the units of the two stages
-// core by core (for the signal and for the send and receive of the fifo),
-// which consumers 8..31 cannot do, having no producer unit on their core. Ring
-// lowering will pair each consumer with the producer of its group instead.
+// The ring stages still pair their units core by core (the signal and, in
+// DFIR, the send and receive of the fifo); ring lowering will pair each
+// consumer with the producer of its group, so the test stops before DFIR.
 
-// GROUPS:      Groups of the cross-core fifo affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>
-// GROUPS-NEXT: group 0: producers {0}, consumers {0, 1, 2, 3}
-// GROUPS-NEXT: group 1: producers {1}, consumers {4, 5, 6, 7}
-// GROUPS-NEXT: group 2: producers {2}, consumers {8, 9, 10, 11}
-// GROUPS-NEXT: group 3: producers {3}, consumers {12, 13, 14, 15}
-// GROUPS-NEXT: group 4: producers {4}, consumers {16, 17, 18, 19}
-// GROUPS-NEXT: group 5: producers {5}, consumers {20, 21, 22, 23}
-// GROUPS-NEXT: group 6: producers {6}, consumers {24, 25, 26, 27}
-// GROUPS-NEXT: group 7: producers {7}, consumers {28, 29, 30, 31}
-// GROUPS-NEXT: producer tiles {0, 1, 2, 3, 4, 5, 6, 7}, consumer tiles {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}, ring consumer tiles {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}
-// GROUPS-NEXT: producer of each consumer: 0 <- 0, 1 <- 0, 2 <- 0, 3 <- 0, 4 <- 1, 5 <- 1, 6 <- 1, 7 <- 1, 8 <- 2, 9 <- 2, 10 <- 2, 11 <- 2, 12 <- 3, 13 <- 3, 14 <- 3, 15 <- 3, 16 <- 4, 17 <- 4, 18 <- 4, 19 <- 4, 20 <- 5, 21 <- 5, 22 <- 5, 23 <- 5, 24 <- 6, 25 <- 6, 26 <- 6, 27 <- 6, 28 <- 7, 29 <- 7, 30 <- 7, 31 <- 7
-// GROUPS-NEXT: self-deliveries {0}
-
-// CHECK: #[[$SET:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
-// CHECK: #[[$GROUP_DOMAIN:.+]] = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>
+// CHECK-DAG: #[[$MAP:.+]] = affine_map<(d0) -> (d0)>
+// CHECK-DAG: #[[$SET:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+// CHECK-DAG: #[[$GROUP_DOMAIN:.+]] = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>
 // CHECK-LABEL:   ktdf_arch.device @ring32_device import("../../../../Dialect/KTDFArch/ring32_device.mlir")
 
 // CHECK-LABEL:   func.func @ring_broadcast() attributes {grid = [32]} {
@@ -84,6 +64,9 @@
 // CHECK-NEXT:     %[[LU29:.*]] = dataflow.get_unit {core = 29 : i32, corelet = 0 : i32, name = "C29-mnilu", type = "mnilu"} : index
 // CHECK-NEXT:     %[[LU30:.*]] = dataflow.get_unit {core = 30 : i32, corelet = 0 : i32, name = "C30-mnilu", type = "mnilu"} : index
 // CHECK-NEXT:     %[[LU31:.*]] = dataflow.get_unit {core = 31 : i32, corelet = 0 : i32, name = "C31-mnilu", type = "mnilu"} : index
+// CHECK-NEXT:     %[[L1LU0:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-l1lu", type = "l1lu"} : index
+// CHECK-NEXT:     %[[SFU0:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-sfu", type = "sfu"} : index
+// CHECK-NEXT:     %[[L1SU0:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-l1su", type = "l1su"} : index
 // CHECK-NEXT:     %[[TILE:.*]] = ktdp.get_compute_tile_id : index
 // CHECK-NEXT:     %[[SU_KEY0:.*]] = arith.constant 0 : index
 // CHECK-NEXT:     %[[SU_KEY1:.*]] = arith.constant 1 : index
@@ -128,6 +111,15 @@
 // CHECK-NEXT:     %[[LU_KEY31:.*]] = arith.constant 31 : index
 // CHECK-NEXT:     %[[LU_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[LU_KEY1]] -> %[[LU1]]], {{\[}}%[[LU_KEY2]] -> %[[LU2]]], {{\[}}%[[LU_KEY3]] -> %[[LU3]]], {{\[}}%[[LU_KEY4]] -> %[[LU4]]], {{\[}}%[[LU_KEY5]] -> %[[LU5]]], {{\[}}%[[LU_KEY6]] -> %[[LU6]]], {{\[}}%[[LU_KEY7]] -> %[[LU7]]], {{\[}}%[[LU_KEY8]] -> %[[LU8]]], {{\[}}%[[LU_KEY9]] -> %[[LU9]]], {{\[}}%[[LU_KEY10]] -> %[[LU10]]], {{\[}}%[[LU_KEY11]] -> %[[LU11]]], {{\[}}%[[LU_KEY12]] -> %[[LU12]]], {{\[}}%[[LU_KEY13]] -> %[[LU13]]], {{\[}}%[[LU_KEY14]] -> %[[LU14]]], {{\[}}%[[LU_KEY15]] -> %[[LU15]]], {{\[}}%[[LU_KEY16]] -> %[[LU16]]], {{\[}}%[[LU_KEY17]] -> %[[LU17]]], {{\[}}%[[LU_KEY18]] -> %[[LU18]]], {{\[}}%[[LU_KEY19]] -> %[[LU19]]], {{\[}}%[[LU_KEY20]] -> %[[LU20]]], {{\[}}%[[LU_KEY21]] -> %[[LU21]]], {{\[}}%[[LU_KEY22]] -> %[[LU22]]], {{\[}}%[[LU_KEY23]] -> %[[LU23]]], {{\[}}%[[LU_KEY24]] -> %[[LU24]]], {{\[}}%[[LU_KEY25]] -> %[[LU25]]], {{\[}}%[[LU_KEY26]] -> %[[LU26]]], {{\[}}%[[LU_KEY27]] -> %[[LU27]]], {{\[}}%[[LU_KEY28]] -> %[[LU28]]], {{\[}}%[[LU_KEY29]] -> %[[LU29]]], {{\[}}%[[LU_KEY30]] -> %[[LU30]]], {{\[}}%[[LU_KEY31]] -> %[[LU31]]]):index
 // CHECK-NEXT:     %[[LU:.*]] = uniform.query_map(map:%[[LU_MAP]], key:%[[TILE]]) : index
+// CHECK-NEXT:     %[[L1LU_KEY0:.*]] = arith.constant 0 : index
+// CHECK-NEXT:     %[[L1LU_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[L1LU_KEY0]] -> %[[L1LU0]]]):index
+// CHECK-NEXT:     %[[L1LU:.*]] = uniform.query_map(map:%[[L1LU_MAP]], key:%[[TILE]]) : index
+// CHECK-NEXT:     %[[SFU_KEY0:.*]] = arith.constant 0 : index
+// CHECK-NEXT:     %[[SFU_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[SFU_KEY0]] -> %[[SFU0]]]):index
+// CHECK-NEXT:     %[[SFU:.*]] = uniform.query_map(map:%[[SFU_MAP]], key:%[[TILE]]) : index
+// CHECK-NEXT:     %[[L1SU_KEY0:.*]] = arith.constant 0 : index
+// CHECK-NEXT:     %[[L1SU_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[L1SU_KEY0]] -> %[[L1SU0]]]):index
+// CHECK-NEXT:     %[[L1SU:.*]] = uniform.query_map(map:%[[L1SU_MAP]], key:%[[TILE]]) : index
 // CHECK-NEXT:     %[[C0:.*]] = arith.constant 0 : index
 // CHECK-NEXT:     %[[C1:.*]] = arith.constant 1 : index
 // CHECK-NEXT:     %[[C64:.*]] = arith.constant 64 : index
@@ -137,15 +129,42 @@
 // CHECK-NEXT:     %[[DST_VIEW:.*]] = ktdp.construct_memory_view %[[C128]], sizes: [64, 64], strides: [64, 1] {coordinate_set = #[[$SET]], memory_space = #ktdp.memory_space<ct_local>} : memref<64x64xf16, #ktdp.memory_space<ct_local>>
 // CHECK-NEXT:     %[[DST:.*]] = memref.memory_space_cast %[[DST_VIEW]] : memref<64x64xf16, #ktdp.memory_space<ct_local>> to memref<64x64xf16, "L1">
 // CHECK-NEXT:     scf.for %[[I:.*]] = %[[C0]] to %[[C64]] step %[[C1]] {
-// CHECK-NEXT:       ktdf_lowering.execute_on %[[SU]], %[[LU]] {
-// CHECK-NEXT:         %[[CH:.*]] = ktdf.fifo.allocate() {dataflow_scheduler.groups = #[[$GROUP_DOMAIN]]} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
-// CHECK-NEXT:         %[[TOKEN:.*]] = ktdf.create_token : !ktdf.token
-// CHECK-NEXT:         ktdf_lowering.execute_on %[[SU]] {
-// CHECK-NEXT:           ktdf.data_transfer from %[[SRC]]{{\[}}%[[I]], %[[C0]]] size [1, 64] to %[[CH]] size [64] : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+// CHECK-NEXT:       ktdf_lowering.execute_on %[[SU]], %[[LU]], %[[L1LU]], %[[SFU]], %[[L1SU]] {
+// CHECK-NEXT:         ktdf_lowering.execute_on %[[SU]], %[[LU]] {
+// CHECK-NEXT:           ktdf_lowering.execute_on %[[SU]], %[[LU]] {
+// CHECK-NEXT:             %[[CH:.*]] = ktdf.fifo.allocate() {dataflow_scheduler.groups = #[[$GROUP_DOMAIN]]} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+// CHECK-NEXT:             %[[TOKEN:.*]] = ktdf.create_token : !ktdf.token
+// CHECK-NEXT:             ktdf_lowering.execute_on %[[SU]] {
+// CHECK-NEXT:               ktdf.data_transfer from %[[SRC]]{{\[}}%[[I]], %[[C0]]] size [1, 64] to %[[CH]] size [64] : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+// CHECK-NEXT:             }
+// CHECK-NEXT:             ktdf_lowering.signal %[[SU]], %[[LU]]
+// CHECK-NEXT:             ktdf_lowering.execute_on %[[LU]] {
+// CHECK-NEXT:               ktdf.data_transfer from %[[CH]] size [64] to %[[DST]]{{\[}}%[[I]], %[[C0]]] size [1, 64] : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<64x64xf16, "L1">
+// CHECK-NEXT:             }
+// CHECK-NEXT:           }
 // CHECK-NEXT:         }
-// CHECK-NEXT:         ktdf_lowering.signal %[[SU]], %[[LU]]
-// CHECK-NEXT:         ktdf_lowering.execute_on %[[LU]] {
-// CHECK-NEXT:           ktdf.data_transfer from %[[CH]] size [64] to %[[DST]]{{\[}}%[[I]], %[[C0]]] size [1, 64] : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<64x64xf16, "L1">
+// CHECK-NEXT:         ktdf_lowering.execute_on %[[L1LU]], %[[SFU]], %[[L1SU]] {
+// CHECK-NEXT:           ktdf_lowering.execute_on %[[L1LU]], %[[SFU]], %[[L1SU]] {
+// CHECK-NEXT:             %[[TO_SFU:.*]] = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+// CHECK-NEXT:             %[[FROM_SFU:.*]] = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>
+// CHECK-NEXT:             %[[LOADED:.*]] = ktdf.create_token : !ktdf.token
+// CHECK-NEXT:             %[[COMPUTED:.*]] = ktdf.create_token : !ktdf.token
+// CHECK-NEXT:             ktdf_lowering.execute_on %[[L1LU]] {
+// CHECK-NEXT:               ktdf.data_transfer from %[[SRC]]{{\[}}%[[I]], %[[C0]]] size [1, 64] to %[[TO_SFU]] size [64] : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+// CHECK-NEXT:             }
+// CHECK-NEXT:             ktdf_lowering.execute_on %[[SFU]] {
+// CHECK-NEXT:               %[[IN:.*]] = ktdf.read_from_fifo %[[TO_SFU]] : <"L1LU" -> "SFU", 64xf16> -> tensor<64xf16>
+// CHECK-NEXT:               %[[INIT:.*]] = tensor.empty() : tensor<64xf16>
+// CHECK-NEXT:               %[[OUT:.*]] = linalg.generic {indexing_maps = [#[[$MAP]], #[[$MAP]]], iterator_types = ["parallel"]} ins(%[[IN]] : tensor<64xf16>) outs(%[[INIT]] : tensor<64xf16>) {
+// CHECK-NEXT:               ^bb0(%[[X:.*]]: f16, %{{.*}}: f16):
+// CHECK-NEXT:                 linalg.yield %[[X]] : f16
+// CHECK-NEXT:               } -> tensor<64xf16>
+// CHECK-NEXT:               ktdf.write_to_fifo %[[OUT]], %[[FROM_SFU]] : tensor<64xf16>, <"SFU" -> "L1SU", 64xf16>
+// CHECK-NEXT:             }
+// CHECK-NEXT:             ktdf_lowering.execute_on %[[L1SU]] {
+// CHECK-NEXT:               ktdf.data_transfer from %[[FROM_SFU]] size [64] to %[[DST]]{{\[}}%[[I]], %[[C0]]] size [1, 64] : !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, memref<64x64xf16, "L1">
+// CHECK-NEXT:             }
+// CHECK-NEXT:           }
 // CHECK-NEXT:         }
 // CHECK-NEXT:       }
 // CHECK-NEXT:     }

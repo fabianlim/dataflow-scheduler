@@ -284,15 +284,22 @@ auto scheduler::getProducerOf(llvm::ArrayRef<ChannelGroup> groups,
   return std::nullopt;
 }
 
-auto scheduler::getSelfFeedingConsumers(llvm::ArrayRef<ChannelGroup> groups)
+auto scheduler::getRingConsumerTiles(llvm::ArrayRef<ChannelGroup> groups)
     -> llvm::SmallVector<int64_t> {
   return getUnion(groups, [](const ChannelGroup& group) {
-    llvm::SmallVector<int64_t> self_feeding;
-    for (const int64_t consumer : group.consumers) {
-      if (llvm::is_contained(group.producers, consumer)) {
-        self_feeding.push_back(consumer);
-      }
-    }
-    return self_feeding;
+    return llvm::to_vector(
+        llvm::make_filter_range(group.consumers, [&](int64_t consumer) {
+          return !llvm::is_contained(group.producers, consumer);
+        }));
+  });
+}
+
+auto scheduler::getSelfDeliveries(llvm::ArrayRef<ChannelGroup> groups)
+    -> llvm::SmallVector<int64_t> {
+  return getUnion(groups, [](const ChannelGroup& group) {
+    return llvm::to_vector(
+        llvm::make_filter_range(group.consumers, [&](int64_t consumer) {
+          return llvm::is_contained(group.producers, consumer);
+        }));
   });
 }

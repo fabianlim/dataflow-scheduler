@@ -134,6 +134,8 @@ void scheduler::buildSchedulerOptimizationPipeline(
   // TODO: position of cross-instance parallelization is TBD
   // pm.addPass(createParallelizeLoopsAcrossInstancesPass(scheduler_ctx));
   pm.addPass(createNormalizeGridTo1DPass());
+  // Last, so that no scheduling pass has to handle the local copies it adds.
+  pm.addPass(createHandleCrossCoreStagesPass());
 }
 
 void scheduler::buildDFIRBackendPipeline(

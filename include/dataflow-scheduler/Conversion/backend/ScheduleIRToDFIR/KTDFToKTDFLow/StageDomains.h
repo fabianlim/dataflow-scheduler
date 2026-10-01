@@ -20,7 +20,7 @@
 //
 // Units are materialized per component, and each component's units run one
 // program unit, so the units of a component are on the tiles of the domain of
-// the stages that use it. A stage without a domain uses every tile of the
+// the leaf stages that use it. A stage without a domain uses every tile of the
 // grid.
 //
 //===----------------------------------------------------------------------===//
@@ -48,8 +48,10 @@ using ComponentTiles = llvm::DenseMap<ResourceType, llvm::SmallVector<int64_t>>;
 /// on a stage that writes or reads exactly one cross-core fifo, and the
 /// stages that write and read a cross-core fifo must have one: the groups of
 /// the fifo are resolved from its group domain and the two stage domains, and
-/// the stages execute on the producers and on the consumers of all groups.
-/// All stages of a component must execute on the same tiles.
+/// the stages execute on the producers and on the ring consumers of all
+/// groups, the consumers of each group without its producers. All leaf stages
+/// of a component must execute on the same tiles; a stage that wraps a
+/// pipeline is not counted.
 mlir::LogicalResult resolveComponentTiles(
     llvm::ArrayRef<mlir::ktdf::StageOp> stages, int grid_size,
     ComponentTiles& component_tiles);

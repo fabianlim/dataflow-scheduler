@@ -182,15 +182,21 @@ auto mlir::ktdf::topologicalSortStages(ArrayRef<StageOp> stages,
 
 namespace {
 
-/// Returns the recursive first-in-topo-order root StageOps reachable from
-/// stage. If stage contains no nested PipelineOp, returns {stage}.
-auto getRootStages(StageOp stage) -> SmallVector<StageOp, 4> {
+/// Returns the first PipelineOp nested in @p stage, or nullptr if @p stage is a
+/// leaf stage.
+auto getNestedPipeline(StageOp stage) -> PipelineOp {
   PipelineOp nested_pipeline;
   stage.walk([&](PipelineOp p) {
     nested_pipeline = p;
     return WalkResult::interrupt();
   });
+  return nested_pipeline;
+}
 
+/// Returns the recursive first-in-topo-order root StageOps reachable from
+/// stage. If stage contains no nested PipelineOp, returns {stage}.
+auto getRootStages(StageOp stage) -> SmallVector<StageOp, 4> {
+  PipelineOp nested_pipeline = getNestedPipeline(stage);
   if (!nested_pipeline) return {stage};
 
   llvm::SmallVector<StageOp, 8> inner_stages;
@@ -215,12 +221,7 @@ auto getRootStages(StageOp stage) -> SmallVector<StageOp, 4> {
 /// Returns the recursive last-in-topo-order leaf StageOps reachable from
 /// stage. If stage contains no nested PipelineOp, returns {stage}.
 auto getLeafStages(StageOp stage) -> llvm::SmallVector<StageOp, 4> {
-  PipelineOp nested_pipeline;
-  stage.walk([&](PipelineOp p) {
-    nested_pipeline = p;
-    return WalkResult::interrupt();
-  });
-
+  PipelineOp nested_pipeline = getNestedPipeline(stage);
   if (!nested_pipeline) return {stage};
 
   llvm::SmallVector<StageOp, 8> inner_stages;
@@ -243,6 +244,10 @@ auto getLeafStages(StageOp stage) -> llvm::SmallVector<StageOp, 4> {
 }
 
 }  // namespace
+
+auto mlir::ktdf::isLeafStage(StageOp stage) -> bool {
+  return !getNestedPipeline(stage);
+}
 
 //===----------------------------------------------------------------------===//
 // buildGlobalStageDAG

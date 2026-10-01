@@ -29,6 +29,7 @@
 #include <mlir/IR/Diagnostics.h>
 
 #include "dataflow-scheduler/Analysis/CrossCoreChannels.h"
+#include "dataflow-scheduler/Dialect/KTDF/Analysis/GlobalStageDAG.h"
 #include "llvm/Support/DebugLog.h"
 
 #define DEBUG_TYPE "ktdf-to-operand-lowering"
@@ -144,7 +145,9 @@ void debugPrintGroups(mlir::Value fifo,
   LDBG(1) << "  producer tiles {"
           << llvm::interleaved(getProducerTiles(channel_groups))
           << "}, consumer tiles {"
-          << llvm::interleaved(getConsumerTiles(channel_groups)) << "}";
+          << llvm::interleaved(getConsumerTiles(channel_groups))
+          << "}, ring consumer tiles {"
+          << llvm::interleaved(getRingConsumerTiles(channel_groups)) << "}";
   LDBG(1) << "  producer of each consumer: "
           << llvm::interleaved(llvm::map_range(
                  getConsumerTiles(channel_groups), [&](int64_t consumer) {
@@ -152,14 +155,17 @@ void debugPrintGroups(mlir::Value fifo,
                           std::to_string(
                               *getProducerOf(channel_groups, consumer));
                  }));
-  LDBG(1) << "  self-feeding consumers {"
-          << llvm::interleaved(getSelfFeedingConsumers(channel_groups)) << "}";
+  LDBG(1) << "  self-deliveries {"
+          << llvm::interleaved(getSelfDeliveries(channel_groups)) << "}";
 }
 
 /// Resolves the groups of each cross-core fifo in @p accesses from its group
 /// domain and the domains of the stages that write and read it, and sets the
-/// tiles of those stages in @p stage_tiles: the producers or the consumers of
-/// all groups.
+/// tiles of those stages in @p stage_tiles: the producers of all groups for
+/// the writing stage, and the ring consumers of all groups for the reading
+/// stage. The ring cannot deliver a tile's data to the tile itself; the
+/// self-deliveries are carried by the local copies of HandleCrossCoreStages,
+/// which runs before.
 mlir::LogicalResult resolveCrossCoreFifos(
     const FifoAccesses& accesses,
     const llvm::DenseMap<mlir::Operation*, mlir::IntegerSetAttr>& domains,
@@ -226,7 +232,7 @@ mlir::LogicalResult resolveCrossCoreFifos(
         stage_tiles[writer.getOperation()] =
             getProducerTiles(*channel_groups);
         stage_tiles[reader.getOperation()] =
-            getConsumerTiles(*channel_groups);
+            getRingConsumerTiles(*channel_groups);
       }
     }
   }
@@ -290,10 +296,14 @@ mlir::LogicalResult scheduler::resolveComponentTiles(
     return mlir::failure();
   }
 
-  // Each component's units run one program unit, so all stages of a
-  // component must execute on the same tiles.
+  // Each component's units run one program unit, so all leaf stages of a
+  // component must execute on the same tiles. A stage that wraps a pipeline
+  // does no work itself: its units are those of the stages inside.
   llvm::DenseMap<ResourceType, mlir::ktdf::StageOp> first_stages;
   for (mlir::ktdf::StageOp stage : stages) {
+    if (!mlir::ktdf::isLeafStage(stage)) {
+      continue;
+    }
     auto units_attr = stage.getApplicableUnitsAttr();
     if (!units_attr) {
       continue;

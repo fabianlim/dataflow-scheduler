@@ -75,6 +75,7 @@
 // CHECK-NEXT:   )
 // CHECK-NEXT:   address-assignment
 // CHECK-NEXT:   normalize-grid-to-1d
+// CHECK-NEXT:   handle-cross-core-stages
 // CHECK-NEXT:   ktdf-to-ktdflowering
 // CHECK-NEXT:   builtin.module(
 // CHECK-NEXT:   func.func(
