@@ -1,4 +1,5 @@
 // RUN: dataflow-scheduler-opt --path-expansion %s | FileCheck %s
+// RUN: dataflow-scheduler-opt --path-expansion --path-expansion %s | FileCheck %s
 
 // A pipeline whose stages all have a unit has nothing left for path expansion
 // to assign. It is legal if the data two consecutive stages exchange can
