@@ -23,6 +23,7 @@ add_dataflow_scheduler_library(DataflowSchedulerAnalysis
     KTIR::KtdpDialect
 
   LINK_MLIR_LIBS
+    MLIRAffineAnalysis
     MLIRAnalysis
     MLIRIR
     MLIRLinalgDialect

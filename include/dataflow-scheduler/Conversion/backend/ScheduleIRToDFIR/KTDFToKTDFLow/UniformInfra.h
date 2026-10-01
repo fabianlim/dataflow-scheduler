@@ -56,11 +56,13 @@ class UniformInfra {
  public:
   explicit UniformInfra(mlir::func::FuncOp func) : func_(func) {}
 
-  /// Create all maps and queries
+  /// Create all maps and queries: for each component, a map from each tile of
+  /// @p component_tiles to the component's unit on it
   mlir::LogicalResult createMapsAndQueries(
-      const ComponentClassification& components, int grid_size,
-      const UnitSSAMap& unit_ssa_map, QueriedUnitsMap& queried_units,
-      UniformMapsStorage& uniform_maps, mlir::OpBuilder& builder);
+      const ComponentClassification& components,
+      const ComponentTiles& component_tiles, const UnitSSAMap& unit_ssa_map,
+      QueriedUnitsMap& queried_units, UniformMapsStorage& uniform_maps,
+      mlir::OpBuilder& builder);
 
   /// Emit uniform map + query inside a program_unit body for each per-core
   /// memory space. Keys = program_unit operand values (matched to memory unit

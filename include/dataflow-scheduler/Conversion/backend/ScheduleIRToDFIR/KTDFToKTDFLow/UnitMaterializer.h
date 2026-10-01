@@ -23,6 +23,7 @@
 
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/ComponentClassifier.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/StageDomains.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "llvm/ADT/DenseMap.h"
@@ -55,9 +56,11 @@ class UnitMaterializer {
  public:
   explicit UnitMaterializer(mlir::func::FuncOp func) : func_(func) {}
 
-  /// Create all unit SSA values at function entry
+  /// Create all unit SSA values at function entry: for each component, one
+  /// per tile of @p component_tiles.
   mlir::LogicalResult materialize(const ComponentClassification& components,
-                                  int grid_size, UnitSSAMap& unit_ssa_map,
+                                  const ComponentTiles& component_tiles,
+                                  UnitSSAMap& unit_ssa_map,
                                   mlir::OpBuilder& builder);
 
   /// Emit dataflow.get_unit ops for memory-space components at func entry.

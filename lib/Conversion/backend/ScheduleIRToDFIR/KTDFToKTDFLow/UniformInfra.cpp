@@ -29,9 +29,10 @@
 using namespace scheduler;
 
 mlir::LogicalResult UniformInfra::createMapsAndQueries(
-    const ComponentClassification& components, int grid_size,
-    const UnitSSAMap& unit_ssa_map, QueriedUnitsMap& queried_units,
-    UniformMapsStorage& uniform_maps, mlir::OpBuilder& builder) {
+    const ComponentClassification& components,
+    const ComponentTiles& component_tiles, const UnitSSAMap& unit_ssa_map,
+    QueriedUnitsMap& queried_units, UniformMapsStorage& uniform_maps,
+    mlir::OpBuilder& builder) {
   LDBG(1) << "Step 4: Create maps and queries";
 
   auto loc = func_.getLoc();
@@ -50,7 +51,7 @@ mlir::LogicalResult UniformInfra::createMapsAndQueries(
     llvm::SmallVector<mlir::Value> keys;
     llvm::SmallVector<mlir::Value> values;
 
-    for (int core = 0; core < grid_size; ++core) {
+    for (int core : component_tiles.at(component)) {
       keys.push_back(mlir::arith::ConstantIndexOp::create(builder, loc, core));
 
       auto it = unit_ssa_map.non_parallel.find(std::make_pair(component, core));
@@ -91,7 +92,7 @@ mlir::LogicalResult UniformInfra::createMapsAndQueries(
         llvm::SmallVector<mlir::Value> keys;
         llvm::SmallVector<mlir::Value> values;
 
-        for (int core = 0; core < grid_size; ++core) {
+        for (int core : component_tiles.at(component)) {
           keys.push_back(
               mlir::arith::ConstantIndexOp::create(builder, loc, core));
 

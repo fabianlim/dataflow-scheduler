@@ -22,6 +22,7 @@
 
 #include "dataflow-scheduler/Transforms/PathExpansion/Materializer.h"
 
+#include "dataflow-scheduler/Analysis/CrossCoreChannels.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -509,6 +510,14 @@ mlir::ktdf::StageOp PathExpansionMaterializer::materializeStageNode(
     auto template_stage = mlir::cast<mlir::ktdf::StageOp>(template_op);
     if (auto applicable_units = template_stage.getApplicableUnits()) {
       new_stage.setApplicableUnitsAttr(*applicable_units);
+    }
+  }
+
+  // A stage built from an original one executes on the same tiles.
+  if (template_op) {
+    if (mlir::Attribute domain =
+            template_op->getAttr(scheduler::kStageDomainAttrName)) {
+      new_stage->setAttr(scheduler::kStageDomainAttrName, domain);
     }
   }
 

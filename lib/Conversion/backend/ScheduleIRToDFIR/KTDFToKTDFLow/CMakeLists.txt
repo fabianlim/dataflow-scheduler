@@ -4,6 +4,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFToKTDFLow
     PipelineExecutionTransform.cpp
     ScratchpadConflicts.cpp
     SignalInsertion.cpp
+    StageDomains.cpp
     UniformInfra.cpp
     UnitMaterializer.cpp
     UnitSSACollection.cpp

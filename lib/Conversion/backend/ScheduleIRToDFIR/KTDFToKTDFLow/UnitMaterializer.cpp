@@ -58,18 +58,18 @@ static std::string unitTypeTag(ResourceType rt) {
 }
 
 mlir::LogicalResult UnitMaterializer::materialize(
-    const ComponentClassification& components, int grid_size,
-    UnitSSAMap& unit_ssa_map, mlir::OpBuilder& builder) {
+    const ComponentClassification& components,
+    const ComponentTiles& component_tiles, UnitSSAMap& unit_ssa_map,
+    mlir::OpBuilder& builder) {
   LDBG(1) << "Step 3: Materialize units";
 
-  assert(grid_size > 0 && "Grid size should be at-least greater than zero");
   auto loc = func_.getLoc();
 
-  // Materialize non-parallel component units: 1 per core
+  // Materialize non-parallel component units: 1 per core of the component
   for (auto component : components.non_parallel_components) {
     std::string comp_name = unitTypeTag(component);
 
-    for (int core = 0; core < grid_size; ++core) {
+    for (int core : component_tiles.at(component)) {
       auto unit_name = "C" + std::to_string(core) + "-" + comp_name;
 
       // Create actual dataflow.get_unit operation
@@ -86,7 +86,8 @@ mlir::LogicalResult UnitMaterializer::materialize(
     }
   }
 
-  // Materialize parallel component units: 1 per corelet per core
+  // Materialize parallel component units: 1 per corelet per core of the
+  // component
   for (auto& [parallel_op, components_in_parallel] :
        components.parallel_components_map) {
     auto parallel = mlir::dyn_cast<mlir::ktdf::ParallelOp>(parallel_op);
@@ -100,7 +101,7 @@ mlir::LogicalResult UnitMaterializer::materialize(
       std::string comp_name = unitTypeTag(component);
 
       for (int corelet = 0; corelet < num_instances; ++corelet) {
-        for (int core = 0; core < grid_size; ++core) {
+        for (int core : component_tiles.at(component)) {
           auto unit_name = "C" + std::to_string(core) + "-" + comp_name +
                            "-CL" + std::to_string(corelet);
 

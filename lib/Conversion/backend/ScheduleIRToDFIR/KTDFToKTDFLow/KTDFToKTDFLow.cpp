@@ -33,6 +33,7 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/PipelineExecutionTransform.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/ScratchpadConflicts.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/SignalInsertion.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/StageDomains.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/UniformInfra.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/UnitMaterializer.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/Passes.h"
@@ -347,13 +348,21 @@ struct KTDFToKTDFLoweringPass
         return signalPassFailure();
       }
 
+      // Step 2b: Resolve the tiles each component's units are on, from the
+      // domains of the stages
+      ComponentTiles component_tiles;
+      if (mlir::failed(
+              resolveComponentTiles(stages, grid_size, component_tiles))) {
+        return signalPassFailure();
+      }
+
       // Step 3: Materialize units
       UnitSSAMap unit_ssa_map;
       mlir::OpBuilder builder(&func.getBody().front(),
                               func.getBody().front().begin());
 
       UnitMaterializer materializer(func);
-      if (mlir::failed(materializer.materialize(components, grid_size,
+      if (mlir::failed(materializer.materialize(components, component_tiles,
                                                 unit_ssa_map, builder))) {
         return signalPassFailure();
       }
@@ -364,8 +373,8 @@ struct KTDFToKTDFLoweringPass
 
       UniformInfra uniform_infra(func);
       if (mlir::failed(uniform_infra.createMapsAndQueries(
-              components, grid_size, unit_ssa_map, queried_units, uniform_maps,
-              builder))) {
+              components, component_tiles, unit_ssa_map, queried_units,
+              uniform_maps, builder))) {
         return signalPassFailure();
       }
 
