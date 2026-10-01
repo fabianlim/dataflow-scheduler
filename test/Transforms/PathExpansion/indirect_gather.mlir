@@ -1,4 +1,5 @@
 // RUN: dataflow-scheduler-opt --path-expansion %s | FileCheck %s
+// RUN: dataflow-scheduler-opt --path-expansion --path-expansion %s | FileCheck %s
 // NOTE: FIFO memory-space names ("DDR", "SFU", "L1") must match the kind
 // strings in sample_device.mlir, which the routing graph keys on.
 

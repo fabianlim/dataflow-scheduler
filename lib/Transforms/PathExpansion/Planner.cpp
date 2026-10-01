@@ -27,6 +27,7 @@
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -1124,20 +1125,100 @@ static llvm::SmallVector<ResourceType> collectOriginalStageResourcePath(
   return endpoint_path;
 }
 
-static bool needsExpansion(
-    llvm::ArrayRef<ResourceType> endpoint_path,
-    const scheduler::arch_view::RoutingGraph::Path& full_path,
+static ResourceType getStageUnit(StageNode* stage) {
+  auto units =
+      mlir::cast<mlir::ktdf::StageOp>(stage->getOperation()).getApplicableUnits();
+  if (!units) return nullptr;
+  assert(units->size() == 1 &&
+         "path expansion currently does not handle multi-unit stages");
+  return llvm::cast<ResourceType>(units->getValue()[0]);
+}
+
+/// Return true if some node of \p source reaches some node of \p target
+/// directly or only through switches, which relay data without staging it.
+static bool isRoutedThroughSwitches(
+    ResourceType source, ResourceType target,
     const scheduler::arch_view::RoutingGraph& arch_graph) {
-  llvm::SmallVector<ResourceType> full_path_no_ls;
-  for (auto node_id : full_path) {
-    auto node_opt = arch_graph.getNode(node_id);
-    assert(node_opt);
-    if (node_opt->kind != scheduler::arch_view::RoutingGraph::ResourceNode::
-                              ResourceKind::LoadStoreUnit) {
-      full_path_no_ls.push_back(node_opt->resource);
+  using RK = scheduler::arch_view::RoutingGraph::ResourceNode::ResourceKind;
+  auto source_ids = arch_graph.getNodeIdsForResource(source);
+  llvm::SmallVector<scheduler::arch_view::RoutingGraph::NodeId> worklist(
+      source_ids.begin(), source_ids.end());
+  llvm::DenseSet<scheduler::arch_view::RoutingGraph::NodeId> visited(
+      source_ids.begin(), source_ids.end());
+  while (!worklist.empty()) {
+    for (auto neighbor : arch_graph.getNeighbors(worklist.pop_back_val())) {
+      auto node = arch_graph.getNode(neighbor);
+      if (node->resource == target) return true;
+      if (node->kind == RK::Switch && visited.insert(neighbor).second)
+        worklist.push_back(neighbor);
     }
   }
-  return full_path_no_ls != endpoint_path;
+  return false;
+}
+
+/// Return true if some node of \p source has an edge to some node of \p target.
+static bool hasDirectLink(
+    ResourceType source, ResourceType target,
+    const scheduler::arch_view::RoutingGraph& arch_graph) {
+  for (auto source_id : arch_graph.getNodeIdsForResource(source))
+    for (auto target_id : arch_graph.getNodeIdsForResource(target))
+      if (arch_graph.getEdgeInfo(source_id, target_id)) return true;
+  return false;
+}
+
+/// Return true if the data that two consecutive mapped stages exchange can
+/// legally travel from \p source_unit to \p target_unit: a fifo connects the
+/// units directly or through switches only, and a memory buffer is written by
+/// one unit and read by the other.
+static bool isLegalJoin(StageNode* source, ResourceType source_unit,
+                        StageNode* target, ResourceType target_unit,
+                        const scheduler::arch_view::RoutingGraph& arch_graph) {
+  llvm::DenseSet<mlir::Value> source_values;
+  source->getOperation()->walk([&](mlir::Operation* op) {
+    source_values.insert(op->operand_begin(), op->operand_end());
+  });
+
+  bool legal = true;
+  target->getOperation()->walk([&](mlir::Operation* op) {
+    for (mlir::Value value : op->getOperands()) {
+      if (!source_values.contains(value)) continue;
+      if (mlir::isa<mlir::ktdf::FifoSlotType>(value.getType())) {
+        legal &= isRoutedThroughSwitches(source_unit, target_unit, arch_graph);
+      } else if (auto type = mlir::dyn_cast<mlir::MemRefType>(value.getType());
+                 type && type.getMemorySpace()) {
+        auto memory = llvm::cast<ResourceType>(type.getMemorySpace());
+        legal &= hasDirectLink(source_unit, memory, arch_graph) &&
+                 hasDirectLink(memory, target_unit, arch_graph);
+      }
+    }
+  });
+  return legal;
+}
+
+/// Return true if path expansion has work left on the pipeline. A stage
+/// without a unit always needs it: assigning units is part of the expansion.
+/// Once every stage has a unit, the pipeline needs expansion only if the data
+/// exchanged between two consecutive stages cannot travel between their units.
+static bool needsExpansion(
+    llvm::ArrayRef<StageNode*> sorted_stages,
+    const scheduler::arch_view::RoutingGraph& arch_graph) {
+  llvm::SmallVector<ResourceType> units;
+  for (StageNode* stage : sorted_stages) {
+    ResourceType unit = getStageUnit(stage);
+    if (!unit) return true;
+    units.push_back(unit);
+  }
+  for (size_t i = 0; i + 1 < sorted_stages.size(); ++i) {
+    if (!isLegalJoin(sorted_stages[i], units[i], sorted_stages[i + 1],
+                     units[i + 1], arch_graph))
+      return true;
+  }
+  return false;
+}
+
+static bool isFullyMapped(llvm::ArrayRef<StageNode*> sorted_stages) {
+  return llvm::all_of(sorted_stages,
+                      [](StageNode* stage) { return getStageUnit(stage); });
 }
 
 static void debugPrintInitialPlannerState(
@@ -1224,14 +1305,30 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
   }
   llvm::SmallVector<StageNode*> sorted_stages = *sorted_stages_or;
 
-  // PREP 2: Verify pipeline has an anchor stage
+  // PREP 2: Check whether path expansion is needed
+  if (!needsExpansion(sorted_stages, arch_graph)) {
+    LDBG(1) << "Pipeline already legal";
+    return plan;
+  }
+  // Expansion derives the missing stages from the memories of the stages that
+  // have no unit yet, so it has nothing to work from in a fully mapped
+  // pipeline.
+  if (isFullyMapped(sorted_stages)) {
+    mlir::cast<mlir::ktdf::PipelineOp>(pipeline->getOperation())
+        .emitError("path-expansion: two consecutive stages of this fully "
+                   "mapped pipeline are not connected, and stages cannot be "
+                   "inserted into a fully mapped pipeline");
+    return nullptr;
+  }
+
+  // PREP 3: Verify pipeline has an anchor stage
   if (!hasAnchorStage(sorted_stages)) {
     return nullptr;
   }
 
   LLVM_DEBUG(debugPrintInitialPlannerState(pipeline, sorted_stages));
 
-  // PREP 3: Assign resources and collect endpoint path
+  // PREP 4: Assign resources and collect endpoint path
   assignOriginalStageResources(sorted_stages, plan.get());
   llvm::SmallVector<ResourceType> endpoint_path =
       collectOriginalStageResourcePath(sorted_stages, plan.get());
@@ -1241,7 +1338,7 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
     return plan;
   }
 
-  // PREP 4: Build full shortest path across architecture graph
+  // PREP 5: Build full shortest path across architecture graph
   std::optional<scheduler::arch_view::RoutingGraph::Path> full_path_opt =
       buildFullShortestPath(endpoint_path, arch_graph);
   if (!full_path_opt) {
@@ -1251,13 +1348,6 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
   scheduler::arch_view::RoutingGraph::Path full_path = *full_path_opt;
 
   LLVM_DEBUG(debugPrintFullPath(full_path));
-
-  // PREP 5: Check whether path expansion is needed
-  if (!needsExpansion(endpoint_path, full_path, arch_graph)) {
-    plan->changed = false;
-    LDBG(1) << "Pipeline already legal";
-    return plan;
-  }
 
   plan->changed = true;
 

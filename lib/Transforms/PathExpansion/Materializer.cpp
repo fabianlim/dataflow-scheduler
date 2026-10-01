@@ -497,15 +497,13 @@ mlir::ktdf::StageOp PathExpansionMaterializer::materializeStageNode(
   auto new_stage =
       mlir::ktdf::StageOp::create(builder_, loc, depends_in, depends_out);
 
-  // Set applicable_units if present in materialization info
+  // Set applicable_units if the planner assigned one, including to original
+  // stages it preserves: every stage leaves path expansion with its unit.
   if (info_it != stage_info_.end() &&
-      info_it->second.kind !=
-          StageMaterializationInfo::Kind::kPreserveOriginal) {
-    if (info_it->second.applicable_unit.has_value()) {
-      auto applicable_units_attr =
-          builder_.getArrayAttr({*info_it->second.applicable_unit});
-      new_stage.setApplicableUnitsAttr(applicable_units_attr);
-    }
+      info_it->second.applicable_unit.has_value()) {
+    auto applicable_units_attr =
+        builder_.getArrayAttr({*info_it->second.applicable_unit});
+    new_stage.setApplicableUnitsAttr(applicable_units_attr);
   } else if (template_op) {
     // Copy applicable_units from template
     auto template_stage = mlir::cast<mlir::ktdf::StageOp>(template_op);

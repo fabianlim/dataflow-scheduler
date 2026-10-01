@@ -1,15 +1,15 @@
-// RUN: dataflow-scheduler-opt --ktdf-to-ktdflowering %s | FileCheck %s --check-prefix=LOWERING
-// RUN: dataflow-scheduler-opt --ktdf-to-ktdflowering --ktdflowering-to-dfir %s | FileCheck %s
-// RUN: dataflow-scheduler-opt --ktdf-to-ktdflowering --ktdflowering-to-dfir %s | FileCheck %s --check-prefix=NOSYNC
+// RUN: dataflow-scheduler-opt --path-expansion --ktdf-to-ktdflowering %s | FileCheck %s --check-prefix=LOWERING
+// RUN: dataflow-scheduler-opt --path-expansion --ktdf-to-ktdflowering --ktdflowering-to-dfir %s | FileCheck %s
+// RUN: dataflow-scheduler-opt --path-expansion --ktdf-to-ktdflowering --ktdflowering-to-dfir %s | FileCheck %s --check-prefix=NOSYNC
 
 // The local copy of the broadcast relayout, on its own: a 64x64xf16 L1 tile
 // is copied from element offset 0 to element offset 128, one stick per
 // iteration, through L1LU -> SFU -> L1SU. The SFU stage is an identity
 // linalg.generic, so it must lower to a plain receive and send.
 //
-// Every stage is mapped. Path expansion is not part of the RUN lines: it
-// does not recognise a fully mapped pipeline as legal yet, and the backend
-// needs every stage mapped.
+// Only the SFU stage is mapped, as the frontend writes such a pipeline. Path
+// expansion finds that no stage is missing and assigns the load and store
+// stages their units, L1LU and L1SU, which the backend needs.
 //
 // No stage has a domain yet, so each program unit runs on the units of all
 // 32 cores.
@@ -104,7 +104,7 @@ module {
         }
         ktdf.stage depends_in(none) depends_out(%p#2) {
           ktdf.data_transfer from %src[%row, %c0] size [1, 64] to %p#0 size [64] : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
-        } {applicable_units = ["L1LU"]}
+        }
         ktdf.stage depends_in(%p#2) depends_out(%p#3) {
           %v = ktdf.read_from_fifo %p#0 : <"L1LU" -> "SFU", 64xf16> -> tensor<64xf16>
           %e = tensor.empty() : tensor<64xf16>
@@ -116,7 +116,7 @@ module {
         } {applicable_units = ["SFU"]}
         ktdf.stage depends_in(%p#3) depends_out(%p#4) {
           ktdf.data_transfer from %p#1 size [64] to %dst[%row, %c0] size [1, 64] : !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, memref<64x64xf16, "L1">
-        } {applicable_units = ["L1SU"]}
+        }
       }
     } {loop_type = #ktdf.loop_type<parallel_loop>}
     return
