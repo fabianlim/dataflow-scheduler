@@ -209,6 +209,25 @@ auto planSelfDeliveries(ktdf::PipelineOp pipeline, int grid_size,
       return failure();
     }
 
+    // The ring carries C(g) without P(g); the rest is copied locally. A
+    // channel or a group with no ring consumer would leave the ring with
+    // nothing to deliver, or a producer sending to no tile.
+    if (getRingConsumerTiles(*channel_groups).empty()) {
+      return producer.emitError()
+             << "a cross-core fifo whose consumers are all producers of their "
+                "group, so that the ring delivers to no tile, is not "
+                "supported yet";
+    }
+    for (const ChannelGroup& group : *channel_groups) {
+      if (getRingConsumerTiles(group).empty()) {
+        return producer.emitError()
+               << "group " << group.id
+               << " of the cross-core fifo delivers only to its producer, so "
+                  "that the producer sends over the ring to no tile, which is "
+                  "not supported yet";
+      }
+    }
+
     const auto tiles = getSelfDeliveries(*channel_groups);
     if (tiles.empty()) {
       continue;

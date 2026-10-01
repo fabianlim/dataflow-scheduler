@@ -61,3 +61,62 @@ module {
     return
   }
 }
+
+// -----
+
+// Two groups, g = 0..1: producer g feeds only itself, so every consumer is a
+// self-delivery and the ring delivers to no tile.
+
+#groups = affine_set<(g) : (g >= 0, 1 - g >= 0)>
+#producers = affine_set<(c)[g] : (c - g == 0)>
+#consumers = affine_set<(c)[g] : (c - g == 0)>
+module {
+  ktdf_arch.device @ring_device import("../../Dialect/KTDFArch/ring_device.mlir")
+  func.func @no_ring_consumer(%src: memref<1x64xf16, "L1">, %dst: memref<1x64xf16, "L1">) attributes {grid = [4]} {
+    ktdf.pipeline {
+      %p:2 = ktdf.private -> (!ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token) {
+        %ch = ktdf.fifo.allocate() {dataflow_scheduler.groups = #groups} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+        %t0 = ktdf.create_token : !ktdf.token
+        ktdf.private_yield %ch, %t0 : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token
+      }
+      // expected-error @below {{a cross-core fifo whose consumers are all producers of their group, so that the ring delivers to no tile, is not supported yet}}
+      ktdf.stage depends_in(none) depends_out(%p#1) {
+        ktdf.data_transfer from %src[0, 0] size [1, 64] to %p#0 size [64] : memref<1x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+      } {applicable_units = ["MNISU"], dataflow_scheduler.domain = #producers}
+      ktdf.stage depends_in(%p#1) depends_out(none) {
+        ktdf.data_transfer from %p#0 size [64] to %dst[0, 0] size [1, 64] : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<1x64xf16, "L1">
+      } {applicable_units = ["MNILU"], dataflow_scheduler.domain = #consumers}
+    }
+    return
+  }
+}
+
+// -----
+
+// Two groups, g = 0..1: producer 0 feeds only itself, and producer 1 feeds
+// cores 1..3. Group 0 has no ring consumer, so producer 0 would send over the
+// ring to no tile.
+
+#groups = affine_set<(g) : (g >= 0, 1 - g >= 0)>
+#producers = affine_set<(c)[g] : (c - g == 0)>
+#consumers = affine_set<(c)[g] : (c - g >= 0, 3 * g - c >= 0)>
+module {
+  ktdf_arch.device @ring_device import("../../Dialect/KTDFArch/ring_device.mlir")
+  func.func @group_without_ring_consumer(%src: memref<1x64xf16, "L1">, %dst: memref<1x64xf16, "L1">) attributes {grid = [4]} {
+    ktdf.pipeline {
+      %p:2 = ktdf.private -> (!ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token) {
+        %ch = ktdf.fifo.allocate() {dataflow_scheduler.groups = #groups} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+        %t0 = ktdf.create_token : !ktdf.token
+        ktdf.private_yield %ch, %t0 : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token
+      }
+      // expected-error @below {{group 0 of the cross-core fifo delivers only to its producer, so that the producer sends over the ring to no tile, which is not supported yet}}
+      ktdf.stage depends_in(none) depends_out(%p#1) {
+        ktdf.data_transfer from %src[0, 0] size [1, 64] to %p#0 size [64] : memref<1x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+      } {applicable_units = ["MNISU"], dataflow_scheduler.domain = #producers}
+      ktdf.stage depends_in(%p#1) depends_out(none) {
+        ktdf.data_transfer from %p#0 size [64] to %dst[0, 0] size [1, 64] : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<1x64xf16, "L1">
+      } {applicable_units = ["MNILU"], dataflow_scheduler.domain = #consumers}
+    }
+    return
+  }
+}

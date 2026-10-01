@@ -61,7 +61,9 @@ def HandleCrossCoreStagesPass
     it: for each group g, the producers P(g) send to the consumers C(g). The
     ring that carries the channel cannot deliver a tile's data to the tile
     itself, so lowering carries only C(g) without P(g) over it. The tiles in
-    both C(g) and P(g) are self-deliveries, and this pass realizes them.
+    both C(g) and P(g) are self-deliveries, and this pass realizes them. For
+    now every group must keep at least one ring consumer: a group whose
+    consumers are all self-deliveries is an error.
 
     A channel pipeline with self-deliveries is replaced by an outer pipeline
     with no token between its stages, so that they run concurrently: one
