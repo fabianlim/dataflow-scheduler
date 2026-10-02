@@ -76,6 +76,73 @@ mlir::scf::ForOp createForOpWithAdditionalIterArgs(mlir::scf::ForOp loop_op,
 /// last reader of.
 void eraseDeadAncestorOps(llvm::ArrayRef<mlir::Operation*> roots);
 
+/// One dimension of the walk of one side of a transfer: which memref dimension
+/// it advances, and by how many indices of that dimension per step.
+struct TransferTimeStep {
+  unsigned memref_dim;
+  int64_t index_step;
+};
+
+/// How one side of a transfer is walked in vectors: the extent of each walked
+/// dimension, slowest-varying first, and what each dimension advances. In
+/// DFIR the walked dimensions are AGEN time dimensions: `extents` becomes
+/// `time_set` and `offsets()` the results of that side's `*_time_addr_map`.
+struct TransferTimeDims {
+  llvm::SmallVector<int64_t> extents;
+  llvm::SmallVector<TransferTimeStep> steps;  // parallel to `extents`
+  size_t rank = 0;
+
+  /// A traversal of a memref of `rank` dimensions that walks nothing.
+  explicit TransferTimeDims(size_t rank) : rank(rank) {}
+
+  /// The offset added to each memref index at time step (d0, ..., dn-1); zero
+  /// at every index a time dimension does not advance. Time dimensions are
+  /// numbered in the order they were added, which is also why an identity
+  /// `time_order` is correct: d0 is the slowest-varying.
+  llvm::SmallVector<mlir::AffineExpr> offsets(
+      mlir::MLIRContext* context) const {
+    llvm::SmallVector<mlir::AffineExpr> result(
+        rank, mlir::getAffineConstantExpr(0, context));
+    for (auto [time_dim, step] : llvm::enumerate(steps)) {
+      result[step.memref_dim] =
+          mlir::getAffineConstantExpr(step.index_step, context) *
+          mlir::getAffineDimExpr(time_dim, context);
+    }
+    return result;
+  }
+
+  /// Drop time dimension `time_dim`. The remaining dimensions keep their
+  /// relative order and are renumbered by `offsets()`.
+  void eraseDim(unsigned time_dim) {
+    extents.erase(extents.begin() + time_dim);
+    steps.erase(steps.begin() + time_dim);
+  }
+};
+
+/// Describe how `sizes` is traversed in vectors of `lanes` elements. Every
+/// non-unit dimension except the innermost contributes a time dimension
+/// stepping by one; the innermost contributes one stepping by a whole vector,
+/// and only when it holds more than one. With a 64-lane vector:
+///
+///   sizes           extents      offsets           time_set
+///   [1, 256, 64]    [256]        (0, d0, 0)        (d0) : 0 <= d0 <= 255
+///   [1, 1, 128]     [2]          (0, 0, 64 * d0)   (d0) : 0 <= d0 <= 1
+///   [2, 4, 8, 64]   [2, 4, 8]    (d0, d1, d2, 0)   3 dims of those extents
+///   [1, 64]         []           (0, 0)            nothing walked
+///
+/// The last row is a transfer that fits in one vector: the offsets are already
+/// the all-zero map, and the caller supplies the single pinned time step.
+TransferTimeDims describeTransferTimeDims(llvm::ArrayRef<int64_t> sizes,
+                                          int64_t lanes);
+
+/// Extend `map` with one trailing dimension that advances `step.memref_dim` by
+/// `step.index_step` indices per unit. Appending a loop induction variable to
+/// the subscript operands then drives that dimension from the loop instead of
+/// from the time axis.
+mlir::AffineMap foldStepIntoSubscripts(mlir::MLIRContext* context,
+                                       mlir::AffineMap map,
+                                       TransferTimeStep step);
+
 }  // namespace scheduler
 
 #endif  // DATAFLOW_SCHEDULER_TRANSFORMS_UTILS_UTILS_H_

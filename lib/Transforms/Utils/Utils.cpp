@@ -163,3 +163,31 @@ void scheduler::eraseDeadAncestorOps(llvm::ArrayRef<mlir::Operation*> roots) {
     op->erase();
   }
 }
+
+scheduler::TransferTimeDims scheduler::describeTransferTimeDims(
+    llvm::ArrayRef<int64_t> sizes, int64_t lanes) {
+  TransferTimeDims dims(sizes.size());
+  auto addDim = [&](unsigned pos, int64_t extent, int64_t index_step) {
+    dims.steps.push_back({pos, index_step});
+    dims.extents.push_back(extent);
+  };
+  for (unsigned i = 0; i + 1 < sizes.size(); ++i) {
+    if (sizes[i] != 1) addDim(i, sizes[i], /*index_step=*/1);
+  }
+  if (const int64_t vectors = sizes.back() / lanes; vectors > 1) {
+    addDim(sizes.size() - 1, vectors, /*index_step=*/lanes);
+  }
+  return dims;
+}
+
+mlir::AffineMap scheduler::foldStepIntoSubscripts(mlir::MLIRContext* context,
+                                                  mlir::AffineMap map,
+                                                  TransferTimeStep step) {
+  llvm::SmallVector<mlir::AffineExpr> results(map.getResults());
+  results[step.memref_dim] =
+      results[step.memref_dim] +
+      mlir::getAffineConstantExpr(step.index_step, context) *
+          mlir::getAffineDimExpr(map.getNumDims(), context);
+  return mlir::AffineMap::get(map.getNumDims() + 1, map.getNumSymbols(),
+                              results, context);
+}

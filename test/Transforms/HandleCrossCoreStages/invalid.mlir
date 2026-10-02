@@ -120,3 +120,90 @@ module {
     return
   }
 }
+
+// -----
+
+// The local copy of a channel moves it in the messages of the channel's
+// throttle, so the transfers into and out of the channel must agree on it.
+
+#groups = affine_set<(g) : (g == 0)>
+#producers = affine_set<(c)[g] : (c - g == 0)>
+#consumers = affine_set<(c)[g] : (c - 4 * g >= 0, 4 * g + 3 - c >= 0)>
+module {
+  ktdf_arch.device @ring_device import("../../Dialect/KTDFArch/ring_device.mlir")
+  func.func @throttles_differ(%src: memref<64x64xf16, "L1">, %dst: memref<64x64xf16, "L1">) attributes {grid = [4]} {
+    ktdf.pipeline {
+      %p:2 = ktdf.private -> (!ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token) {
+        %ch = ktdf.fifo.allocate() {dataflow_scheduler.groups = #groups} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+        %t0 = ktdf.create_token : !ktdf.token
+        ktdf.private_yield %ch, %t0 : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token
+      }
+      ktdf.stage depends_in(none) depends_out(%p#1) {
+        // expected-error @below {{the transfers into and out of a cross-core fifo with self-deliveries must have the same throttle}}
+        ktdf.data_transfer from %src[0, 0] size [64, 64] to %p#0 size [64, 64] {dataflow_scheduler.throttle = 64 : i64} : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+      } {applicable_units = ["MNISU"], dataflow_scheduler.domain = #producers}
+      ktdf.stage depends_in(%p#1) depends_out(none) {
+        ktdf.data_transfer from %p#0 size [64, 64] to %dst[0, 0] size [64, 64] {dataflow_scheduler.throttle = 32 : i64} : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<64x64xf16, "L1">
+      } {applicable_units = ["MNILU"], dataflow_scheduler.domain = #consumers}
+    }
+    return
+  }
+}
+
+// -----
+
+// A message of the throttle's 64 elements does not divide the innermost
+// dimension of 96 elements.
+
+#groups = affine_set<(g) : (g == 0)>
+#producers = affine_set<(c)[g] : (c - g == 0)>
+#consumers = affine_set<(c)[g] : (c - 4 * g >= 0, 4 * g + 3 - c >= 0)>
+module {
+  ktdf_arch.device @ring_device import("../../Dialect/KTDFArch/ring_device.mlir")
+  func.func @innermost_not_multiple_of_throttle(%src: memref<64x96xf16, "L1">, %dst: memref<64x96xf16, "L1">) attributes {grid = [4]} {
+    ktdf.pipeline {
+      %p:2 = ktdf.private -> (!ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token) {
+        %ch = ktdf.fifo.allocate() {dataflow_scheduler.groups = #groups} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+        %t0 = ktdf.create_token : !ktdf.token
+        ktdf.private_yield %ch, %t0 : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token
+      }
+      ktdf.stage depends_in(none) depends_out(%p#1) {
+        // expected-error @below {{the local copy of a cross-core fifo moves it in messages of its throttle of 64, which requires the innermost sizes of the memories it copies between to be multiples of the throttle}}
+        ktdf.data_transfer from %src[0, 0] size [64, 96] to %p#0 size [64, 96] {dataflow_scheduler.throttle = 64 : i64} : memref<64x96xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+      } {applicable_units = ["MNISU"], dataflow_scheduler.domain = #producers}
+      ktdf.stage depends_in(%p#1) depends_out(none) {
+        ktdf.data_transfer from %p#0 size [64, 96] to %dst[0, 0] size [64, 96] {dataflow_scheduler.throttle = 64 : i64} : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<64x96xf16, "L1">
+      } {applicable_units = ["MNILU"], dataflow_scheduler.domain = #consumers}
+    }
+    return
+  }
+}
+
+// -----
+
+// The producer reads 64 rows of one message and the consumer writes 32 rows of
+// two, so the local copy has no one loop over the messages of both.
+
+#groups = affine_set<(g) : (g == 0)>
+#producers = affine_set<(c)[g] : (c - g == 0)>
+#consumers = affine_set<(c)[g] : (c - 4 * g >= 0, 4 * g + 3 - c >= 0)>
+module {
+  ktdf_arch.device @ring_device import("../../Dialect/KTDFArch/ring_device.mlir")
+  func.func @different_walks(%src: memref<64x64xf16, "L1">, %dst: memref<32x128xf16, "L1">) attributes {grid = [4]} {
+    ktdf.pipeline {
+      %p:2 = ktdf.private -> (!ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token) {
+        %ch = ktdf.fifo.allocate() {dataflow_scheduler.groups = #groups} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+        %t0 = ktdf.create_token : !ktdf.token
+        ktdf.private_yield %ch, %t0 : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token
+      }
+      ktdf.stage depends_in(none) depends_out(%p#1) {
+        // expected-error @below {{the local copy of a cross-core fifo moves it in messages of its throttle of 64, which requires the memories it copies between to be walked in the same messages}}
+        ktdf.data_transfer from %src[0, 0] size [64, 64] to %p#0 size [64, 64] {dataflow_scheduler.throttle = 64 : i64} : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+      } {applicable_units = ["MNISU"], dataflow_scheduler.domain = #producers}
+      ktdf.stage depends_in(%p#1) depends_out(none) {
+        ktdf.data_transfer from %p#0 size [32, 128] to %dst[0, 0] size [32, 128] {dataflow_scheduler.throttle = 64 : i64} : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<32x128xf16, "L1">
+      } {applicable_units = ["MNILU"], dataflow_scheduler.domain = #consumers}
+    }
+    return
+  }
+}

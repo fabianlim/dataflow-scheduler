@@ -9,13 +9,16 @@
 // ktdf-to-ktdflowering materializes the units on the tiles of the leaf
 // stages of each kind.
 //
-// The channel has the groups g = 0..7: producer core g sends its slice to the
-// consumer cores 4g..4g+3. The ring carries C(g) without P(g), so MNISU is on
-// cores 0..7 and MNILU on cores 1..31; the local copy carries core 0's slice
-// to core 0, so L1LU, SFU and L1SU are on core 0 only. Each kind's map from
-// tile to unit lists exactly those tiles. The stages that wrap the channel
-// and the local copy are not counted for the tiles; they execute on the units
-// of the stages they wrap.
+// The channel has the groups g = 0..7: producer core g sends its 64x64 tile
+// to the consumer cores 4g..4g+3, in messages of one 64-element stick, the
+// throttle of its transfers. The ring carries C(g) without P(g), so MNISU is
+// on cores 0..7 and MNILU on cores 1..31; the local copy carries core 0's
+// tile to core 0, so L1LU, SFU and L1SU are on core 0 only. Each kind's map
+// from tile to unit lists exactly those tiles. The stages that wrap the
+// channel and the local copy are not counted for the tiles; they execute on
+// the units of the stages they wrap. The corelet path moves one vector per
+// transfer, so the local copy is a loop over the 64 sticks around its
+// pipeline, one stick per iteration.
 //
 // The token between the ring stages gets no signal: the producer stage
 // writes no memory, only the fifo, so the stages have no memory conflict.
@@ -29,8 +32,9 @@
 //
 // In DFIR the attributes of a group differ per unit, so the MNISU and MNILU
 // program units have one region per unit; each creates the group of its
-// producer's entry and moves one stick per iteration with a composite load
-// that sends to the group or a composite store that receives from it.
+// producer's entry and moves the tile with one composite load that sends to
+// the group or one composite store that receives from it, one stick per time
+// step over 64 time steps, with no loop around them.
 
 // The DFIR. Its output is large, so the checks below are explicit about what
 // they cover: every unit declaration; the ring producer program unit over
@@ -48,14 +52,14 @@
 
 // CHECK-DAG: #[[$LAYOUT:.+]] = affine_map<(d0, d1) -> (d0 * 64 + d1)>
 // CHECK-DAG: #[[$ORDER:.+]] = affine_map<(d0, d1) -> (d0, d1)>
-// CHECK-DAG: #[[$NO_OFFSET:.+]] = affine_map<(d0) -> (0, 0)>
+// CHECK-DAG: #[[$NEXT_ROW:.+]] = affine_map<(d0) -> (d0, 0)>
 // CHECK-DAG: #[[$TIME_ORDER:.+]] = affine_map<(d0) -> (d0)>
 // CHECK-DAG: #[[$STICK:.+]] = affine_set<(d0, d1) : (d0 == 0, d1 >= 0, -d1 + 63 >= 0)>
-// CHECK-DAG: #[[$ONE_STEP:.+]] = affine_set<(d0) : (d0 == 0)>
+// CHECK-DAG: #[[$ROWS:.+]] = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
 
 // CHECK-LABEL:   func.func @ring_broadcast() attributes {grid = [32]} {
-// CHECK-NEXT:     %[[C128:.*]] = arith.constant 128 : index
 // CHECK-NEXT:     %[[C64:.*]] = arith.constant 64 : index
+// CHECK-NEXT:     %[[C128:.*]] = arith.constant 128 : index
 // CHECK-NEXT:     %[[C1:.*]] = arith.constant 1 : index
 // CHECK-NEXT:     %[[C0:.*]] = arith.constant 0 : index
 // CHECK-NEXT:     %[[SU0:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-mnisu", type = "mnisu"} : index
@@ -140,64 +144,55 @@
 // CHECK-NEXT:       uniform.uniformize_regions -> () {
 // CHECK-NEXT:         (%{{.*}} -> %[[SU0]]){
 // CHECK-NEXT:           %[[SRC0:.*]] = dataflow.get_logical_memory_view %[[SU_MEM]], %[[C0]] {layout_map = #[[$LAYOUT]]} : index, index, memref<64x64xf16>
-// CHECK-NEXT:           scf.for %[[I0:.*]] = %[[C0]] to %[[C64]] step %[[C1]] {
-// CHECK-NEXT:             %[[GROUP0:.*]] = dataflow.create_multicast_group(%[[SU0]] -> ()) {count = 0 : i32, group_id = 0 : i32, num_consumers = 3 : i32} : index
-// CHECK-NEXT:             agen.composite_load %[[SRC0]]{{\[}}%[[I0]], %[[C0]]]
-// CHECK-NEXT:              time_symbols()(%[[STICK0:.*]]:vector<64xf16>)
-// CHECK-NEXT:              {load_order = #[[$ORDER]], load_set = #[[$STICK]], time_addr_map = #[[$NO_OFFSET]], time_order = #[[$TIME_ORDER]], time_set = #[[$ONE_STEP]]}
-// CHECK-NEXT:             {
-// CHECK-NEXT:               dataflow.send %[[GROUP0]], %[[STICK0]] {dir = #dataflow<direction CounterClockwise>} : vector<64xf16>
-// CHECK-NEXT:               agen.yield
-// CHECK-NEXT:             } : memref<64x64xf16>
-// CHECK-NEXT:           }
+// CHECK-NEXT:           %[[GROUP0:.*]] = dataflow.create_multicast_group(%[[SU0]] -> ()) {count = 0 : i32, group_id = 0 : i32, num_consumers = 3 : i32} : index
+// CHECK-NEXT:           agen.composite_load %[[SRC0]]{{\[}}%[[C0]], %[[C0]]]
+// CHECK-NEXT:            time_symbols()(%[[STICK0:.*]]:vector<64xf16>)
+// CHECK-NEXT:            {load_order = #[[$ORDER]], load_set = #[[$STICK]], time_addr_map = #[[$NEXT_ROW]], time_order = #[[$TIME_ORDER]], time_set = #[[$ROWS]]}
+// CHECK-NEXT:           {
+// CHECK-NEXT:             dataflow.send %[[GROUP0]], %[[STICK0]] {dir = #dataflow<direction CounterClockwise>} : vector<64xf16>
+// CHECK-NEXT:             agen.yield
+// CHECK-NEXT:           } : memref<64x64xf16>
 // CHECK-NEXT:           uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[SU1]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[SU_MEM]], %[[C0]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             %[[GROUP1:.*]] = dataflow.create_multicast_group(%[[SU1]] -> ()) {count = 0 : i32, group_id = 1 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           %[[GROUP1:.*]] = dataflow.create_multicast_group(%[[SU1]] -> ()) {count = 0 : i32, group_id = 1 : i32, num_consumers = 4 : i32} : index
 // CHECK:                  dataflow.send %[[GROUP1]], %{{.*}} {dir = #dataflow<direction CounterClockwise>} : vector<64xf16>
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[SU2]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[SU_MEM]], %[[C0]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             %[[GROUP2:.*]] = dataflow.create_multicast_group(%[[SU2]] -> ()) {count = 0 : i32, group_id = 2 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           %[[GROUP2:.*]] = dataflow.create_multicast_group(%[[SU2]] -> ()) {count = 0 : i32, group_id = 2 : i32, num_consumers = 4 : i32} : index
 // CHECK:                  dataflow.send %[[GROUP2]], %{{.*}} {dir = #dataflow<direction Clockwise>} : vector<64xf16>
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[SU3]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[SU_MEM]], %[[C0]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             %[[GROUP3:.*]] = dataflow.create_multicast_group(%[[SU3]] -> ()) {count = 0 : i32, group_id = 3 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           %[[GROUP3:.*]] = dataflow.create_multicast_group(%[[SU3]] -> ()) {count = 0 : i32, group_id = 3 : i32, num_consumers = 4 : i32} : index
 // CHECK:                  dataflow.send %[[GROUP3]], %{{.*}} {dir = #dataflow<direction CounterClockwise>} : vector<64xf16>
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[SU4]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[SU_MEM]], %[[C0]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             %[[GROUP4:.*]] = dataflow.create_multicast_group(%[[SU4]] -> ()) {count = 0 : i32, group_id = 4 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           %[[GROUP4:.*]] = dataflow.create_multicast_group(%[[SU4]] -> ()) {count = 0 : i32, group_id = 4 : i32, num_consumers = 4 : i32} : index
 // CHECK:                  dataflow.send %[[GROUP4]], %{{.*}} {dir = #dataflow<direction CounterClockwise>} : vector<64xf16>
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[SU5]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[SU_MEM]], %[[C0]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             %[[GROUP5:.*]] = dataflow.create_multicast_group(%[[SU5]] -> ()) {count = 0 : i32, group_id = 5 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           %[[GROUP5:.*]] = dataflow.create_multicast_group(%[[SU5]] -> ()) {count = 0 : i32, group_id = 5 : i32, num_consumers = 4 : i32} : index
 // CHECK:                  dataflow.send %[[GROUP5]], %{{.*}} {dir = #dataflow<direction Clockwise>} : vector<64xf16>
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[SU6]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[SU_MEM]], %[[C0]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             %[[GROUP6:.*]] = dataflow.create_multicast_group(%[[SU6]] -> ()) {count = 0 : i32, group_id = 6 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           %[[GROUP6:.*]] = dataflow.create_multicast_group(%[[SU6]] -> ()) {count = 0 : i32, group_id = 6 : i32, num_consumers = 4 : i32} : index
 // CHECK:                  dataflow.send %[[GROUP6]], %{{.*}} {dir = #dataflow<direction Clockwise>} : vector<64xf16>
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[SU7]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[SU_MEM]], %[[C0]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             %[[GROUP7:.*]] = dataflow.create_multicast_group(%[[SU7]] -> ()) {count = 0 : i32, group_id = 7 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           %[[GROUP7:.*]] = dataflow.create_multicast_group(%[[SU7]] -> ()) {count = 0 : i32, group_id = 7 : i32, num_consumers = 4 : i32} : index
 // CHECK:                  dataflow.send %[[GROUP7]], %{{.*}} {dir = #dataflow<direction CounterClockwise>} : vector<64xf16>
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
@@ -212,218 +207,185 @@
 // CHECK-NEXT:       uniform.uniformize_regions -> () {
 // CHECK-NEXT:         (%{{.*}} -> %[[LU1]]){
 // CHECK-NEXT:           %[[DST1:.*]] = dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]] {layout_map = #[[$LAYOUT]]} : index, index, memref<64x64xf16>
-// CHECK-NEXT:           scf.for %[[I1:.*]] = %[[C0]] to %[[C64]] step %[[C1]] {
-// CHECK-NEXT:             %[[JOIN1:.*]] = dataflow.create_multicast_group(%[[SU0]] -> ()) {count = 0 : i32, group_id = 0 : i32, num_consumers = 3 : i32} : index
-// CHECK-NEXT:             agen.composite_store %[[DST1]]{{\[}}%[[I1]], %[[C0]]]
-// CHECK-NEXT:              time_symbols()
-// CHECK-NEXT:              {store_order = #[[$ORDER]], store_set = #[[$STICK]], time_addr_map = #[[$NO_OFFSET]], time_order = #[[$TIME_ORDER]], time_set = #[[$ONE_STEP]]}
-// CHECK-NEXT:             {
-// CHECK-NEXT:               %[[RECEIVED1:.*]] = dataflow.receive %[[JOIN1]] : vector<64xf16>
-// CHECK-NEXT:               agen.yield %[[RECEIVED1]] : vector<64xf16>
-// CHECK-NEXT:             } : memref<64x64xf16>
-// CHECK-NEXT:           }
+// CHECK-NEXT:           %[[JOIN1:.*]] = dataflow.create_multicast_group(%[[SU0]] -> ()) {count = 0 : i32, group_id = 0 : i32, num_consumers = 3 : i32} : index
+// CHECK-NEXT:           agen.composite_store %[[DST1]]{{\[}}%[[C0]], %[[C0]]]
+// CHECK-NEXT:            time_symbols()
+// CHECK-NEXT:            {store_order = #[[$ORDER]], store_set = #[[$STICK]], time_addr_map = #[[$NEXT_ROW]], time_order = #[[$TIME_ORDER]], time_set = #[[$ROWS]]}
+// CHECK-NEXT:           {
+// CHECK-NEXT:             %[[RECEIVED1:.*]] = dataflow.receive %[[JOIN1]] : vector<64xf16>
+// CHECK-NEXT:             agen.yield %[[RECEIVED1]] : vector<64xf16>
+// CHECK-NEXT:           } : memref<64x64xf16>
 // CHECK-NEXT:           uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU2]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU0]] -> ()) {count = 0 : i32, group_id = 0 : i32, num_consumers = 3 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU0]] -> ()) {count = 0 : i32, group_id = 0 : i32, num_consumers = 3 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU3]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU0]] -> ()) {count = 0 : i32, group_id = 0 : i32, num_consumers = 3 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU0]] -> ()) {count = 0 : i32, group_id = 0 : i32, num_consumers = 3 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU4]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU1]] -> ()) {count = 0 : i32, group_id = 1 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU1]] -> ()) {count = 0 : i32, group_id = 1 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU5]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU1]] -> ()) {count = 0 : i32, group_id = 1 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU1]] -> ()) {count = 0 : i32, group_id = 1 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU6]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU1]] -> ()) {count = 0 : i32, group_id = 1 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU1]] -> ()) {count = 0 : i32, group_id = 1 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU7]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU1]] -> ()) {count = 0 : i32, group_id = 1 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU1]] -> ()) {count = 0 : i32, group_id = 1 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU8]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU2]] -> ()) {count = 0 : i32, group_id = 2 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU2]] -> ()) {count = 0 : i32, group_id = 2 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU9]]){
 // CHECK-NEXT:           %[[DST9:.*]] = dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]] {layout_map = #[[$LAYOUT]]} : index, index, memref<64x64xf16>
-// CHECK-NEXT:           scf.for %[[I9:.*]] = %[[C0]] to %[[C64]] step %[[C1]] {
-// CHECK-NEXT:             %[[JOIN9:.*]] = dataflow.create_multicast_group(%[[SU2]] -> ()) {count = 0 : i32, group_id = 2 : i32, num_consumers = 4 : i32} : index
-// CHECK-NEXT:             agen.composite_store %[[DST9]]{{\[}}%[[I9]], %[[C0]]]
-// CHECK-NEXT:              time_symbols()
-// CHECK-NEXT:              {store_order = #[[$ORDER]], store_set = #[[$STICK]], time_addr_map = #[[$NO_OFFSET]], time_order = #[[$TIME_ORDER]], time_set = #[[$ONE_STEP]]}
-// CHECK-NEXT:             {
-// CHECK-NEXT:               %[[RECEIVED9:.*]] = dataflow.receive %[[JOIN9]] : vector<64xf16>
-// CHECK-NEXT:               agen.yield %[[RECEIVED9]] : vector<64xf16>
-// CHECK-NEXT:             } : memref<64x64xf16>
-// CHECK-NEXT:           }
+// CHECK-NEXT:           %[[JOIN9:.*]] = dataflow.create_multicast_group(%[[SU2]] -> ()) {count = 0 : i32, group_id = 2 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           agen.composite_store %[[DST9]]{{\[}}%[[C0]], %[[C0]]]
+// CHECK-NEXT:            time_symbols()
+// CHECK-NEXT:            {store_order = #[[$ORDER]], store_set = #[[$STICK]], time_addr_map = #[[$NEXT_ROW]], time_order = #[[$TIME_ORDER]], time_set = #[[$ROWS]]}
+// CHECK-NEXT:           {
+// CHECK-NEXT:             %[[RECEIVED9:.*]] = dataflow.receive %[[JOIN9]] : vector<64xf16>
+// CHECK-NEXT:             agen.yield %[[RECEIVED9]] : vector<64xf16>
+// CHECK-NEXT:           } : memref<64x64xf16>
 // CHECK-NEXT:           uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU10]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU2]] -> ()) {count = 0 : i32, group_id = 2 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU2]] -> ()) {count = 0 : i32, group_id = 2 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU11]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU2]] -> ()) {count = 0 : i32, group_id = 2 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU2]] -> ()) {count = 0 : i32, group_id = 2 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU12]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU3]] -> ()) {count = 0 : i32, group_id = 3 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU3]] -> ()) {count = 0 : i32, group_id = 3 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU13]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU3]] -> ()) {count = 0 : i32, group_id = 3 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU3]] -> ()) {count = 0 : i32, group_id = 3 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU14]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU3]] -> ()) {count = 0 : i32, group_id = 3 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU3]] -> ()) {count = 0 : i32, group_id = 3 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU15]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU3]] -> ()) {count = 0 : i32, group_id = 3 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU3]] -> ()) {count = 0 : i32, group_id = 3 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU16]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU4]] -> ()) {count = 0 : i32, group_id = 4 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU4]] -> ()) {count = 0 : i32, group_id = 4 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU17]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU4]] -> ()) {count = 0 : i32, group_id = 4 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU4]] -> ()) {count = 0 : i32, group_id = 4 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU18]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU4]] -> ()) {count = 0 : i32, group_id = 4 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU4]] -> ()) {count = 0 : i32, group_id = 4 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU19]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU4]] -> ()) {count = 0 : i32, group_id = 4 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU4]] -> ()) {count = 0 : i32, group_id = 4 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU20]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU5]] -> ()) {count = 0 : i32, group_id = 5 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU5]] -> ()) {count = 0 : i32, group_id = 5 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU21]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU5]] -> ()) {count = 0 : i32, group_id = 5 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU5]] -> ()) {count = 0 : i32, group_id = 5 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU22]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU5]] -> ()) {count = 0 : i32, group_id = 5 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU5]] -> ()) {count = 0 : i32, group_id = 5 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU23]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU5]] -> ()) {count = 0 : i32, group_id = 5 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU5]] -> ()) {count = 0 : i32, group_id = 5 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU24]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU6]] -> ()) {count = 0 : i32, group_id = 6 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU6]] -> ()) {count = 0 : i32, group_id = 6 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU25]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU6]] -> ()) {count = 0 : i32, group_id = 6 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU6]] -> ()) {count = 0 : i32, group_id = 6 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU26]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU6]] -> ()) {count = 0 : i32, group_id = 6 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU6]] -> ()) {count = 0 : i32, group_id = 6 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU27]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU6]] -> ()) {count = 0 : i32, group_id = 6 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU6]] -> ()) {count = 0 : i32, group_id = 6 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU28]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU7]] -> ()) {count = 0 : i32, group_id = 7 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU7]] -> ()) {count = 0 : i32, group_id = 7 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU29]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU7]] -> ()) {count = 0 : i32, group_id = 7 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU7]] -> ()) {count = 0 : i32, group_id = 7 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU30]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU7]] -> ()) {count = 0 : i32, group_id = 7 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU7]] -> ()) {count = 0 : i32, group_id = 7 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:         (%{{.*}} -> %[[LU31]]){
 // CHECK-NEXT:           dataflow.get_logical_memory_view %[[LU_MEM]], %[[C128]]
-// CHECK-NEXT:           scf.for
-// CHECK-NEXT:             dataflow.create_multicast_group(%[[SU7]] -> ()) {count = 0 : i32, group_id = 7 : i32, num_consumers = 4 : i32} : index
+// CHECK-NEXT:           dataflow.create_multicast_group(%[[SU7]] -> ()) {count = 0 : i32, group_id = 7 : i32, num_consumers = 4 : i32} : index
 // CHECK:                uniform.yield
 // CHECK-NEXT:         }
 // CHECK-NEXT:       }
 // CHECK-NEXT:     }
 
-// The local copy on core 0: L1LU loads a stick from the view at offset 0 and
-// sends it to the SFU, which forwards it to L1SU, which stores it to the view
-// at offset 128.
+// The local copy on core 0, in a loop over the 64 sticks: L1LU loads a stick
+// from the view at offset 0 and sends it to the SFU, which forwards it to
+// L1SU, which stores it to the view at offset 128.
 // CHECK-NEXT:     dataflow.program_unit iter_arg : %[[PU_L1LU:.*]] -> (%[[L1LU0]]) : {
 // CHECK-NEXT:       %[[L1LU_MEM_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[L1LU0]] -> %[[MEM0]]]):index
 // CHECK-NEXT:       %[[L1LU_MEM:.*]] = uniform.query_map(map:%[[L1LU_MEM_MAP]], key:%[[PU_L1LU]]) : index
 // CHECK-NEXT:       %[[LOCAL_SRC:.*]] = dataflow.get_logical_memory_view %[[L1LU_MEM]], %[[C0]] {layout_map = #[[$LAYOUT]]} : index, index, memref<64x64xf16>
 // CHECK-NEXT:       scf.for %[[ROW0:.*]] = %[[C0]] to %[[C64]] step %[[C1]] {
-// CHECK-NEXT:         %[[LOADED:.*]] = agen.vector_load %[[LOCAL_SRC]]{{\[}}%[[ROW0]], %[[C0]]] {load_order = #[[$ORDER]], load_set = #[[$STICK]]} : memref<64x64xf16>, vector<64xf16>
+// CHECK-NEXT:         %[[LOADED:.*]] = agen.vector_load %[[LOCAL_SRC]]{{\[}}%[[C0]] + %[[ROW0]], %[[C0]]] {load_order = #[[$ORDER]], load_set = #[[$STICK]]} : memref<64x64xf16>, vector<64xf16>
 // CHECK-NEXT:         %[[TO_SFU_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[L1LU0]] -> %[[SFU0]]]):index
 // CHECK-NEXT:         %[[TO_SFU:.*]] = uniform.query_map(map:%[[TO_SFU_MAP]], key:%[[PU_L1LU]]) : index
 // CHECK-NEXT:         dataflow.send %[[TO_SFU]], %[[LOADED]] : vector<64xf16>
@@ -447,7 +409,7 @@
 // CHECK-NEXT:         %[[FROM_SFU_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[L1SU0]] -> %[[SFU0]]]):index
 // CHECK-NEXT:         %[[FROM_SFU:.*]] = uniform.query_map(map:%[[FROM_SFU_MAP]], key:%[[PU_L1SU]]) : index
 // CHECK-NEXT:         %[[STORED:.*]] = dataflow.receive %[[FROM_SFU]] : vector<64xf16>
-// CHECK-NEXT:         agen.vector_store %[[STORED]], %[[LOCAL_DST]]{{\[}}%[[ROW2]], %[[C0]]] {store_order = #[[$ORDER]], store_set = #[[$STICK]]} : memref<64x64xf16>, vector<64xf16>
+// CHECK-NEXT:         agen.vector_store %[[STORED]], %[[LOCAL_DST]]{{\[}}%[[C0]] + %[[ROW2]], %[[C0]]] {store_order = #[[$ORDER]], store_set = #[[$STICK]]} : memref<64x64xf16>, vector<64xf16>
 // CHECK-NEXT:       }
 // CHECK-NEXT:     }
 // CHECK-NEXT:     return
@@ -589,37 +551,38 @@
 // LOWERING-NEXT:     %[[SRC_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[SRC_KEY1]] -> %[[SU0]]], {{\[}}%[[SRC_KEY2]] -> %[[SU0]]], {{\[}}%[[SRC_KEY3]] -> %[[SU0]]], {{\[}}%[[SRC_KEY4]] -> %[[SU1]]], {{\[}}%[[SRC_KEY5]] -> %[[SU1]]], {{\[}}%[[SRC_KEY6]] -> %[[SU1]]], {{\[}}%[[SRC_KEY7]] -> %[[SU1]]], {{\[}}%[[SRC_KEY8]] -> %[[SU2]]], {{\[}}%[[SRC_KEY9]] -> %[[SU2]]], {{\[}}%[[SRC_KEY10]] -> %[[SU2]]], {{\[}}%[[SRC_KEY11]] -> %[[SU2]]], {{\[}}%[[SRC_KEY12]] -> %[[SU3]]], {{\[}}%[[SRC_KEY13]] -> %[[SU3]]], {{\[}}%[[SRC_KEY14]] -> %[[SU3]]], {{\[}}%[[SRC_KEY15]] -> %[[SU3]]], {{\[}}%[[SRC_KEY16]] -> %[[SU4]]], {{\[}}%[[SRC_KEY17]] -> %[[SU4]]], {{\[}}%[[SRC_KEY18]] -> %[[SU4]]], {{\[}}%[[SRC_KEY19]] -> %[[SU4]]], {{\[}}%[[SRC_KEY20]] -> %[[SU5]]], {{\[}}%[[SRC_KEY21]] -> %[[SU5]]], {{\[}}%[[SRC_KEY22]] -> %[[SU5]]], {{\[}}%[[SRC_KEY23]] -> %[[SU5]]], {{\[}}%[[SRC_KEY24]] -> %[[SU6]]], {{\[}}%[[SRC_KEY25]] -> %[[SU6]]], {{\[}}%[[SRC_KEY26]] -> %[[SU6]]], {{\[}}%[[SRC_KEY27]] -> %[[SU6]]], {{\[}}%[[SRC_KEY28]] -> %[[SU7]]], {{\[}}%[[SRC_KEY29]] -> %[[SU7]]], {{\[}}%[[SRC_KEY30]] -> %[[SU7]]], {{\[}}%[[SRC_KEY31]] -> %[[SU7]]]):index
 // LOWERING-NEXT:     %[[SRC_SU:.*]] = uniform.query_map(map:%[[SRC_MAP]], key:%[[TILE]]) : index
 // LOWERING-NEXT:     %[[C0:.*]] = arith.constant 0 : index
-// LOWERING-NEXT:     %[[C1:.*]] = arith.constant 1 : index
-// LOWERING-NEXT:     %[[C64:.*]] = arith.constant 64 : index
 // LOWERING-NEXT:     %[[C128:.*]] = arith.constant 128 : index
 // LOWERING-NEXT:     %[[SRC_VIEW:.*]] = ktdp.construct_memory_view %[[C0]], sizes: [64, 64], strides: [64, 1] {coordinate_set = #[[$SET]], memory_space = #ktdp.memory_space<ct_local>} : memref<64x64xf16, #ktdp.memory_space<ct_local>>
 // LOWERING-NEXT:     %[[SRC:.*]] = memref.memory_space_cast %[[SRC_VIEW]] : memref<64x64xf16, #ktdp.memory_space<ct_local>> to memref<64x64xf16, "L1">
 // LOWERING-NEXT:     %[[DST_VIEW:.*]] = ktdp.construct_memory_view %[[C128]], sizes: [64, 64], strides: [64, 1] {coordinate_set = #[[$SET]], memory_space = #ktdp.memory_space<ct_local>} : memref<64x64xf16, #ktdp.memory_space<ct_local>>
 // LOWERING-NEXT:     %[[DST:.*]] = memref.memory_space_cast %[[DST_VIEW]] : memref<64x64xf16, #ktdp.memory_space<ct_local>> to memref<64x64xf16, "L1">
-// LOWERING-NEXT:     scf.for %[[I:.*]] = %[[C0]] to %[[C64]] step %[[C1]] {
-// LOWERING-NEXT:       ktdf_lowering.execute_on %[[SU]], %[[LU]], %[[L1LU]], %[[SFU]], %[[L1SU]] {
+// LOWERING-NEXT:     ktdf_lowering.execute_on %[[SU]], %[[LU]], %[[L1LU]], %[[SFU]], %[[L1SU]] {
+// LOWERING-NEXT:       ktdf_lowering.execute_on %[[SU]], %[[LU]] {
 // LOWERING-NEXT:         ktdf_lowering.execute_on %[[SU]], %[[LU]] {
-// LOWERING-NEXT:           ktdf_lowering.execute_on %[[SU]], %[[LU]] {
-// LOWERING-NEXT:             %[[CH:.*]] = ktdf.fifo.allocate() {dataflow_scheduler.groups = #[[$GROUP_DOMAIN]]} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
-// LOWERING-NEXT:             %[[TOKEN:.*]] = ktdf.create_token : !ktdf.token
-// LOWERING-NEXT:             ktdf_lowering.execute_on %[[SU]] {
-// LOWERING-NEXT:               %[[TO_GROUP:.*]] = ktdf_lowering.multicast_group %[[CH]] producer(%[[SU]]) {directions = [#dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>], group_ids = array<i32: 0, 1, 2, 3, 4, 5, 6, 7>, num_consumers = array<i32: 3, 4, 4, 4, 4, 4, 4, 4>, producers = array<i64: 0, 1, 2, 3, 4, 5, 6, 7>} : <"MNISU" -> "MNILU", 64xf16>
-// LOWERING-NEXT:               ktdf.data_transfer from %[[SRC]]{{\[}}%[[I]], %[[C0]]] size [1, 64] to %[[TO_GROUP]] size [64] : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
-// LOWERING-NEXT:             }
-// LOWERING-NEXT:             ktdf_lowering.execute_on %[[LU]] {
-// LOWERING-NEXT:               %[[FROM_GROUP:.*]] = ktdf_lowering.multicast_group %[[CH]] producer(%[[SRC_SU]]) {directions = [#dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>], group_ids = array<i32: 0, 1, 2, 3, 4, 5, 6, 7>, num_consumers = array<i32: 3, 4, 4, 4, 4, 4, 4, 4>, producers = array<i64: 0, 1, 2, 3, 4, 5, 6, 7>} : <"MNISU" -> "MNILU", 64xf16>
-// LOWERING-NEXT:               ktdf.data_transfer from %[[FROM_GROUP]] size [64] to %[[DST]]{{\[}}%[[I]], %[[C0]]] size [1, 64] : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<64x64xf16, "L1">
-// LOWERING-NEXT:             }
+// LOWERING-NEXT:           %[[CH:.*]] = ktdf.fifo.allocate() {dataflow_scheduler.groups = #[[$GROUP_DOMAIN]]} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+// LOWERING-NEXT:           %[[TOKEN:.*]] = ktdf.create_token : !ktdf.token
+// LOWERING-NEXT:           ktdf_lowering.execute_on %[[SU]] {
+// LOWERING-NEXT:             %[[TO_GROUP:.*]] = ktdf_lowering.multicast_group %[[CH]] producer(%[[SU]]) {directions = [#dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>], group_ids = array<i32: 0, 1, 2, 3, 4, 5, 6, 7>, num_consumers = array<i32: 3, 4, 4, 4, 4, 4, 4, 4>, producers = array<i64: 0, 1, 2, 3, 4, 5, 6, 7>} : <"MNISU" -> "MNILU", 64xf16>
+// LOWERING-NEXT:             ktdf.data_transfer from %[[SRC]]{{\[}}%[[C0]], %[[C0]]] size [64, 64] to %[[TO_GROUP]] size [64, 64] {dataflow_scheduler.throttle = 64 : i64} : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+// LOWERING-NEXT:           }
+// LOWERING-NEXT:           ktdf_lowering.execute_on %[[LU]] {
+// LOWERING-NEXT:             %[[FROM_GROUP:.*]] = ktdf_lowering.multicast_group %[[CH]] producer(%[[SRC_SU]]) {directions = [#dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>], group_ids = array<i32: 0, 1, 2, 3, 4, 5, 6, 7>, num_consumers = array<i32: 3, 4, 4, 4, 4, 4, 4, 4>, producers = array<i64: 0, 1, 2, 3, 4, 5, 6, 7>} : <"MNISU" -> "MNILU", 64xf16>
+// LOWERING-NEXT:             ktdf.data_transfer from %[[FROM_GROUP]] size [64, 64] to %[[DST]]{{\[}}%[[C0]], %[[C0]]] size [64, 64] {dataflow_scheduler.throttle = 64 : i64} : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<64x64xf16, "L1">
 // LOWERING-NEXT:           }
 // LOWERING-NEXT:         }
-// LOWERING-NEXT:         ktdf_lowering.execute_on %[[L1LU]], %[[SFU]], %[[L1SU]] {
+// LOWERING-NEXT:       }
+// LOWERING-NEXT:       ktdf_lowering.execute_on %[[L1LU]], %[[SFU]], %[[L1SU]] {
+// LOWERING-NEXT:         %[[ROW_LB:.*]] = arith.constant 0 : index
+// LOWERING-NEXT:         %[[ROW_STEP:.*]] = arith.constant 1 : index
+// LOWERING-NEXT:         %[[ROW_UB:.*]] = arith.constant 64 : index
+// LOWERING-NEXT:         scf.for %[[ROW:.*]] = %[[ROW_LB]] to %[[ROW_UB]] step %[[ROW_STEP]] {
 // LOWERING-NEXT:           ktdf_lowering.execute_on %[[L1LU]], %[[SFU]], %[[L1SU]] {
 // LOWERING-NEXT:             %[[TO_SFU:.*]] = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
 // LOWERING-NEXT:             %[[FROM_SFU:.*]] = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>
 // LOWERING-NEXT:             %[[LOADED:.*]] = ktdf.create_token : !ktdf.token
 // LOWERING-NEXT:             %[[COMPUTED:.*]] = ktdf.create_token : !ktdf.token
 // LOWERING-NEXT:             ktdf_lowering.execute_on %[[L1LU]] {
-// LOWERING-NEXT:               ktdf.data_transfer from %[[SRC]]{{\[}}%[[I]], %[[C0]]] size [1, 64] to %[[TO_SFU]] size [64] : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+// LOWERING-NEXT:               ktdf.data_transfer from %[[SRC]]{{\[}}%[[C0]] + %[[ROW]], %[[C0]]] size [1, 64] to %[[TO_SFU]] size [1, 64] {dataflow_scheduler.throttle = 64 : i64} : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
 // LOWERING-NEXT:             }
 // LOWERING-NEXT:             ktdf_lowering.execute_on %[[SFU]] {
 // LOWERING-NEXT:               %[[IN:.*]] = ktdf.read_from_fifo %[[TO_SFU]] : <"L1LU" -> "SFU", 64xf16> -> tensor<64xf16>
@@ -631,7 +594,7 @@
 // LOWERING-NEXT:               ktdf.write_to_fifo %[[OUT]], %[[FROM_SFU]] : tensor<64xf16>, <"SFU" -> "L1SU", 64xf16>
 // LOWERING-NEXT:             }
 // LOWERING-NEXT:             ktdf_lowering.execute_on %[[L1SU]] {
-// LOWERING-NEXT:               ktdf.data_transfer from %[[FROM_SFU]] size [64] to %[[DST]]{{\[}}%[[I]], %[[C0]]] size [1, 64] : !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, memref<64x64xf16, "L1">
+// LOWERING-NEXT:               ktdf.data_transfer from %[[FROM_SFU]] size [1, 64] to %[[DST]]{{\[}}%[[C0]] + %[[ROW]], %[[C0]]] size [1, 64] {dataflow_scheduler.throttle = 64 : i64} : !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, memref<64x64xf16, "L1">
 // LOWERING-NEXT:             }
 // LOWERING-NEXT:           }
 // LOWERING-NEXT:         }
@@ -648,29 +611,25 @@ module {
   ktdf_arch.device @ring32_device import("../../../../Dialect/KTDFArch/ring32_device.mlir")
   func.func @ring_broadcast() attributes {grid = [32]} {
     %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %c64 = arith.constant 64 : index
     %c128 = arith.constant 128 : index
     %0 = ktdp.construct_memory_view %c0, sizes: [64, 64], strides: [64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<ct_local>} : memref<64x64xf16, #ktdp.memory_space<ct_local>>
     %src = memref.memory_space_cast %0 : memref<64x64xf16, #ktdp.memory_space<ct_local>> to memref<64x64xf16, "L1">
     %1 = ktdp.construct_memory_view %c128, sizes: [64, 64], strides: [64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<ct_local>} : memref<64x64xf16, #ktdp.memory_space<ct_local>>
     %dst = memref.memory_space_cast %1 : memref<64x64xf16, #ktdp.memory_space<ct_local>> to memref<64x64xf16, "L1">
-    scf.for %i = %c0 to %c64 step %c1 {
-      ktdf.pipeline {
-        %p:3 = ktdf.private -> (!ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token, !ktdf.token) {
-          %ch = ktdf.fifo.allocate() {dataflow_scheduler.groups = #groups} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
-          %t0 = ktdf.create_token : !ktdf.token
-          %t1 = ktdf.create_token : !ktdf.token
-          ktdf.private_yield %ch, %t0, %t1 : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token, !ktdf.token
-        }
-        ktdf.stage depends_in(none) depends_out(%p#1) {
-          ktdf.data_transfer from %src[%i, %c0] size [1, 64] to %p#0 size [64] : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
-        } {dataflow_scheduler.domain = #producers}
-        ktdf.stage depends_in(%p#1) depends_out(%p#2) {
-          ktdf.data_transfer from %p#0 size [64] to %dst[%i, %c0] size [1, 64] : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<64x64xf16, "L1">
-        } {dataflow_scheduler.domain = #consumers}
+    ktdf.pipeline {
+      %p:3 = ktdf.private -> (!ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token, !ktdf.token) {
+        %ch = ktdf.fifo.allocate() {dataflow_scheduler.groups = #groups} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+        %t0 = ktdf.create_token : !ktdf.token
+        %t1 = ktdf.create_token : !ktdf.token
+        ktdf.private_yield %ch, %t0, %t1 : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, !ktdf.token, !ktdf.token
       }
-    } {loop_type = #ktdf.loop_type<parallel_loop>}
+      ktdf.stage depends_in(none) depends_out(%p#1) {
+        ktdf.data_transfer from %src[%c0, %c0] size [64, 64] to %p#0 size [64, 64] {dataflow_scheduler.throttle = 64 : i64} : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+      } {dataflow_scheduler.domain = #producers}
+      ktdf.stage depends_in(%p#1) depends_out(%p#2) {
+        ktdf.data_transfer from %p#0 size [64, 64] to %dst[%c0, %c0] size [64, 64] {dataflow_scheduler.throttle = 64 : i64} : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<64x64xf16, "L1">
+      } {dataflow_scheduler.domain = #consumers}
+    }
     return
   }
 }

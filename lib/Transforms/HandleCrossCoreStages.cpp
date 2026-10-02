@@ -24,8 +24,14 @@
 // carries the rest, the self-deliveries, by a local copy on the tiles that
 // deliver to themselves, which runs concurrently with the channel.
 //
+// The corelet path of the local copy moves one vector per transfer, so a
+// channel that moves several messages of its throttle is copied in loop form:
+// a loop nest over the messages, one per iteration.
+//
 //===----------------------------------------------------------------------===//
 
+#include <functional>
+#include <numeric>
 #include <optional>
 #include <tuple>
 
@@ -33,8 +39,10 @@
 #include <llvm/ADT/SetVector.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/DebugLog.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Linalg/IR/Linalg.h>
+#include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
@@ -44,6 +52,7 @@
 
 #include "dataflow-scheduler/Analysis/ArchViews/RoutingGraph.h"
 #include "dataflow-scheduler/Analysis/CrossCoreChannels.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/ApplicableUnits.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
@@ -70,6 +79,16 @@ struct LocalRoute {
   ResourceType store;
 };
 
+/// The messages of a cross-core channel, in which its local copy moves it.
+struct Messages {
+  /// The number of elements of a message, the throttle of the channel.
+  int64_t size;
+  /// The walks in messages of the memory the producer reads and of the memory
+  /// the consumer writes, of the same extents.
+  TransferTimeDims source;
+  TransferTimeDims target;
+};
+
 /// The self-deliveries of a cross-core channel, and how they are copied.
 struct SelfDelivery {
   /// The transfer into the channel, on the producer stage.
@@ -80,12 +99,73 @@ struct SelfDelivery {
   IntegerSetAttr domain;
   /// The route of the local copy.
   LocalRoute route;
+  /// The messages of the channel, if there are several.
+  std::optional<Messages> messages;
 };
 
 /// Gets the memory @p value is in, or nullptr if it is not a memref in one.
 auto getMemory(Value value) -> ResourceType {
   auto type = dyn_cast<MemRefType>(value.getType());
   return type ? dyn_cast_or_null<ResourceType>(type.getMemorySpace()) : nullptr;
+}
+
+/// Gets the throttle of @p transfer, if it has one.
+auto getThrottle(ktdf::DataTransferOp transfer) -> std::optional<int64_t> {
+  if (auto attr = transfer->getAttrOfType<IntegerAttr>(kThrottleAttrName)) {
+    return attr.getInt();
+  }
+  return std::nullopt;
+}
+
+/// Finds the messages of the channel that @p write writes and @p read reads,
+/// if it moves more than one. A failure to split the channel into messages is
+/// reported on @p write.
+auto planMessages(ktdf::DataTransferOp write, ktdf::DataTransferOp read)
+    -> FailureOr<std::optional<Messages>> {
+  const auto throttle = getThrottle(write);
+  if (throttle != getThrottle(read)) {
+    return write.emitError()
+           << "the transfers into and out of a cross-core fifo with "
+              "self-deliveries must have the same throttle";
+  }
+  if (!throttle) {
+    return std::optional<Messages>();
+  }
+  if (!write.hasAllStaticSourceSizes() || !read.hasAllStaticDestSizes()) {
+    return write.emitError() << "self-deliveries of a cross-core fifo whose "
+                                "transfers have dynamic sizes are not "
+                                "supported yet";
+  }
+  const ArrayRef<int64_t> source = *write.getStaticSourceSizes();
+  const ArrayRef<int64_t> target = *read.getStaticDestSizes();
+  const auto getNumElements = [](ArrayRef<int64_t> sizes) {
+    return std::accumulate(sizes.begin(), sizes.end(), int64_t{1},
+                           std::multiplies<>());
+  };
+  if (getNumElements(source) <= *throttle &&
+      getNumElements(target) <= *throttle) {
+    return std::optional<Messages>();
+  }
+  if (source.empty() || target.empty() || source.back() % *throttle != 0 ||
+      target.back() % *throttle != 0) {
+    return write.emitError()
+           << "the local copy of a cross-core fifo moves it in messages of "
+              "its throttle of "
+           << *throttle
+           << ", which requires the innermost sizes of the memories it "
+              "copies between to be multiples of the throttle";
+  }
+  Messages messages{*throttle, describeTransferTimeDims(source, *throttle),
+                    describeTransferTimeDims(target, *throttle)};
+  if (messages.source.extents != messages.target.extents) {
+    return write.emitError()
+           << "the local copy of a cross-core fifo moves it in messages of "
+              "its throttle of "
+           << *throttle
+           << ", which requires the memories it copies between to be walked "
+              "in the same messages";
+  }
+  return std::optional<Messages>(std::move(messages));
 }
 
 /// Finds the route of a local copy from the memory @p source to the memory
@@ -248,19 +328,74 @@ auto planSelfDeliveries(ktdf::PipelineOp pipeline, int grid_size,
     if (failed(route)) {
       return failure();
     }
+    auto messages = planMessages(write, read);
+    if (failed(messages)) {
+      return failure();
+    }
     LDBG(1) << "Self-deliveries on " << IntegerSetAttr::get(*domain)
             << " of the cross-core fifo " << groups;
-    deliveries.push_back({write, read, IntegerSetAttr::get(*domain), *route});
+    deliveries.push_back(
+        {write, read, IntegerSetAttr::get(*domain), *route, *messages});
   }
   return success();
 }
 
+/// Narrows @p transfer, a copy of a channel transfer between memory and a fifo,
+/// to the message at @p ivs of @p walk, the walk of its memory in messages of
+/// @p size elements.
+void narrowToMessage(ktdf::DataTransferOp transfer,
+                     const TransferTimeDims& walk, ValueRange ivs,
+                     int64_t size) {
+  MLIRContext* context = transfer.getContext();
+  const auto getMessageSizes = [&](ArrayRef<int64_t> sizes) {
+    SmallVector<int64_t> message(sizes.size(), 1);
+    message.back() = size;
+    return message;
+  };
+  const auto getMessageMap = [&](AffineMap map) {
+    for (const TransferTimeStep& step : walk.steps) {
+      map = foldStepIntoSubscripts(context, map, step);
+    }
+    return map;
+  };
+  if (transfer.isDestFifo()) {
+    transfer.setSourceMap(getMessageMap(*transfer.getSourceMap()));
+    transfer.getSourceIndicesMutable().append(ivs);
+  } else {
+    transfer.setDestMap(getMessageMap(*transfer.getDestMap()));
+    transfer.getDestIndicesMutable().append(ivs);
+  }
+  if (auto sizes = transfer.getStaticSourceSizes()) {
+    transfer.setStaticSourceSizes(getMessageSizes(*sizes));
+  }
+  if (auto sizes = transfer.getStaticDestSizes()) {
+    transfer.setStaticDestSizes(getMessageSizes(*sizes));
+  }
+}
+
 /// Builds the local copy of @p delivery: a pipeline that loads the producer's
 /// data, passes it through an identity on the compute unit and stores it
-/// where the consumer stores it, on the self-delivering tiles.
+/// where the consumer stores it, on the self-delivering tiles. A channel of
+/// several messages is copied by a loop nest around the pipeline, one message
+/// per iteration.
 auto buildLocalCopy(OpBuilder& builder, Location loc, SelfDelivery delivery)
     -> ktdf::PipelineOp {
   MLIRContext* context = builder.getContext();
+  OpBuilder::InsertionGuard guard(builder);
+  SmallVector<Value> ivs;
+  if (delivery.messages) {
+    const Value lower = arith::ConstantIndexOp::create(builder, loc, 0);
+    const Value step = arith::ConstantIndexOp::create(builder, loc, 1);
+    for (const int64_t extent : delivery.messages->source.extents) {
+      const Value upper = arith::ConstantIndexOp::create(builder, loc, extent);
+      auto loop = scf::ForOp::create(builder, loc, lower, upper, step);
+      loop->setAttr("loop_type", ktdf::LoopTypeAttr::get(
+                                     context, ktdf::LoopType::ParallelLoop));
+      builder.setInsertionPointToStart(loop.getBody());
+      ivs.push_back(loop.getInductionVar());
+    }
+  }
+
   const Value channel = delivery.write.getDestination();
   const auto channel_type = cast<ktdf::FifoSlotType>(channel.getType());
   const LocalRoute& route = delivery.route;
@@ -274,7 +409,6 @@ auto buildLocalCopy(OpBuilder& builder, Location loc, SelfDelivery delivery)
   const auto token = ktdf::TokenType::get(context);
 
   auto pipeline = ktdf::PipelineOp::create(builder, loc);
-  OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToStart(pipeline.getBody());
   auto private_op = ktdf::PrivateOp::create(
       builder, loc, TypeRange{to_compute, from_compute, token, token},
@@ -303,11 +437,23 @@ auto buildLocalCopy(OpBuilder& builder, Location loc, SelfDelivery delivery)
     stage.setApplicableUnitsAttr(builder.getArrayAttr({unit}));
     stage->setAttr(kStageDomainAttrName, delivery.domain);
   };
+  // A channel transfer with a fifo of the local copy in place of the channel,
+  // narrowed to one message if the channel has several.
+  const auto cloneTransfer = [&](OpBuilder& builder,
+                                 ktdf::DataTransferOp transfer, Value fifo) {
+    IRMapping mapping;
+    mapping.map(channel, fifo);
+    auto clone = cast<ktdf::DataTransferOp>(builder.clone(*transfer, mapping));
+    if (const auto& messages = delivery.messages) {
+      narrowToMessage(
+          clone,
+          transfer == delivery.write ? messages->source : messages->target, ivs,
+          messages->size);
+    }
+  };
   // The producer's transfer, into the compute unit instead of the channel.
   createStage({}, loaded, route.load, [&](OpBuilder& builder, Location) {
-    IRMapping mapping;
-    mapping.map(channel, into_compute);
-    builder.clone(*delivery.write, mapping);
+    cloneTransfer(builder, delivery.write, into_compute);
   });
   createStage(
       loaded, computed, route.compute, [&](OpBuilder& builder, Location loc) {
@@ -330,9 +476,7 @@ auto buildLocalCopy(OpBuilder& builder, Location loc, SelfDelivery delivery)
       });
   // The consumer's transfer, out of the compute unit instead of the channel.
   createStage(computed, {}, route.store, [&](OpBuilder& builder, Location) {
-    IRMapping mapping;
-    mapping.map(channel, out_of_compute);
-    builder.clone(*delivery.read, mapping);
+    cloneTransfer(builder, delivery.read, out_of_compute);
   });
   return pipeline;
 }
@@ -401,7 +545,7 @@ struct HandleCrossCoreStagesPass
 
     for (ktdf::PipelineOp channel : channels) {
       int grid_size = 0;
-      SmallVector<SelfDelivery> deliveries;
+      SmallVector<SelfDelivery, 1> deliveries;
       if (failed(extractGridSize(channel->getParentOfType<func::FuncOp>(),
                                  grid_size)) ||
           failed(planSelfDeliveries(channel, grid_size, graph, deliveries))) {

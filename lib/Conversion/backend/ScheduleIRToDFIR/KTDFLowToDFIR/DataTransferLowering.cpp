@@ -31,6 +31,7 @@
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchAttributes.h"
 #include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLowering.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
+#include "dataflow-scheduler/Transforms/Utils/Utils.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Analysis/Presburger/IntegerRelation.h"
 #include "mlir/Analysis/Presburger/PresburgerSpace.h"
@@ -85,78 +86,6 @@ mlir::Value insertSplatShuffle(mlir::PatternRewriter& rewriter,
              /*dbgName=*/nullptr, indices_attr,
              rewriter.getI32IntegerAttr(repetition))
       .getOutput();
-}
-
-/// One time dimension of one side of a transfer: which memref dimension it
-/// advances, and by how many indices of that dimension per step.
-struct TransferTimeStep {
-  unsigned memref_dim;
-  int64_t index_step;
-};
-
-/// How one side of a transfer traverses the AGEN time axis: the extent of each
-/// time dimension, slowest-varying first, and what each dimension advances.
-/// `extents` becomes `time_set`; `offsets()` becomes the results of that
-/// side's `*_time_addr_map`.
-struct TransferTimeDims {
-  llvm::SmallVector<int64_t> extents;
-  llvm::SmallVector<TransferTimeStep> steps;  // parallel to `extents`
-  size_t rank = 0;
-
-  /// A traversal of a memref of `rank` dimensions that walks nothing.
-  explicit TransferTimeDims(size_t rank) : rank(rank) {}
-
-  /// The offset added to each memref index at time step (d0, ..., dn-1); zero
-  /// at every index a time dimension does not advance. Time dimensions are
-  /// numbered in the order they were added, which is also why an identity
-  /// `time_order` is correct: d0 is the slowest-varying.
-  llvm::SmallVector<mlir::AffineExpr> offsets(
-      mlir::MLIRContext* context) const {
-    llvm::SmallVector<mlir::AffineExpr> result(
-        rank, mlir::getAffineConstantExpr(0, context));
-    for (auto [time_dim, step] : llvm::enumerate(steps)) {
-      result[step.memref_dim] =
-          mlir::getAffineConstantExpr(step.index_step, context) *
-          mlir::getAffineDimExpr(time_dim, context);
-    }
-    return result;
-  }
-
-  /// Drop time dimension `time_dim`. The remaining dimensions keep their
-  /// relative order and are renumbered by `offsets()`.
-  void eraseDim(unsigned time_dim) {
-    extents.erase(extents.begin() + time_dim);
-    steps.erase(steps.begin() + time_dim);
-  }
-};
-
-/// Describe how `sizes` is traversed over time. Every non-unit dimension
-/// except the innermost contributes a time dimension stepping by one; the
-/// innermost contributes one stepping by a whole vector, and only when it
-/// holds more than one. With a 64-lane vector:
-///
-///   sizes           extents      offsets           time_set
-///   [1, 256, 64]    [256]        (0, d0, 0)        (d0) : 0 <= d0 <= 255
-///   [1, 1, 128]     [2]          (0, 0, 64 * d0)   (d0) : 0 <= d0 <= 1
-///   [2, 4, 8, 64]   [2, 4, 8]    (d0, d1, d2, 0)   3 dims of those extents
-///   [1, 64]         []           (0, 0)            nothing walked
-///
-/// The last row is a transfer that fits in one vector: the offsets are already
-/// the all-zero map, and the caller supplies the single pinned time step.
-TransferTimeDims describeTransferTimeDims(llvm::ArrayRef<int64_t> sizes,
-                                          int64_t lanes) {
-  TransferTimeDims dims(sizes.size());
-  auto addDim = [&](unsigned pos, int64_t extent, int64_t index_step) {
-    dims.steps.push_back({pos, index_step});
-    dims.extents.push_back(extent);
-  };
-  for (unsigned i = 0; i + 1 < sizes.size(); ++i) {
-    if (sizes[i] != 1) addDim(i, sizes[i], /*index_step=*/1);
-  }
-  if (const int64_t vectors = sizes.back() / lanes; vectors > 1) {
-    addDim(sizes.size() - 1, vectors, /*index_step=*/lanes);
-  }
-  return dims;
 }
 
 /// The coefficient of each dimension of `map`, which must have one result, or
@@ -241,35 +170,52 @@ mlir::FailureOr<llvm::SmallVector<int64_t>> getElementStrides(
   return strides;
 }
 
-/// Extend `map` with one trailing dimension that advances `step.memref_dim` by
-/// `step.index_step` indices per unit. Appending a loop induction variable to
-/// the subscript operands then drives that dimension from the loop instead of
-/// from the time axis.
-mlir::AffineMap foldStepIntoSubscripts(mlir::MLIRContext* context,
-                                       mlir::AffineMap map,
-                                       TransferTimeStep step) {
-  llvm::SmallVector<mlir::AffineExpr> results(map.getResults());
-  results[step.memref_dim] =
-      results[step.memref_dim] +
-      mlir::getAffineConstantExpr(step.index_step, context) *
-          mlir::getAffineDimExpr(map.getNumDims(), context);
-  return mlir::AffineMap::get(map.getNumDims() + 1, map.getNumSymbols(),
-                              results, context);
-}
-
-/// The time dimension of a composite transfer of one vector: a single pinned
-/// time step, at offset zero in each of the `rank` memref dimensions.
-struct SingleTimeStep {
+/// The memory side of a transfer into or out of a multicast group, in
+/// messages of the transfer's throttle: the sizes and the vector of one
+/// message, and the time dimensions that walk the messages, one per time step,
+/// as for a transfer between memories. A transfer without a throttle, or of at
+/// most one message, is one message in a single pinned time step.
+struct Messages {
+  llvm::SmallVector<int64_t> sizes;
+  mlir::VectorType type;
   mlir::IntegerSet time_set;
   mlir::AffineMap time_order;
   mlir::AffineMap time_addr_map;
-
-  SingleTimeStep(mlir::MLIRContext* context, unsigned rank)
-      : time_set(scheduler::buildIntegerSetFromSizes(context, {1})),
-        time_order(mlir::AffineMap::getMultiDimIdentityMap(1, context)),
-        time_addr_map(mlir::AffineMap::get(
-            1, 0, TransferTimeDims(rank).offsets(context), context)) {}
 };
+
+/// Split the memory side of `op`, of `sizes`, whose elements `vector_type`
+/// holds, into the messages of its throttle.
+mlir::FailureOr<Messages> splitIntoMessages(mlir::ktdf::DataTransferOp op,
+                                            llvm::ArrayRef<int64_t> sizes,
+                                            mlir::VectorType vector_type) {
+  auto* context = op.getContext();
+  Messages messages{llvm::to_vector(sizes), vector_type, {}, {}, {}};
+  TransferTimeDims walk(sizes.size());
+  const int64_t total = vector_type.getNumElements();
+  if (const auto throttle = getThrottle(op); throttle && total > *throttle) {
+    if (sizes.empty() || sizes.back() % *throttle != 0) {
+      return op.emitError()
+             << "data transfer of " << total << " elements exceeds the "
+             << "throttle of " << *throttle
+             << "; splitting requires the innermost memory size to be a "
+                "multiple of the throttle";
+    }
+    walk = describeTransferTimeDims(sizes, *throttle);
+    messages.sizes.assign(sizes.size(), 1);
+    messages.sizes.back() = *throttle;
+    messages.type =
+        mlir::VectorType::get({*throttle}, vector_type.getElementType());
+  }
+
+  llvm::SmallVector<int64_t> extents = walk.extents;
+  if (extents.empty()) extents.push_back(1);
+  messages.time_set = scheduler::buildIntegerSetFromSizes(context, extents);
+  messages.time_order =
+      mlir::AffineMap::getMultiDimIdentityMap(extents.size(), context);
+  messages.time_addr_map =
+      mlir::AffineMap::get(extents.size(), 0, walk.offsets(context), context);
+  return messages;
+}
 
 /// A multicast group in DFIR: the group a unit sends to or receives from, and
 /// the direction around the ring its producer sends in.
@@ -1109,8 +1055,7 @@ struct LowerDataTransferPattern
   }
 
   /// Lower as agen.composite_load whose body sends the loaded vector to the
-  /// multicast group `group_op` (L1 onto the ring). Like a transfer into a
-  /// same-core fifo, it moves one vector, in a single time step.
+  /// multicast group `group_op` (L1 onto the ring), one message per time step.
   mlir::LogicalResult lowerAsLoadAndMulticast(
       mlir::PatternRewriter& rewriter,
       mlir::ktdf::DataTransferOp data_transfer_op, mlir::Value src_memref,
@@ -1119,19 +1064,23 @@ struct LowerDataTransferPattern
       mlir::ktdf_lowering::MulticastGroupOp group_op) const {
     auto* context = rewriter.getContext();
     const auto loc = data_transfer_op.getLoc();
+    auto messages =
+        splitIntoMessages(data_transfer_op, src_static_sizes, vector_type);
+    if (mlir::failed(messages)) {
+      return mlir::failure();
+    }
     auto group = createMulticastGroup(rewriter, group_op);
     if (mlir::failed(group)) {
       return mlir::failure();
     }
 
-    auto load_set = buildIntegerSetFromSizes(context, src_static_sizes);
+    auto load_set = buildIntegerSetFromSizes(context, messages->sizes);
     auto load_order =
         mlir::AffineMap::getMultiDimIdentityMap(num_dims, context);
-    const SingleTimeStep time(context, num_dims);
     auto composite_op = mlir::agen::CompositeLoadOp::create(
         rewriter, loc, src_memref, /*dbg_name=*/nullptr, src_map, src_indices,
-        vector_type, load_set, load_order, /*time_symbols=*/{}, time.time_set,
-        time.time_order, time.time_addr_map);
+        messages->type, load_set, load_order, /*time_symbols=*/{},
+        messages->time_set, messages->time_order, messages->time_addr_map);
 
     mlir::OpBuilder body_builder(composite_op.getBody()->getTerminator());
     mlir::dataflow::SendOp::create(body_builder, loc, group->group,
@@ -1143,8 +1092,8 @@ struct LowerDataTransferPattern
   }
 
   /// Lower as agen.composite_store whose body receives the stored vector from
-  /// the multicast group `group_op` (the ring into L1). Like a transfer out of
-  /// a same-core fifo, it moves one vector, in a single time step.
+  /// the multicast group `group_op` (the ring into L1), one message per time
+  /// step.
   mlir::LogicalResult lowerAsMulticastReceiveAndStore(
       mlir::PatternRewriter& rewriter,
       mlir::ktdf::DataTransferOp data_transfer_op, mlir::Value dst_memref,
@@ -1153,25 +1102,29 @@ struct LowerDataTransferPattern
       mlir::ktdf_lowering::MulticastGroupOp group_op) const {
     auto* context = rewriter.getContext();
     const auto loc = data_transfer_op.getLoc();
+    auto messages =
+        splitIntoMessages(data_transfer_op, dst_static_sizes, vector_type);
+    if (mlir::failed(messages)) {
+      return mlir::failure();
+    }
     auto group = createMulticastGroup(rewriter, group_op);
     if (mlir::failed(group)) {
       return mlir::failure();
     }
 
-    auto store_set = buildIntegerSetFromSizes(context, dst_static_sizes);
+    auto store_set = buildIntegerSetFromSizes(context, messages->sizes);
     auto store_order =
         mlir::AffineMap::getMultiDimIdentityMap(num_dims, context);
-    const SingleTimeStep time(context, num_dims);
     auto composite_op = mlir::agen::CompositeStoreOp::create(
         rewriter, loc, dst_memref, /*dbg_name=*/nullptr, dst_map, dst_indices,
-        store_set, store_order, /*time_symbols=*/{}, time.time_set,
-        time.time_order, time.time_addr_map);
+        store_set, store_order, /*time_symbols=*/{}, messages->time_set,
+        messages->time_order, messages->time_addr_map);
 
     mlir::Operation* terminator =
         composite_op.getRegion().front().getTerminator();
     mlir::OpBuilder body_builder(terminator);
     auto receive_op = mlir::dataflow::ReceiveOp::create(
-        body_builder, loc, vector_type, group->group, /*dbgName=*/nullptr);
+        body_builder, loc, messages->type, group->group, /*dbgName=*/nullptr);
     mlir::agen::YieldOp::create(body_builder, loc, receive_op.getData());
     terminator->erase();
 
