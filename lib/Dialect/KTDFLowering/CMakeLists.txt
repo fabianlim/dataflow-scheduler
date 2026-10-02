@@ -13,9 +13,11 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFLoweringDialect
     DataflowSchedulerKTDFLoweringIncGen
 
   LINK_LIBS PUBLIC
+    DataflowSchedulerDialects::DataflowDialect
     DataflowSchedulerDialects::KTDFDialect
 
   LINK_MLIR_LIBS
     MLIRIR
     MLIRControlFlowInterfaces
+    MLIRSideEffectInterfaces
 )

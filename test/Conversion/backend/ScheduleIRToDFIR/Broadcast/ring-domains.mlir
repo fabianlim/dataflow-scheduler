@@ -25,10 +25,14 @@
 // The token between the two stages gets no signal: the producer stage writes
 // no memory, only the fifo, so the stages have no memory conflict.
 //
-// The test stops before DFIR: that lowering pairs the units of the two stages
-// core by core (for the send and receive of the fifo), which consumers 8..31
-// cannot do, having no producer unit on their core. Ring lowering will pair
-// each consumer with the producer of its group instead.
+// The fifo is carried by multicast groups, which each side makes explicit
+// with ktdf_lowering.multicast_group in place of the fifo: the producer names
+// its own MNISU, each consumer the MNISU of its group's producer, from the
+// table that maps each ring consumer tile 1..31 to it. Both carry the same
+// attributes per producer 0..7: the group g, its number of ring consumers (3
+// for group 0, whose producer core 0 is also one of its consumers, 4 for the
+// others) and the direction the producer sends in. broadcast-frontend-form.mlir
+// lowers the broadcast on to DFIR.
 
 // GROUPS:      Groups of the cross-core fifo affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>
 // GROUPS-NEXT: group 0: producers {0}, consumers {0, 1, 2, 3}
@@ -131,6 +135,39 @@
 // CHECK-NEXT:     %[[LU_KEY31:.*]] = arith.constant 31 : index
 // CHECK-NEXT:     %[[LU_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[LU_KEY1]] -> %[[LU1]]], {{\[}}%[[LU_KEY2]] -> %[[LU2]]], {{\[}}%[[LU_KEY3]] -> %[[LU3]]], {{\[}}%[[LU_KEY4]] -> %[[LU4]]], {{\[}}%[[LU_KEY5]] -> %[[LU5]]], {{\[}}%[[LU_KEY6]] -> %[[LU6]]], {{\[}}%[[LU_KEY7]] -> %[[LU7]]], {{\[}}%[[LU_KEY8]] -> %[[LU8]]], {{\[}}%[[LU_KEY9]] -> %[[LU9]]], {{\[}}%[[LU_KEY10]] -> %[[LU10]]], {{\[}}%[[LU_KEY11]] -> %[[LU11]]], {{\[}}%[[LU_KEY12]] -> %[[LU12]]], {{\[}}%[[LU_KEY13]] -> %[[LU13]]], {{\[}}%[[LU_KEY14]] -> %[[LU14]]], {{\[}}%[[LU_KEY15]] -> %[[LU15]]], {{\[}}%[[LU_KEY16]] -> %[[LU16]]], {{\[}}%[[LU_KEY17]] -> %[[LU17]]], {{\[}}%[[LU_KEY18]] -> %[[LU18]]], {{\[}}%[[LU_KEY19]] -> %[[LU19]]], {{\[}}%[[LU_KEY20]] -> %[[LU20]]], {{\[}}%[[LU_KEY21]] -> %[[LU21]]], {{\[}}%[[LU_KEY22]] -> %[[LU22]]], {{\[}}%[[LU_KEY23]] -> %[[LU23]]], {{\[}}%[[LU_KEY24]] -> %[[LU24]]], {{\[}}%[[LU_KEY25]] -> %[[LU25]]], {{\[}}%[[LU_KEY26]] -> %[[LU26]]], {{\[}}%[[LU_KEY27]] -> %[[LU27]]], {{\[}}%[[LU_KEY28]] -> %[[LU28]]], {{\[}}%[[LU_KEY29]] -> %[[LU29]]], {{\[}}%[[LU_KEY30]] -> %[[LU30]]], {{\[}}%[[LU_KEY31]] -> %[[LU31]]]):index
 // CHECK-NEXT:     %[[LU:.*]] = uniform.query_map(map:%[[LU_MAP]], key:%[[TILE]]) : index
+// CHECK-NEXT:     %[[SRC_KEY1:.*]] = arith.constant 1 : index
+// CHECK-NEXT:     %[[SRC_KEY2:.*]] = arith.constant 2 : index
+// CHECK-NEXT:     %[[SRC_KEY3:.*]] = arith.constant 3 : index
+// CHECK-NEXT:     %[[SRC_KEY4:.*]] = arith.constant 4 : index
+// CHECK-NEXT:     %[[SRC_KEY5:.*]] = arith.constant 5 : index
+// CHECK-NEXT:     %[[SRC_KEY6:.*]] = arith.constant 6 : index
+// CHECK-NEXT:     %[[SRC_KEY7:.*]] = arith.constant 7 : index
+// CHECK-NEXT:     %[[SRC_KEY8:.*]] = arith.constant 8 : index
+// CHECK-NEXT:     %[[SRC_KEY9:.*]] = arith.constant 9 : index
+// CHECK-NEXT:     %[[SRC_KEY10:.*]] = arith.constant 10 : index
+// CHECK-NEXT:     %[[SRC_KEY11:.*]] = arith.constant 11 : index
+// CHECK-NEXT:     %[[SRC_KEY12:.*]] = arith.constant 12 : index
+// CHECK-NEXT:     %[[SRC_KEY13:.*]] = arith.constant 13 : index
+// CHECK-NEXT:     %[[SRC_KEY14:.*]] = arith.constant 14 : index
+// CHECK-NEXT:     %[[SRC_KEY15:.*]] = arith.constant 15 : index
+// CHECK-NEXT:     %[[SRC_KEY16:.*]] = arith.constant 16 : index
+// CHECK-NEXT:     %[[SRC_KEY17:.*]] = arith.constant 17 : index
+// CHECK-NEXT:     %[[SRC_KEY18:.*]] = arith.constant 18 : index
+// CHECK-NEXT:     %[[SRC_KEY19:.*]] = arith.constant 19 : index
+// CHECK-NEXT:     %[[SRC_KEY20:.*]] = arith.constant 20 : index
+// CHECK-NEXT:     %[[SRC_KEY21:.*]] = arith.constant 21 : index
+// CHECK-NEXT:     %[[SRC_KEY22:.*]] = arith.constant 22 : index
+// CHECK-NEXT:     %[[SRC_KEY23:.*]] = arith.constant 23 : index
+// CHECK-NEXT:     %[[SRC_KEY24:.*]] = arith.constant 24 : index
+// CHECK-NEXT:     %[[SRC_KEY25:.*]] = arith.constant 25 : index
+// CHECK-NEXT:     %[[SRC_KEY26:.*]] = arith.constant 26 : index
+// CHECK-NEXT:     %[[SRC_KEY27:.*]] = arith.constant 27 : index
+// CHECK-NEXT:     %[[SRC_KEY28:.*]] = arith.constant 28 : index
+// CHECK-NEXT:     %[[SRC_KEY29:.*]] = arith.constant 29 : index
+// CHECK-NEXT:     %[[SRC_KEY30:.*]] = arith.constant 30 : index
+// CHECK-NEXT:     %[[SRC_KEY31:.*]] = arith.constant 31 : index
+// CHECK-NEXT:     %[[SRC_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[SRC_KEY1]] -> %[[SU0]]], {{\[}}%[[SRC_KEY2]] -> %[[SU0]]], {{\[}}%[[SRC_KEY3]] -> %[[SU0]]], {{\[}}%[[SRC_KEY4]] -> %[[SU1]]], {{\[}}%[[SRC_KEY5]] -> %[[SU1]]], {{\[}}%[[SRC_KEY6]] -> %[[SU1]]], {{\[}}%[[SRC_KEY7]] -> %[[SU1]]], {{\[}}%[[SRC_KEY8]] -> %[[SU2]]], {{\[}}%[[SRC_KEY9]] -> %[[SU2]]], {{\[}}%[[SRC_KEY10]] -> %[[SU2]]], {{\[}}%[[SRC_KEY11]] -> %[[SU2]]], {{\[}}%[[SRC_KEY12]] -> %[[SU3]]], {{\[}}%[[SRC_KEY13]] -> %[[SU3]]], {{\[}}%[[SRC_KEY14]] -> %[[SU3]]], {{\[}}%[[SRC_KEY15]] -> %[[SU3]]], {{\[}}%[[SRC_KEY16]] -> %[[SU4]]], {{\[}}%[[SRC_KEY17]] -> %[[SU4]]], {{\[}}%[[SRC_KEY18]] -> %[[SU4]]], {{\[}}%[[SRC_KEY19]] -> %[[SU4]]], {{\[}}%[[SRC_KEY20]] -> %[[SU5]]], {{\[}}%[[SRC_KEY21]] -> %[[SU5]]], {{\[}}%[[SRC_KEY22]] -> %[[SU5]]], {{\[}}%[[SRC_KEY23]] -> %[[SU5]]], {{\[}}%[[SRC_KEY24]] -> %[[SU6]]], {{\[}}%[[SRC_KEY25]] -> %[[SU6]]], {{\[}}%[[SRC_KEY26]] -> %[[SU6]]], {{\[}}%[[SRC_KEY27]] -> %[[SU6]]], {{\[}}%[[SRC_KEY28]] -> %[[SU7]]], {{\[}}%[[SRC_KEY29]] -> %[[SU7]]], {{\[}}%[[SRC_KEY30]] -> %[[SU7]]], {{\[}}%[[SRC_KEY31]] -> %[[SU7]]]):index
+// CHECK-NEXT:     %[[SRC_SU:.*]] = uniform.query_map(map:%[[SRC_MAP]], key:%[[TILE]]) : index
 // CHECK-NEXT:     %[[C0:.*]] = arith.constant 0 : index
 // CHECK-NEXT:     %[[C1:.*]] = arith.constant 1 : index
 // CHECK-NEXT:     %[[C64:.*]] = arith.constant 64 : index
@@ -144,10 +181,12 @@
 // CHECK-NEXT:         %[[CH:.*]] = ktdf.fifo.allocate() {dataflow_scheduler.groups = #[[$GROUP_DOMAIN]]} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
 // CHECK-NEXT:         %[[TOKEN:.*]] = ktdf.create_token : !ktdf.token
 // CHECK-NEXT:         ktdf_lowering.execute_on %[[SU]] {
-// CHECK-NEXT:           ktdf.data_transfer from %[[SRC]]{{\[}}%[[I]], %[[C0]]] size [1, 64] to %[[CH]] size [64] : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+// CHECK-NEXT:           %[[TO_GROUP:.*]] = ktdf_lowering.multicast_group %[[CH]] producer(%[[SU]]) {directions = [#dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>], group_ids = array<i32: 0, 1, 2, 3, 4, 5, 6, 7>, num_consumers = array<i32: 3, 4, 4, 4, 4, 4, 4, 4>, producers = array<i64: 0, 1, 2, 3, 4, 5, 6, 7>} : <"MNISU" -> "MNILU", 64xf16>
+// CHECK-NEXT:           ktdf.data_transfer from %[[SRC]]{{\[}}%[[I]], %[[C0]]] size [1, 64] to %[[TO_GROUP]] size [64] : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
 // CHECK-NEXT:         }
 // CHECK-NEXT:         ktdf_lowering.execute_on %[[LU]] {
-// CHECK-NEXT:           ktdf.data_transfer from %[[CH]] size [64] to %[[DST]]{{\[}}%[[I]], %[[C0]]] size [1, 64] : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<64x64xf16, "L1">
+// CHECK-NEXT:           %[[FROM_GROUP:.*]] = ktdf_lowering.multicast_group %[[CH]] producer(%[[SRC_SU]]) {directions = [#dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>], group_ids = array<i32: 0, 1, 2, 3, 4, 5, 6, 7>, num_consumers = array<i32: 3, 4, 4, 4, 4, 4, 4, 4>, producers = array<i64: 0, 1, 2, 3, 4, 5, 6, 7>} : <"MNISU" -> "MNILU", 64xf16>
+// CHECK-NEXT:           ktdf.data_transfer from %[[FROM_GROUP]] size [64] to %[[DST]]{{\[}}%[[I]], %[[C0]]] size [1, 64] : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<64x64xf16, "L1">
 // CHECK-NEXT:         }
 // CHECK-NEXT:       }
 // CHECK-NEXT:     }

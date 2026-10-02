@@ -25,7 +25,10 @@
 
 #include <mlir/IR/OpDefinition.h>
 #include <mlir/Interfaces/ControlFlowInterfaces.h>
+#include <mlir/Interfaces/SideEffectInterfaces.h>
 
+#include "dataflow-scheduler/Dialect/Dataflow/DataflowAttributes.h"  // IWYU pragma: keep
+#include "dataflow-scheduler/Dialect/KTDF/KTDFTypes.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLoweringDialect.h"  // IWYU pragma: keep
 
 /// Auto-generated includes.

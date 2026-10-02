@@ -22,12 +22,14 @@
 #include <mlir/IR/Operation.h>
 
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/UniformInfra.h"
 #include "dataflow-scheduler/Dialect/Agen/Agen.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/Mapping.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchAttributes.h"
+#include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLowering.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Analysis/Presburger/IntegerRelation.h"
@@ -253,6 +255,73 @@ mlir::AffineMap foldStepIntoSubscripts(mlir::MLIRContext* context,
           mlir::getAffineDimExpr(map.getNumDims(), context);
   return mlir::AffineMap::get(map.getNumDims() + 1, map.getNumSymbols(),
                               results, context);
+}
+
+/// The time dimension of a composite transfer of one vector: a single pinned
+/// time step, at offset zero in each of the `rank` memref dimensions.
+struct SingleTimeStep {
+  mlir::IntegerSet time_set;
+  mlir::AffineMap time_order;
+  mlir::AffineMap time_addr_map;
+
+  SingleTimeStep(mlir::MLIRContext* context, unsigned rank)
+      : time_set(scheduler::buildIntegerSetFromSizes(context, {1})),
+        time_order(mlir::AffineMap::getMultiDimIdentityMap(1, context)),
+        time_addr_map(mlir::AffineMap::get(
+            1, 0, TransferTimeDims(rank).offsets(context), context)) {}
+};
+
+/// A multicast group in DFIR: the group a unit sends to or receives from, and
+/// the direction around the ring its producer sends in.
+struct MulticastGroup {
+  mlir::Value group;
+  mlir::dataflow::DataflowRoutingDirectionAttr direction;
+};
+
+/// Create the dataflow.create_multicast_group of `group_op` in the
+/// uniform.uniformize_regions region of one unit around it. The producer
+/// operand, a table keyed by tile, resolves to its entry for that unit's
+/// core, and the attributes are the entry of that producer. A group starts
+/// with no outstanding requests (`count = 0`).
+mlir::FailureOr<MulticastGroup> createMulticastGroup(
+    mlir::PatternRewriter& rewriter,
+    mlir::ktdf_lowering::MulticastGroupOp group_op) {
+  mlir::dataflow::GetUnitOp unit = getRegionUnit(group_op);
+  if (!unit) {
+    return group_op.emitError(
+        "multicast group must be in the region of one unit of a "
+        "uniform.uniformize_regions");
+  }
+  const int64_t core = unit->getAttrOfType<mlir::IntegerAttr>("core").getInt();
+
+  mlir::Value producer =
+      UniformInfra::lookupOnCore(group_op.getProducer(), core);
+  auto producer_unit =
+      producer ? producer.getDefiningOp<mlir::dataflow::GetUnitOp>() : nullptr;
+  if (!producer_unit) {
+    return group_op.emitError(
+               "no producer unit of the multicast group on core ")
+           << core;
+  }
+  const int64_t producer_core =
+      producer_unit->getAttrOfType<mlir::IntegerAttr>("core").getInt();
+  const auto producers = group_op.getProducers();
+  const auto* entry = llvm::find(producers, producer_core);
+  if (entry == producers.end()) {
+    return group_op.emitError("multicast group has no entry for the producer ")
+           << "tile " << producer_core;
+  }
+  const size_t index = entry - producers.begin();
+
+  mlir::OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(group_op);
+  auto group = mlir::dataflow::CreateMulticastGroupOp::create(
+      rewriter, group_op.getLoc(), rewriter.getIndexType(), producer,
+      /*consumers=*/mlir::ValueRange(), group_op.getNumConsumers()[index],
+      group_op.getGroupIds()[index], /*count=*/0);
+  return MulticastGroup{
+      group, llvm::cast<mlir::dataflow::DataflowRoutingDirectionAttr>(
+                 group_op.getDirections()[index])};
 }
 
 /// Emit a self-sync (dataflow.sync_send) before `indirect_transfer`, hoisted as
@@ -743,6 +812,13 @@ struct LowerDataTransferPattern
             num_dims, rewriter.getContext());
         auto src_map = data_transfer_op.getSourceMap().value_or(identity_map);
 
+        if (auto group =
+                dst.getDefiningOp<mlir::ktdf_lowering::MulticastGroupOp>()) {
+          return lowerAsLoadAndMulticast(rewriter, data_transfer_op, src_memref,
+                                         src_indices, src_static_sizes,
+                                         num_dims, vector_type, src_map, group);
+        }
+
         auto dst_fifo_slot_type =
             llvm::cast<mlir::ktdf::FifoSlotType>(dst.getType());
         return lowerAsLoadAndSend(rewriter, data_transfer_op, src_memref,
@@ -761,6 +837,13 @@ struct LowerDataTransferPattern
         auto identity_map = mlir::AffineMap::getMultiDimIdentityMap(
             num_dims, rewriter.getContext());
         auto dst_map = data_transfer_op.getDestMap().value_or(identity_map);
+
+        if (auto group =
+                src.getDefiningOp<mlir::ktdf_lowering::MulticastGroupOp>()) {
+          return lowerAsMulticastReceiveAndStore(
+              rewriter, data_transfer_op, dst_memref, dst_indices,
+              dst_static_sizes, num_dims, vector_type, dst_map, group);
+        }
 
         auto src_fifo_slot_type =
             llvm::cast<mlir::ktdf::FifoSlotType>(src.getType());
@@ -1021,6 +1104,77 @@ struct LowerDataTransferPattern
                                    /*dbgName=*/nullptr);
 
     // Erase the original data_transfer operation
+    rewriter.eraseOp(data_transfer_op);
+    return mlir::success();
+  }
+
+  /// Lower as agen.composite_load whose body sends the loaded vector to the
+  /// multicast group `group_op` (L1 onto the ring). Like a transfer into a
+  /// same-core fifo, it moves one vector, in a single time step.
+  mlir::LogicalResult lowerAsLoadAndMulticast(
+      mlir::PatternRewriter& rewriter,
+      mlir::ktdf::DataTransferOp data_transfer_op, mlir::Value src_memref,
+      mlir::ValueRange src_indices, llvm::ArrayRef<int64_t> src_static_sizes,
+      unsigned num_dims, mlir::VectorType vector_type, mlir::AffineMap src_map,
+      mlir::ktdf_lowering::MulticastGroupOp group_op) const {
+    auto* context = rewriter.getContext();
+    const auto loc = data_transfer_op.getLoc();
+    auto group = createMulticastGroup(rewriter, group_op);
+    if (mlir::failed(group)) {
+      return mlir::failure();
+    }
+
+    auto load_set = buildIntegerSetFromSizes(context, src_static_sizes);
+    auto load_order =
+        mlir::AffineMap::getMultiDimIdentityMap(num_dims, context);
+    const SingleTimeStep time(context, num_dims);
+    auto composite_op = mlir::agen::CompositeLoadOp::create(
+        rewriter, loc, src_memref, /*dbg_name=*/nullptr, src_map, src_indices,
+        vector_type, load_set, load_order, /*time_symbols=*/{}, time.time_set,
+        time.time_order, time.time_addr_map);
+
+    mlir::OpBuilder body_builder(composite_op.getBody()->getTerminator());
+    mlir::dataflow::SendOp::create(body_builder, loc, group->group,
+                                   composite_op.getLoadInductionVar(),
+                                   group->direction, /*dbgName=*/nullptr);
+
+    rewriter.eraseOp(data_transfer_op);
+    return mlir::success();
+  }
+
+  /// Lower as agen.composite_store whose body receives the stored vector from
+  /// the multicast group `group_op` (the ring into L1). Like a transfer out of
+  /// a same-core fifo, it moves one vector, in a single time step.
+  mlir::LogicalResult lowerAsMulticastReceiveAndStore(
+      mlir::PatternRewriter& rewriter,
+      mlir::ktdf::DataTransferOp data_transfer_op, mlir::Value dst_memref,
+      mlir::ValueRange dst_indices, llvm::ArrayRef<int64_t> dst_static_sizes,
+      unsigned num_dims, mlir::VectorType vector_type, mlir::AffineMap dst_map,
+      mlir::ktdf_lowering::MulticastGroupOp group_op) const {
+    auto* context = rewriter.getContext();
+    const auto loc = data_transfer_op.getLoc();
+    auto group = createMulticastGroup(rewriter, group_op);
+    if (mlir::failed(group)) {
+      return mlir::failure();
+    }
+
+    auto store_set = buildIntegerSetFromSizes(context, dst_static_sizes);
+    auto store_order =
+        mlir::AffineMap::getMultiDimIdentityMap(num_dims, context);
+    const SingleTimeStep time(context, num_dims);
+    auto composite_op = mlir::agen::CompositeStoreOp::create(
+        rewriter, loc, dst_memref, /*dbg_name=*/nullptr, dst_map, dst_indices,
+        store_set, store_order, /*time_symbols=*/{}, time.time_set,
+        time.time_order, time.time_addr_map);
+
+    mlir::Operation* terminator =
+        composite_op.getRegion().front().getTerminator();
+    mlir::OpBuilder body_builder(terminator);
+    auto receive_op = mlir::dataflow::ReceiveOp::create(
+        body_builder, loc, vector_type, group->group, /*dbgName=*/nullptr);
+    mlir::agen::YieldOp::create(body_builder, loc, receive_op.getData());
+    terminator->erase();
+
     rewriter.eraseOp(data_transfer_op);
     return mlir::success();
   }

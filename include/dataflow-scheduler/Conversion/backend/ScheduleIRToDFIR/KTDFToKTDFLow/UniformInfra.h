@@ -22,6 +22,7 @@
 #include <map>
 
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/ComponentClassifier.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/StageDomains.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/UnitMaterializer.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
@@ -40,6 +41,8 @@ struct QueriedUnitsMap {
   llvm::DenseMap<std::pair<std::pair<mlir::Operation*, ResourceType>, int>,
                  mlir::Value>
       parallel;  // ((parallel_op, component resource), corelet) -> Value
+  llvm::DenseMap<mlir::Value, mlir::Value>
+      ring_producers;  // cross-core fifo -> the producer unit feeding the tile
 };
 
 /// Storage for uniform maps
@@ -49,6 +52,8 @@ struct UniformMapsStorage {
   llvm::DenseMap<std::pair<std::pair<mlir::Operation*, ResourceType>, int>,
                  mlir::Value>
       parallel;  // ((parallel_op, component resource), corelet) -> Value
+  llvm::DenseMap<mlir::Value, mlir::Value>
+      ring_producers;  // cross-core fifo -> Value
 };
 
 /// Creates uniform maps and queries at function entry
@@ -57,10 +62,13 @@ class UniformInfra {
   explicit UniformInfra(mlir::func::FuncOp func) : func_(func) {}
 
   /// Create all maps and queries: for each component, a map from each tile of
-  /// @p component_tiles to the component's unit on it
+  /// @p component_tiles to the component's unit on it, and for each
+  /// cross-core channel of @p channels, a map from each ring consumer tile to
+  /// the producer unit of its group, the unit that feeds it over the ring
   mlir::LogicalResult createMapsAndQueries(
       const ComponentClassification& components,
-      const ComponentTiles& component_tiles, const UnitSSAMap& unit_ssa_map,
+      const ComponentTiles& component_tiles,
+      const CrossCoreChannelMap& channels, const UnitSSAMap& unit_ssa_map,
       QueriedUnitsMap& queried_units, UniformMapsStorage& uniform_maps,
       mlir::OpBuilder& builder);
 
@@ -87,6 +95,12 @@ class UniformInfra {
   static llvm::FailureOr<mlir::Value> buildSignalQueryMap(
       mlir::Value signal_query_map, mlir::dataflow::ProgramUnitOp program_unit,
       mlir::OpBuilder& builder, mlir::Location loc);
+
+  /// Get the value that @p query, a query_map with get_compute_tile_id as key
+  /// of a mapping keyed by constant tile ids, gives on the core @p core: the
+  /// value the mapping maps @p core to, or nullptr if it has no such entry or
+  /// @p query is not such a query.
+  static mlir::Value lookupOnCore(mlir::Value query, int64_t core);
 
  private:
   mlir::func::FuncOp func_;

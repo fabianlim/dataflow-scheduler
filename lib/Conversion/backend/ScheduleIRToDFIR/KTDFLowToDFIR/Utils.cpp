@@ -159,6 +159,20 @@ mlir::Value scheduler::createQueryMapForComponent(
   return query_op.getResult();
 }
 
+mlir::dataflow::GetUnitOp scheduler::getRegionUnit(mlir::Operation* op) {
+  auto regions_op = op->getParentOfType<mlir::uniform::UniformizeRegionsOp>();
+  if (!regions_op) return nullptr;
+
+  mlir::Region* region = op->getParentRegion();
+  while (region->getParentOp() != regions_op) {
+    region = region->getParentOp()->getParentRegion();
+  }
+  mlir::ValueRange units =
+      regions_op.getRegionUnitList(region->getRegionNumber());
+  if (units.size() != 1) return nullptr;
+  return units.front().getDefiningOp<mlir::dataflow::GetUnitOp>();
+}
+
 mlir::LogicalResult scheduler::replaceComputeTileIdWithCoreQuery(
     mlir::dataflow::ProgramUnitOp program_unit,
     llvm::DenseMap<int64_t, mlir::Value>& core_id_consts,

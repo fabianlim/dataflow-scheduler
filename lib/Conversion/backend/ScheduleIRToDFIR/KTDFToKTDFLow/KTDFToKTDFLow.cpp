@@ -27,6 +27,7 @@
 
 #include <map>
 
+#include "dataflow-scheduler/Analysis/CrossCoreChannels.h"
 #include "dataflow-scheduler/Analysis/Mapping.h"
 #include "dataflow-scheduler/Analysis/WriteSetScan.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/ComponentClassifier.h"
@@ -37,6 +38,7 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/UniformInfra.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/UnitMaterializer.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/Passes.h"
+#include "dataflow-scheduler/Dialect/Dataflow/DataflowAttributes.h"
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/GlobalStageDAG.h"
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
@@ -293,6 +295,78 @@ static void addScfForPipelineBackEdges(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Make the multicast group of each cross-core channel explicit.
+//
+// On the ring, the producer and the consumers of a group do not address each
+// other's units but the group, which each side creates, named by its producer
+// unit and attributes. So in the stage that writes the fifo and in the stage
+// that reads it, a ktdf_lowering.multicast_group stands for the stage's end of
+// the group, and the stage uses it in place of the fifo. The producer names
+// its own unit, a consumer the producer unit that feeds its tile. Both carry
+// the groups as the same per-producer attributes: the group id g, the number
+// of ring consumers of the group, and the direction the producer sends in.
+// ---------------------------------------------------------------------------
+static mlir::LogicalResult createMulticastGroups(
+    const CrossCoreChannelMap& channels, const StageToUnitsMap& stage_to_units,
+    const QueriedUnitsMap& queried_units) {
+  for (const auto& entry : channels) {
+    mlir::Value fifo = entry.first;
+    const CrossCoreChannel& channel = entry.second;
+    mlir::MLIRContext* context = fifo.getContext();
+    mlir::ktdf::StageOp producer_stage = channel.producer;
+    mlir::ktdf::StageOp consumer_stage = channel.consumer;
+
+    // The attributes, one entry per producer tile.
+    llvm::SmallVector<int64_t> producers = getProducerTiles(channel.groups);
+    llvm::SmallVector<int32_t> group_ids;
+    llvm::SmallVector<int32_t> num_consumers;
+    llvm::SmallVector<mlir::Attribute> directions;
+    for (const int64_t producer : producers) {
+      const ChannelGroup& group =
+          *llvm::find_if(channel.groups, [&](const ChannelGroup& group) {
+            return llvm::is_contained(group.producers, producer);
+          });
+      const auto direction = getRingDirection(producer);
+      if (!direction) {
+        return producer_stage.emitError()
+               << "no ring direction is known for the producer tile "
+               << producer << " of the cross-core fifo this stage writes";
+      }
+      group_ids.push_back(static_cast<int32_t>(group.id));
+      num_consumers.push_back(
+          static_cast<int32_t>(getRingConsumerTiles(group).size()));
+      directions.push_back(mlir::dataflow::DataflowRoutingDirectionAttr::get(
+          context,
+          *direction == RingDirection::kClockwise
+              ? mlir::dataflow::DataflowRoutingDirection::Clockwise
+              : mlir::dataflow::DataflowRoutingDirection::CounterClockwise));
+    }
+
+    // Each side's end of the group replaces the fifo in its stage.
+    const auto createGroup = [&](mlir::ktdf::StageOp stage,
+                                 mlir::Value producer) {
+      auto builder = mlir::OpBuilder::atBlockBegin(stage.getBody());
+      auto group = mlir::ktdf_lowering::MulticastGroupOp::create(
+          builder, stage.getLoc(), fifo.getType(), fifo, producer, producers,
+          group_ids, num_consumers, builder.getArrayAttr(directions));
+      fifo.replaceUsesWithIf(group, [&](mlir::OpOperand& use) {
+        return use.getOwner() != group &&
+               stage->isProperAncestor(use.getOwner());
+      });
+    };
+    const auto& producer_units =
+        stage_to_units.mapping.at(producer_stage.getOperation());
+    if (producer_units.size() != 1) {
+      return producer_stage.emitError(
+          "stage writing a cross-core fifo must execute on exactly one unit");
+    }
+    createGroup(producer_stage, producer_units.front());
+    createGroup(consumer_stage, queried_units.ring_producers.at(fifo));
+  }
+  return mlir::success();
+}
+
 struct KTDFToKTDFLoweringPass
     : public impl::KTDFToKTDFLoweringPassBase<KTDFToKTDFLoweringPass> {
   KTDFToKTDFLoweringPass()
@@ -348,8 +422,9 @@ struct KTDFToKTDFLoweringPass
       // Step 2b: Resolve the tiles each component's units are on, from the
       // domains of the stages
       ComponentTiles component_tiles;
-      if (mlir::failed(
-              resolveComponentTiles(stages, grid_size, component_tiles))) {
+      CrossCoreChannelMap channels;
+      if (mlir::failed(resolveComponentTiles(stages, grid_size, component_tiles,
+                                             channels))) {
         return signalPassFailure();
       }
 
@@ -370,8 +445,8 @@ struct KTDFToKTDFLoweringPass
 
       UniformInfra uniform_infra(func);
       if (mlir::failed(uniform_infra.createMapsAndQueries(
-              components, component_tiles, unit_ssa_map, queried_units,
-              uniform_maps, builder))) {
+              components, component_tiles, channels, unit_ssa_map,
+              queried_units, uniform_maps, builder))) {
         return signalPassFailure();
       }
 
@@ -479,6 +554,13 @@ struct KTDFToKTDFLoweringPass
       // are wrapped in scf.if guards (iv != lb / iv != ub-step).
       if (mlir::failed(insertSignals(func.getLoc(), stage_to_units, global_dag,
                                      conflicts, back_edges))) {
+        return signalPassFailure();
+      }
+
+      // Step 8b: Make the multicast group of each cross-core fifo explicit
+      // in the stages that write and read it.
+      if (mlir::failed(
+              createMulticastGroups(channels, stage_to_units, queried_units))) {
         return signalPassFailure();
       }
 

@@ -37,7 +37,9 @@ namespace scheduler {
 /// dataflow.program_unit at the function entry block (right before the
 /// terminator) and clone every op in `work_ops` into its body. Then filter
 /// inner ktdf_lowering.execute_on / ktdf_lowering.signal ops by applicability
-/// to the entry's resource type.
+/// to the entry's resource type. A program unit whose body creates a
+/// multicast group gets one uniform.uniformize_regions region per unit, each
+/// holding a copy of the body, since the group's attributes differ per unit.
 ///
 /// Erases the original `work_ops` from the function entry block on success.
 ///

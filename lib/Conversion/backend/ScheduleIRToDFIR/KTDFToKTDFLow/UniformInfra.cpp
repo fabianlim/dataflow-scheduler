@@ -30,9 +30,9 @@ using namespace scheduler;
 
 mlir::LogicalResult UniformInfra::createMapsAndQueries(
     const ComponentClassification& components,
-    const ComponentTiles& component_tiles, const UnitSSAMap& unit_ssa_map,
-    QueriedUnitsMap& queried_units, UniformMapsStorage& uniform_maps,
-    mlir::OpBuilder& builder) {
+    const ComponentTiles& component_tiles, const CrossCoreChannelMap& channels,
+    const UnitSSAMap& unit_ssa_map, QueriedUnitsMap& queried_units,
+    UniformMapsStorage& uniform_maps, mlir::OpBuilder& builder) {
   LDBG(1) << "Step 4: Create maps and queries";
 
   auto loc = func_.getLoc();
@@ -124,6 +124,45 @@ mlir::LogicalResult UniformInfra::createMapsAndQueries(
     }
   }
 
+  // Create maps and queries for the producers of cross-core channels: each
+  // ring consumer tile is fed by the producer unit of its group, the unit of
+  // the producer stage's component on the group's producer tile.
+  for (const auto& [fifo, channel] : channels) {
+    mlir::ktdf::StageOp producer_stage = channel.producer;
+    auto producer_units = producer_stage.getApplicableUnitsAttr();
+    if (!producer_units || producer_units.size() != 1) {
+      return producer_stage.emitError(
+          "stage writing a cross-core fifo must have exactly one applicable "
+          "unit");
+    }
+    const auto component = llvm::cast<ResourceType>(producer_units[0]);
+
+    llvm::SmallVector<mlir::Value> keys;
+    llvm::SmallVector<mlir::Value> values;
+    for (int64_t consumer : getRingConsumerTiles(channel.groups)) {
+      const int64_t producer = *getProducerOf(channel.groups, consumer);
+      auto it = unit_ssa_map.non_parallel.find(
+          std::make_pair(component, static_cast<int>(producer)));
+      if (it == unit_ssa_map.non_parallel.end()) {
+        return func_.emitError("Unit SSA value not found for component ")
+               << getComponentName(component) << " core " << producer;
+      }
+      keys.push_back(
+          mlir::arith::ConstantIndexOp::create(builder, loc, consumer));
+      values.push_back(it->second);
+    }
+
+    auto map_op = mlir::uniform::DefImmutableMappingOp::create(
+        builder, loc, builder.getIndexType(), keys, values);
+    uniform_maps.ring_producers[fifo] = map_op.getResult();
+    auto query_op = mlir::uniform::QueryMapOp::create(
+        builder, loc, builder.getIndexType(), map_op.getResult(), tile_id);
+    queried_units.ring_producers[fifo] = query_op.getResult();
+
+    LDBG(1) << "  Created map and query for the producers of a cross-core "
+               "fifo";
+  }
+
   LDBG(1) << "Map and query creation complete";
   return mlir::success();
 }
@@ -189,30 +228,30 @@ mlir::LogicalResult UniformInfra::buildMemoryUniformMaps(
   return mlir::success();
 }
 
-llvm::FailureOr<mlir::Value> UniformInfra::buildSignalQueryMap(
-    mlir::Value signal_query_map, mlir::dataflow::ProgramUnitOp program_unit,
-    mlir::OpBuilder& builder, mlir::Location loc) {
-  // Get the original query_map operation
-  auto query_op = signal_query_map.getDefiningOp<mlir::uniform::QueryMapOp>();
+mlir::Value UniformInfra::lookupOnCore(mlir::Value query, int64_t core) {
+  auto query_op = query.getDefiningOp<mlir::uniform::QueryMapOp>();
   if (!query_op) {
-    return mlir::failure();
+    return nullptr;
   }
-
-  // Get the def_immutable_mapping
   auto def_map_op =
       query_op.getMap().getDefiningOp<mlir::uniform::DefImmutableMappingOp>();
   if (!def_map_op) {
-    return mlir::failure();
+    return nullptr;
   }
 
-  // Get the keys and values from the original mapping
-  auto original_keys = def_map_op.getKeys();
-  auto original_values = def_map_op.getValues();
-
-  if (original_keys.size() != original_values.size()) {
-    return mlir::failure();
+  for (auto [key, value] :
+       llvm::zip_equal(def_map_op.getKeys(), def_map_op.getValues())) {
+    auto key_const = key.getDefiningOp<mlir::arith::ConstantIndexOp>();
+    if (key_const && key_const.value() == core) {
+      return value;
+    }
   }
+  return nullptr;
+}
 
+llvm::FailureOr<mlir::Value> UniformInfra::buildSignalQueryMap(
+    mlir::Value signal_query_map, mlir::dataflow::ProgramUnitOp program_unit,
+    mlir::OpBuilder& builder, mlir::Location loc) {
   // The program_unit operands are the keys for the new mapping
   mlir::ValueRange pu_operands = program_unit.getUnits();
 
@@ -231,24 +270,14 @@ llvm::FailureOr<mlir::Value> UniformInfra::buildSignalQueryMap(
     if (!core_attr) {
       return mlir::failure();
     }
-    int core = static_cast<int>(core_attr.getInt());
 
     // Find the corresponding value in the original mapping for this core
-    bool found = false;
-    for (size_t i = 0; i < original_keys.size(); ++i) {
-      auto key_const =
-          original_keys[i].getDefiningOp<mlir::arith::ConstantIndexOp>();
-      if (key_const && key_const.value() == core) {
-        new_keys.push_back(pu_op);
-        new_values.push_back(original_values[i]);
-        found = true;
-        break;
-      }
-    }
-
-    if (!found) {
+    mlir::Value value = lookupOnCore(signal_query_map, core_attr.getInt());
+    if (!value) {
       return mlir::failure();
     }
+    new_keys.push_back(pu_op);
+    new_values.push_back(value);
   }
 
   // Create new def_immutable_mapping with program_unit operands as keys

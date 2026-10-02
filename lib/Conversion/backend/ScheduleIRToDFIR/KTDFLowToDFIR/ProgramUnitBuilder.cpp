@@ -22,6 +22,7 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLowering.h"
+#include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -104,6 +105,41 @@ mlir::LogicalResult filterAndUnwrapKTDFLoweringOps(
   return mlir::success();
 }
 
+// Gives `pu` one uniform.uniformize_regions region per unit, each holding a
+// copy of its body, if the body creates a multicast group. The attributes of
+// a multicast group, its id and number of consumers and the direction its
+// producer sends in, are those of the unit's group, so they differ per unit
+// and cannot be selected through a query map; each region selects the ones of
+// its unit.
+void splitIntoUnitRegions(mlir::dataflow::ProgramUnitOp pu) {
+  const bool has_multicast_group =
+      pu.walk([](mlir::ktdf_lowering::MulticastGroupOp) {
+          return mlir::WalkResult::interrupt();
+        }).wasInterrupted();
+  if (!has_multicast_group) return;
+
+  mlir::Block& body = pu.getRegion().front();
+  llvm::SmallVector<mlir::Operation*> body_ops;
+  for (mlir::Operation& op : body.without_terminator()) body_ops.push_back(&op);
+
+  const auto loc = pu.getLoc();
+  mlir::OpBuilder builder(body.getTerminator());
+  mlir::ValueRange units = pu.getUnits();
+  auto regions_op = mlir::uniform::UniformizeRegionsOp::create(
+      builder, loc, /*results=*/mlir::TypeRange(), units,
+      builder.getI32ArrayAttr(llvm::SmallVector<int32_t>(units.size(), 1)),
+      /*regIndices=*/nullptr, /*regLocales=*/nullptr, units.size());
+  for (mlir::Region& region : regions_op.getRegions()) {
+    mlir::OpBuilder region_builder(pu.getContext());
+    region_builder.createBlock(&region, {}, {builder.getIndexType()}, {loc});
+    mlir::IRMapping mapping;
+    for (mlir::Operation* op : body_ops) region_builder.clone(*op, mapping);
+    mlir::uniform::UniformizeRegionsOp::ensureTerminator(region, builder, loc);
+  }
+
+  for (mlir::Operation* op : llvm::reverse(body_ops)) op->erase();
+}
+
 }  // namespace
 
 mlir::LogicalResult scheduler::buildProgramUnits(
@@ -162,6 +198,7 @@ mlir::LogicalResult scheduler::buildProgramUnits(
     if (mlir::failed(filterAndUnwrapKTDFLoweringOps(pu, ct))) {
       return mlir::failure();
     }
+    splitIntoUnitRegions(pu);
     if (mlir::failed(scheduler::replaceComputeTileIdWithCoreQuery(
             pu, core_id_consts, const_builder))) {
       return mlir::failure();

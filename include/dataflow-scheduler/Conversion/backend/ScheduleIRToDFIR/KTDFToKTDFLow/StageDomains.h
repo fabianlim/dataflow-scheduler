@@ -30,8 +30,10 @@
 
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/SmallVector.h>
 
+#include "dataflow-scheduler/Analysis/CrossCoreChannels.h"
 #include "dataflow-scheduler/Analysis/Mapping.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 
@@ -40,21 +42,35 @@ namespace scheduler {
 /// Component -> the tiles its units are on, in increasing order.
 using ComponentTiles = llvm::DenseMap<ResourceType, llvm::SmallVector<int64_t>>;
 
-/// Reads and verifies the domain of each of @p stages, and gets the tiles of
-/// each component they use.
+/// A cross-core channel: the stage that writes a cross-core fifo, the stage
+/// that reads it, and the groups resolved from the fifo's group domain and
+/// the domains of the two stages.
+struct CrossCoreChannel {
+  mlir::ktdf::StageOp producer;
+  mlir::ktdf::StageOp consumer;
+  llvm::SmallVector<ChannelGroup> groups;
+};
+
+/// Cross-core fifo -> its channel, in the order the fifos are accessed.
+using CrossCoreChannelMap = llvm::MapVector<mlir::Value, CrossCoreChannel>;
+
+/// Reads and verifies the domain of each of @p stages, gets the tiles of each
+/// component they use, and resolves the channel of each cross-core fifo they
+/// write or read into @p channels.
 ///
 /// A plain domain must be a set over the tile alone, non-empty and within the
 /// grid [0, @p grid_size). A domain with one symbol, the group, is only valid
 /// on a stage that writes or reads exactly one cross-core fifo, and the
-/// stages that write and read a cross-core fifo must have one: the groups of
-/// the fifo are resolved from its group domain and the two stage domains, and
-/// the stages execute on the producers and on the ring consumers of all
-/// groups, the consumers of each group without its producers. All leaf stages
-/// of a component must execute on the same tiles; a stage that wraps a
-/// pipeline is not counted.
+/// stages that write and read a cross-core fifo must have one: for now one
+/// stage writes the fifo and one stage reads it, the groups of the fifo are
+/// resolved from its group domain and the two stage domains, and the stages
+/// execute on the producers and on the ring consumers of all groups, the
+/// consumers of each group without its producers. All leaf stages of a
+/// component must execute on the same tiles; a stage that wraps a pipeline is
+/// not counted.
 mlir::LogicalResult resolveComponentTiles(
     llvm::ArrayRef<mlir::ktdf::StageOp> stages, int grid_size,
-    ComponentTiles& component_tiles);
+    ComponentTiles& component_tiles, CrossCoreChannelMap& channels);
 
 }  // namespace scheduler
 

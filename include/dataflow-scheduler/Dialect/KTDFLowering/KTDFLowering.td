@@ -27,10 +27,13 @@
 
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 
 include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLoweringDialect.td"
+include "dataflow-scheduler/Dialect/Dataflow/DataflowAttributes.td"
 include "dataflow-scheduler/Dialect/KTDF/KTDFEnums.td"
 include "dataflow-scheduler/Dialect/KTDF/KTDFAttributes.td"
+include "dataflow-scheduler/Dialect/KTDF/KTDFTypes.td"
 
 class KTDFLowering_Op<string mnemonic, list<Trait> traits = []> :
     Op<KTDFLowering_Dialect, mnemonic, traits> {
@@ -120,6 +123,61 @@ def KTDFLowering_SignalOp : KTDFLowering_Op<"signal", []> {
     /// Get the number of unit operands
     size_t getNumUnits() { return getUnits().size(); }
   }];
+}
+
+def KTDFLowering_MulticastGroupOp : KTDFLowering_Op<"multicast_group", [
+    Pure,
+    AllTypesMatch<["fifo", "result"]>
+  ]> {
+  let summary = "This core's end of the multicast group of a cross-core fifo";
+  let description = [{
+    The `ktdf_lowering.multicast_group` operation stands for this core's end of
+    the multicast group that carries the cross-core fifo `fifo`: a producer
+    unit sends to the group, and the consumers of the group receive from it.
+    Its result has the type of `fifo` and is used in place of it by the
+    `ktdf.data_transfer` that writes or reads the fifo.
+
+    Both ends of the fifo create the group, each in its own
+    `ktdf_lowering.execute_on`: the producer names itself as `producer`, and
+    each consumer names the producer unit that feeds it. The groups of the fifo
+    are described per producer by the parallel arrays `producers` (the producer
+    tiles), `group_ids`, `num_consumers` and `directions` (the direction around
+    the ring the producer sends in). Both ends carry the same arrays and read
+    the entry of their group's producer, so they create the same group.
+
+    This is a temporary operation used during the lowering process. In DFIR it
+    becomes a `dataflow.create_multicast_group` of the entry's producer, and
+    the transfer into or out of it a composite load that sends to the group or
+    a composite store that receives from it.
+
+    Example:
+    ```mlir
+    %group = ktdf_lowering.multicast_group %fifo producer(%unit) {
+        producers = array<i64: 0, 1>, group_ids = array<i32: 0, 1>,
+        num_consumers = array<i32: 1, 2>,
+        directions = [#dataflow<direction CounterClockwise>,
+                      #dataflow<direction Clockwise>]}
+        : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
+    ```
+  }];
+
+  let arguments = (ins
+    KTDF_FifoSlotType:$fifo,
+    Index:$producer,
+    DenseI64ArrayAttr:$producers,
+    DenseI32ArrayAttr:$group_ids,
+    DenseI32ArrayAttr:$num_consumers,
+    TypedArrayAttrBase<DataflowRoutingDirectionAttr,
+                       "array of routing directions">:$directions
+  );
+
+  let results = (outs KTDF_FifoSlotType:$result);
+
+  let assemblyFormat = [{
+    $fifo `producer` `(` $producer `)` attr-dict `:` type($fifo)
+  }];
+
+  let hasVerifier = 1;
 }
 
 #endif // DATAFLOW_SCHEDULER_DIALECT_KTDFLOWERING_KTDFLOWERING_TD

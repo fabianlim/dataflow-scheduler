@@ -70,6 +70,10 @@ mlir::Value createQueryMapForComponent(
 /// `const_builder`'s position (function scope, before the units) on first need.
 /// Returns failure if an operand is not a dataflow.get_unit or lacks a 'core'
 /// attribute.
+/// Gets the unit that the uniform.uniformize_regions region around @p op is
+/// for, or nullptr if @p op is not in a region for one unit.
+mlir::dataflow::GetUnitOp getRegionUnit(mlir::Operation* op);
+
 mlir::LogicalResult replaceComputeTileIdWithCoreQuery(
     mlir::dataflow::ProgramUnitOp program_unit,
     llvm::DenseMap<int64_t, mlir::Value>& core_id_consts,

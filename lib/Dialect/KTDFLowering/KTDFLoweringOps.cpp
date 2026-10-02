@@ -121,3 +121,27 @@ void SignalOp::print(OpAsmPrinter& printer) {
   // Print attributes
   printer.printOptionalAttrDict((*this)->getAttrs());
 }
+
+//===----------------------------------------------------------------------===//
+// MulticastGroupOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult MulticastGroupOp::verify() {
+  // One entry per producer in each of the parallel arrays.
+  const size_t num_producers = getProducers().size();
+  if (num_producers == 0) {
+    return emitOpError("must describe at least one producer");
+  }
+  if (getGroupIds().size() != num_producers ||
+      getNumConsumers().size() != num_producers ||
+      getDirections().size() != num_producers) {
+    return emitOpError(
+               "'producers', 'group_ids', 'num_consumers' and "
+               "'directions' must have one entry per producer, but "
+               "they have ")
+           << num_producers << ", " << getGroupIds().size() << ", "
+           << getNumConsumers().size() << " and " << getDirections().size()
+           << " entries";
+  }
+  return success();
+}

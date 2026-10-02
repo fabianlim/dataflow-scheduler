@@ -18,6 +18,7 @@
 
 #include "dataflow-scheduler/Analysis/CrossCoreChannels.h"
 
+#include <array>
 #include <string>
 
 #include <llvm/ADT/DenseMap.h>
@@ -302,4 +303,18 @@ auto scheduler::getSelfDeliveries(llvm::ArrayRef<ChannelGroup> groups)
           return llvm::is_contained(group.producers, consumer);
         }));
   });
+}
+
+auto scheduler::getRingDirection(int64_t producer)
+    -> std::optional<RingDirection> {
+  // The directions of the reference DFIR, by producer tile.
+  constexpr auto kCW = RingDirection::kClockwise;
+  constexpr auto kCCW = RingDirection::kCounterClockwise;
+  constexpr std::array kReferenceDirections = {kCCW, kCCW, kCW, kCCW,
+                                               kCCW, kCW,  kCW, kCCW};
+  if (producer < 0 ||
+      producer >= static_cast<int64_t>(kReferenceDirections.size())) {
+    return std::nullopt;
+  }
+  return kReferenceDirections[producer];
 }

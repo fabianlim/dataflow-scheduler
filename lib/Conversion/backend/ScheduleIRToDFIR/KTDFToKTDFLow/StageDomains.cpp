@@ -159,19 +159,19 @@ void debugPrintGroups(mlir::Value fifo,
           << llvm::interleaved(getSelfDeliveries(channel_groups)) << "}";
 }
 
-/// Resolves the groups of each cross-core fifo in @p accesses from its group
-/// domain and the domains of the stages that write and read it, and sets the
-/// tiles of those stages in @p stage_tiles: the producers of all groups for
-/// the writing stage, and the ring consumers of all groups for the reading
-/// stage. The ring cannot deliver a tile's data to the tile itself; the
-/// self-deliveries are carried by the local copies of HandleCrossCoreStages,
-/// which runs before.
+/// Resolves the channel of each cross-core fifo in @p accesses: the groups
+/// from its group domain and the domains of the stages that write and read
+/// it. Sets the tiles of those stages in @p stage_tiles: the producers of all
+/// groups for the writing stage, and the ring consumers of all groups for the
+/// reading stage. The ring cannot deliver a tile's data to the tile itself;
+/// the self-deliveries are carried by the local copies of
+/// HandleCrossCoreStages, which runs before.
 mlir::LogicalResult resolveCrossCoreFifos(
     const FifoAccesses& accesses,
     const llvm::DenseMap<mlir::Operation*, mlir::IntegerSetAttr>& domains,
     int grid_size,
-    llvm::DenseMap<mlir::Operation*, llvm::SmallVector<int64_t>>&
-        stage_tiles) {
+    llvm::DenseMap<mlir::Operation*, llvm::SmallVector<int64_t>>& stage_tiles,
+    CrossCoreChannelMap& channels) {
   llvm::SetVector<mlir::Value> fifos = getCrossCoreFifos(accesses.writers);
   fifos.insert_range(getCrossCoreFifos(accesses.readers));
 
@@ -202,39 +202,43 @@ mlir::LogicalResult resolveCrossCoreFifos(
       return writers.front().emitError()
              << "stage writes a cross-core fifo that no stage reads";
     }
-
-    for (mlir::ktdf::StageOp writer : writers) {
-      auto producer_domain = getParametricDomain(writer, "writes");
-      if (mlir::failed(producer_domain)) {
-        return mlir::failure();
-      }
-      for (mlir::ktdf::StageOp reader : readers) {
-        auto consumer_domain = getParametricDomain(reader, "reads");
-        if (mlir::failed(consumer_domain)) {
-          return mlir::failure();
-        }
-
-        auto channel_groups = resolveChannelGroups(
-            getFifoGroups(fifo), *producer_domain, *consumer_domain,
-            grid_size, [&] {
-              auto diag = writer.emitError()
-                          << "invalid groups of the cross-core fifo this "
-                             "stage writes: ";
-              diag.attachNote(reader.getLoc())
-                  << "the stage reading the fifo";
-              return diag;
-            });
-        if (mlir::failed(channel_groups)) {
-          return mlir::failure();
-        }
-        LLVM_DEBUG(debugPrintGroups(fifo, *channel_groups));
-
-        stage_tiles[writer.getOperation()] =
-            getProducerTiles(*channel_groups);
-        stage_tiles[reader.getOperation()] =
-            getRingConsumerTiles(*channel_groups);
-      }
+    // The groups belong to the channel, one producer stage and one consumer
+    // stage, and both create the same multicast groups from them.
+    if (writers.size() != 1 || readers.size() != 1) {
+      return writers.front().emitError()
+             << "a cross-core fifo is written by one stage and read by one "
+                "stage for now, but the fifo this stage writes is written by "
+             << writers.size() << " and read by " << readers.size();
     }
+    mlir::ktdf::StageOp writer = writers.front();
+    mlir::ktdf::StageOp reader = readers.front();
+
+    auto producer_domain = getParametricDomain(writer, "writes");
+    if (mlir::failed(producer_domain)) {
+      return mlir::failure();
+    }
+    auto consumer_domain = getParametricDomain(reader, "reads");
+    if (mlir::failed(consumer_domain)) {
+      return mlir::failure();
+    }
+
+    auto channel_groups = resolveChannelGroups(
+        getFifoGroups(fifo), *producer_domain, *consumer_domain, grid_size,
+        [&] {
+          auto diag = writer.emitError()
+                      << "invalid groups of the cross-core fifo this "
+                         "stage writes: ";
+          diag.attachNote(reader.getLoc()) << "the stage reading the fifo";
+          return diag;
+        });
+    if (mlir::failed(channel_groups)) {
+      return mlir::failure();
+    }
+    LLVM_DEBUG(debugPrintGroups(fifo, *channel_groups));
+
+    stage_tiles[writer.getOperation()] = getProducerTiles(*channel_groups);
+    stage_tiles[reader.getOperation()] = getRingConsumerTiles(*channel_groups);
+    channels[fifo] = {writer, reader, std::move(*channel_groups)};
   }
   return mlir::success();
 }
@@ -243,7 +247,7 @@ mlir::LogicalResult resolveCrossCoreFifos(
 
 mlir::LogicalResult scheduler::resolveComponentTiles(
     llvm::ArrayRef<mlir::ktdf::StageOp> stages, int grid_size,
-    ComponentTiles& component_tiles) {
+    ComponentTiles& component_tiles, CrossCoreChannelMap& channels) {
   LDBG(1) << "Step 2b: Resolve stage domains";
 
   const FifoAccesses accesses = collectFifoAccesses(stages);
@@ -291,8 +295,8 @@ mlir::LogicalResult scheduler::resolveComponentTiles(
     }
   }
 
-  if (mlir::failed(
-          resolveCrossCoreFifos(accesses, domains, grid_size, stage_tiles))) {
+  if (mlir::failed(resolveCrossCoreFifos(accesses, domains, grid_size,
+                                         stage_tiles, channels))) {
     return mlir::failure();
   }
 

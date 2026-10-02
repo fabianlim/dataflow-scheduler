@@ -44,9 +44,8 @@
 // constant bounds of G, then each value in between, then each tile of the
 // grid. The analysis resolves the groups of a channel from its group domain
 // and its two stage domains, and derives from them the tiles of each stage,
-// the ring consumers, the producer of each consumer and the self-deliveries.
-// It will grow to derive what lowering needs beyond these, such as the ring
-// direction each producer sends in.
+// the ring consumers, the producer of each consumer and the self-deliveries,
+// and gives the direction around the ring each producer sends in.
 //
 //===----------------------------------------------------------------------===//
 
@@ -163,6 +162,24 @@ auto getRingConsumerTiles(llvm::ArrayRef<ChannelGroup> groups)
 [[nodiscard]]
 auto getSelfDeliveries(llvm::ArrayRef<ChannelGroup> groups)
     -> llvm::SmallVector<int64_t>;
+
+/// A direction around the ring.
+enum class RingDirection { kClockwise, kCounterClockwise };
+
+/// Gets the direction around the ring in which the producer tile @p producer
+/// sends to the consumers of its group.
+///
+/// Temporary: these are the directions of the reference DFIR of the
+/// broadcast relayout, for its producers 0..7. They do not follow from the
+/// ring as the device wires it today, with the ring stops in core order, so
+/// the physical ring order must differ. Once the device has the physical ring
+/// order, the direction is to be inferred from the port-level ring graph,
+/// where each stop and each direction are separate (for instance, the
+/// direction whose farthest consumer is closest).
+///
+/// @retval std::nullopt No direction is known for @p producer.
+[[nodiscard]]
+auto getRingDirection(int64_t producer) -> std::optional<RingDirection>;
 
 }  // namespace scheduler
 
