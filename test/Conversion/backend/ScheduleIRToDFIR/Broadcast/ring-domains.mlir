@@ -1,25 +1,26 @@
 // RUN: dataflow-scheduler-opt --path-expansion --ktdf-to-ktdflowering %s | FileCheck %s
 // RUN: dataflow-scheduler-opt --path-expansion --ktdf-to-ktdflowering --debug-only=ktdf-to-operand-lowering %s 2>&1 >/dev/null | FileCheck %s --check-prefix=GROUPS
 
-// The frontend form of the broadcast relayout on the 32-core ring device:
-// the cross-core fifo has the groups g = 0..7, and producer core g sends its
-// 64x64 tile to the consumer cores 4g..4g+3, in messages of one 64-element
+// The frontend form of the broadcast relayout on the 4-core ring device:
+// the cross-core fifo has the groups g = 0..1, and producer core g sends its
+// 64x64 tile to the consumer cores 2g and 2g+1, in messages of one 64-element
 // stick, the throttle of its transfers. The producer stage's domain selects
 // the producer of each group, P(g) = {g}, and the consumer stage's domain
-// its consumers, C(g) = {4g..4g+3}. Path expansion maps the stages to MNISU
+// its consumers, C(g) = {2g, 2g+1}. Path expansion maps the stages to MNISU
 // and MNILU and keeps their domains.
 //
 // ktdf-to-ktdflowering resolves the groups (checked under GROUPS, from the
-// debug output): the producer stage executes on cores 0..7, the union of
-// P(g). The consumers are cores 0..31, the union of C(g), and consumer c is
-// fed by producer c floordiv 4. Core 0 is the one self-delivery, in both
-// C(0) and P(0), which the ring cannot carry: the consumer stage executes on
-// the ring consumers, C(g) without P(g), cores 1..31. Without
-// handle-cross-core-stages, which carries the self-delivery by a local copy,
-// nothing delivers core 0's tile to core 0 here.
+// debug output): the producer stage executes on cores 0..1, the union of
+// P(g). The consumers are cores 0..3, the union of C(g), and consumer c is
+// fed by producer c floordiv 2. Core 1 is both the producer of group 1 and a
+// consumer of group 0. Core 0 is the one self-delivery, in both C(0) and
+// P(0), which the ring cannot carry: the consumer stage executes on the ring
+// consumers, C(g) without P(g), cores 1..3. Without handle-cross-core-stages,
+// which carries the self-delivery by a local copy, nothing delivers core 0's
+// tile to core 0 here.
 //
 // Units are materialized per kind on the tiles of its stages: MNISU on cores
-// 0..7 and MNILU on cores 1..31, and each kind's map from tile to unit lists
+// 0..1 and MNILU on cores 1..3, and each kind's map from tile to unit lists
 // exactly those tiles: after lowering to DFIR, they are the units the kind's
 // program unit runs on.
 //
@@ -29,145 +30,43 @@
 // The fifo is carried by multicast groups, which each side makes explicit
 // with ktdf_lowering.multicast_group in place of the fifo: the producer names
 // its own MNISU, each consumer the MNISU of its group's producer, from the
-// table that maps each ring consumer tile 1..31 to it. Both carry the same
-// attributes per producer 0..7: the group g, its number of ring consumers (3
-// for group 0, whose producer core 0 is also one of its consumers, 4 for the
-// others) and the direction the producer sends in. broadcast-frontend-form.mlir
+// table that maps each ring consumer tile 1..3 to it. Both carry the same
+// attributes per producer 0..1: the group g, its number of ring consumers (1
+// for group 0, whose producer core 0 is also one of its consumers, 2 for
+// group 1) and the direction the producer sends in. broadcast-frontend-form.mlir
 // lowers the broadcast on to DFIR.
 
-// GROUPS:      Groups of the cross-core fifo affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>
-// GROUPS-NEXT: group 0: producers {0}, consumers {0, 1, 2, 3}
-// GROUPS-NEXT: group 1: producers {1}, consumers {4, 5, 6, 7}
-// GROUPS-NEXT: group 2: producers {2}, consumers {8, 9, 10, 11}
-// GROUPS-NEXT: group 3: producers {3}, consumers {12, 13, 14, 15}
-// GROUPS-NEXT: group 4: producers {4}, consumers {16, 17, 18, 19}
-// GROUPS-NEXT: group 5: producers {5}, consumers {20, 21, 22, 23}
-// GROUPS-NEXT: group 6: producers {6}, consumers {24, 25, 26, 27}
-// GROUPS-NEXT: group 7: producers {7}, consumers {28, 29, 30, 31}
-// GROUPS-NEXT: producer tiles {0, 1, 2, 3, 4, 5, 6, 7}, consumer tiles {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}, ring consumer tiles {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}
-// GROUPS-NEXT: producer of each consumer: 0 <- 0, 1 <- 0, 2 <- 0, 3 <- 0, 4 <- 1, 5 <- 1, 6 <- 1, 7 <- 1, 8 <- 2, 9 <- 2, 10 <- 2, 11 <- 2, 12 <- 3, 13 <- 3, 14 <- 3, 15 <- 3, 16 <- 4, 17 <- 4, 18 <- 4, 19 <- 4, 20 <- 5, 21 <- 5, 22 <- 5, 23 <- 5, 24 <- 6, 25 <- 6, 26 <- 6, 27 <- 6, 28 <- 7, 29 <- 7, 30 <- 7, 31 <- 7
+// GROUPS:      Groups of the cross-core fifo affine_set<(d0) : (d0 >= 0, -d0 + 1 >= 0)>
+// GROUPS-NEXT: group 0: producers {0}, consumers {0, 1}
+// GROUPS-NEXT: group 1: producers {1}, consumers {2, 3}
+// GROUPS-NEXT: producer tiles {0, 1}, consumer tiles {0, 1, 2, 3}, ring consumer tiles {1, 2, 3}
+// GROUPS-NEXT: producer of each consumer: 0 <- 0, 1 <- 0, 2 <- 1, 3 <- 1
 // GROUPS-NEXT: self-deliveries {0}
 
 // CHECK: #[[$SET:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
-// CHECK: #[[$GROUP_DOMAIN:.+]] = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>
-// CHECK-LABEL:   ktdf_arch.device @ring32_device import("../../../../Dialect/KTDFArch/ring32_device.mlir")
+// CHECK: #[[$GROUP_DOMAIN:.+]] = affine_set<(d0) : (d0 >= 0, -d0 + 1 >= 0)>
+// CHECK-LABEL:   ktdf_arch.device @ring_device import("../../../../Dialect/KTDFArch/ring_device.mlir")
 
-// CHECK-LABEL:   func.func @ring_broadcast() attributes {grid = [32]} {
+// CHECK-LABEL:   func.func @ring_broadcast() attributes {grid = [4]} {
 // CHECK-NEXT:     %[[SU0:.*]] = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-mnisu", type = "mnisu"} : index
 // CHECK-NEXT:     %[[SU1:.*]] = dataflow.get_unit {core = 1 : i32, corelet = 0 : i32, name = "C1-mnisu", type = "mnisu"} : index
-// CHECK-NEXT:     %[[SU2:.*]] = dataflow.get_unit {core = 2 : i32, corelet = 0 : i32, name = "C2-mnisu", type = "mnisu"} : index
-// CHECK-NEXT:     %[[SU3:.*]] = dataflow.get_unit {core = 3 : i32, corelet = 0 : i32, name = "C3-mnisu", type = "mnisu"} : index
-// CHECK-NEXT:     %[[SU4:.*]] = dataflow.get_unit {core = 4 : i32, corelet = 0 : i32, name = "C4-mnisu", type = "mnisu"} : index
-// CHECK-NEXT:     %[[SU5:.*]] = dataflow.get_unit {core = 5 : i32, corelet = 0 : i32, name = "C5-mnisu", type = "mnisu"} : index
-// CHECK-NEXT:     %[[SU6:.*]] = dataflow.get_unit {core = 6 : i32, corelet = 0 : i32, name = "C6-mnisu", type = "mnisu"} : index
-// CHECK-NEXT:     %[[SU7:.*]] = dataflow.get_unit {core = 7 : i32, corelet = 0 : i32, name = "C7-mnisu", type = "mnisu"} : index
 // CHECK-NEXT:     %[[LU1:.*]] = dataflow.get_unit {core = 1 : i32, corelet = 0 : i32, name = "C1-mnilu", type = "mnilu"} : index
 // CHECK-NEXT:     %[[LU2:.*]] = dataflow.get_unit {core = 2 : i32, corelet = 0 : i32, name = "C2-mnilu", type = "mnilu"} : index
 // CHECK-NEXT:     %[[LU3:.*]] = dataflow.get_unit {core = 3 : i32, corelet = 0 : i32, name = "C3-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU4:.*]] = dataflow.get_unit {core = 4 : i32, corelet = 0 : i32, name = "C4-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU5:.*]] = dataflow.get_unit {core = 5 : i32, corelet = 0 : i32, name = "C5-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU6:.*]] = dataflow.get_unit {core = 6 : i32, corelet = 0 : i32, name = "C6-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU7:.*]] = dataflow.get_unit {core = 7 : i32, corelet = 0 : i32, name = "C7-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU8:.*]] = dataflow.get_unit {core = 8 : i32, corelet = 0 : i32, name = "C8-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU9:.*]] = dataflow.get_unit {core = 9 : i32, corelet = 0 : i32, name = "C9-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU10:.*]] = dataflow.get_unit {core = 10 : i32, corelet = 0 : i32, name = "C10-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU11:.*]] = dataflow.get_unit {core = 11 : i32, corelet = 0 : i32, name = "C11-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU12:.*]] = dataflow.get_unit {core = 12 : i32, corelet = 0 : i32, name = "C12-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU13:.*]] = dataflow.get_unit {core = 13 : i32, corelet = 0 : i32, name = "C13-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU14:.*]] = dataflow.get_unit {core = 14 : i32, corelet = 0 : i32, name = "C14-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU15:.*]] = dataflow.get_unit {core = 15 : i32, corelet = 0 : i32, name = "C15-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU16:.*]] = dataflow.get_unit {core = 16 : i32, corelet = 0 : i32, name = "C16-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU17:.*]] = dataflow.get_unit {core = 17 : i32, corelet = 0 : i32, name = "C17-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU18:.*]] = dataflow.get_unit {core = 18 : i32, corelet = 0 : i32, name = "C18-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU19:.*]] = dataflow.get_unit {core = 19 : i32, corelet = 0 : i32, name = "C19-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU20:.*]] = dataflow.get_unit {core = 20 : i32, corelet = 0 : i32, name = "C20-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU21:.*]] = dataflow.get_unit {core = 21 : i32, corelet = 0 : i32, name = "C21-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU22:.*]] = dataflow.get_unit {core = 22 : i32, corelet = 0 : i32, name = "C22-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU23:.*]] = dataflow.get_unit {core = 23 : i32, corelet = 0 : i32, name = "C23-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU24:.*]] = dataflow.get_unit {core = 24 : i32, corelet = 0 : i32, name = "C24-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU25:.*]] = dataflow.get_unit {core = 25 : i32, corelet = 0 : i32, name = "C25-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU26:.*]] = dataflow.get_unit {core = 26 : i32, corelet = 0 : i32, name = "C26-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU27:.*]] = dataflow.get_unit {core = 27 : i32, corelet = 0 : i32, name = "C27-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU28:.*]] = dataflow.get_unit {core = 28 : i32, corelet = 0 : i32, name = "C28-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU29:.*]] = dataflow.get_unit {core = 29 : i32, corelet = 0 : i32, name = "C29-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU30:.*]] = dataflow.get_unit {core = 30 : i32, corelet = 0 : i32, name = "C30-mnilu", type = "mnilu"} : index
-// CHECK-NEXT:     %[[LU31:.*]] = dataflow.get_unit {core = 31 : i32, corelet = 0 : i32, name = "C31-mnilu", type = "mnilu"} : index
 // CHECK-NEXT:     %[[TILE:.*]] = ktdp.get_compute_tile_id : index
 // CHECK-NEXT:     %[[SU_KEY0:.*]] = arith.constant 0 : index
 // CHECK-NEXT:     %[[SU_KEY1:.*]] = arith.constant 1 : index
-// CHECK-NEXT:     %[[SU_KEY2:.*]] = arith.constant 2 : index
-// CHECK-NEXT:     %[[SU_KEY3:.*]] = arith.constant 3 : index
-// CHECK-NEXT:     %[[SU_KEY4:.*]] = arith.constant 4 : index
-// CHECK-NEXT:     %[[SU_KEY5:.*]] = arith.constant 5 : index
-// CHECK-NEXT:     %[[SU_KEY6:.*]] = arith.constant 6 : index
-// CHECK-NEXT:     %[[SU_KEY7:.*]] = arith.constant 7 : index
-// CHECK-NEXT:     %[[SU_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[SU_KEY0]] -> %[[SU0]]], {{\[}}%[[SU_KEY1]] -> %[[SU1]]], {{\[}}%[[SU_KEY2]] -> %[[SU2]]], {{\[}}%[[SU_KEY3]] -> %[[SU3]]], {{\[}}%[[SU_KEY4]] -> %[[SU4]]], {{\[}}%[[SU_KEY5]] -> %[[SU5]]], {{\[}}%[[SU_KEY6]] -> %[[SU6]]], {{\[}}%[[SU_KEY7]] -> %[[SU7]]]):index
+// CHECK-NEXT:     %[[SU_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[SU_KEY0]] -> %[[SU0]]], {{\[}}%[[SU_KEY1]] -> %[[SU1]]]):index
 // CHECK-NEXT:     %[[SU:.*]] = uniform.query_map(map:%[[SU_MAP]], key:%[[TILE]]) : index
 // CHECK-NEXT:     %[[LU_KEY1:.*]] = arith.constant 1 : index
 // CHECK-NEXT:     %[[LU_KEY2:.*]] = arith.constant 2 : index
 // CHECK-NEXT:     %[[LU_KEY3:.*]] = arith.constant 3 : index
-// CHECK-NEXT:     %[[LU_KEY4:.*]] = arith.constant 4 : index
-// CHECK-NEXT:     %[[LU_KEY5:.*]] = arith.constant 5 : index
-// CHECK-NEXT:     %[[LU_KEY6:.*]] = arith.constant 6 : index
-// CHECK-NEXT:     %[[LU_KEY7:.*]] = arith.constant 7 : index
-// CHECK-NEXT:     %[[LU_KEY8:.*]] = arith.constant 8 : index
-// CHECK-NEXT:     %[[LU_KEY9:.*]] = arith.constant 9 : index
-// CHECK-NEXT:     %[[LU_KEY10:.*]] = arith.constant 10 : index
-// CHECK-NEXT:     %[[LU_KEY11:.*]] = arith.constant 11 : index
-// CHECK-NEXT:     %[[LU_KEY12:.*]] = arith.constant 12 : index
-// CHECK-NEXT:     %[[LU_KEY13:.*]] = arith.constant 13 : index
-// CHECK-NEXT:     %[[LU_KEY14:.*]] = arith.constant 14 : index
-// CHECK-NEXT:     %[[LU_KEY15:.*]] = arith.constant 15 : index
-// CHECK-NEXT:     %[[LU_KEY16:.*]] = arith.constant 16 : index
-// CHECK-NEXT:     %[[LU_KEY17:.*]] = arith.constant 17 : index
-// CHECK-NEXT:     %[[LU_KEY18:.*]] = arith.constant 18 : index
-// CHECK-NEXT:     %[[LU_KEY19:.*]] = arith.constant 19 : index
-// CHECK-NEXT:     %[[LU_KEY20:.*]] = arith.constant 20 : index
-// CHECK-NEXT:     %[[LU_KEY21:.*]] = arith.constant 21 : index
-// CHECK-NEXT:     %[[LU_KEY22:.*]] = arith.constant 22 : index
-// CHECK-NEXT:     %[[LU_KEY23:.*]] = arith.constant 23 : index
-// CHECK-NEXT:     %[[LU_KEY24:.*]] = arith.constant 24 : index
-// CHECK-NEXT:     %[[LU_KEY25:.*]] = arith.constant 25 : index
-// CHECK-NEXT:     %[[LU_KEY26:.*]] = arith.constant 26 : index
-// CHECK-NEXT:     %[[LU_KEY27:.*]] = arith.constant 27 : index
-// CHECK-NEXT:     %[[LU_KEY28:.*]] = arith.constant 28 : index
-// CHECK-NEXT:     %[[LU_KEY29:.*]] = arith.constant 29 : index
-// CHECK-NEXT:     %[[LU_KEY30:.*]] = arith.constant 30 : index
-// CHECK-NEXT:     %[[LU_KEY31:.*]] = arith.constant 31 : index
-// CHECK-NEXT:     %[[LU_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[LU_KEY1]] -> %[[LU1]]], {{\[}}%[[LU_KEY2]] -> %[[LU2]]], {{\[}}%[[LU_KEY3]] -> %[[LU3]]], {{\[}}%[[LU_KEY4]] -> %[[LU4]]], {{\[}}%[[LU_KEY5]] -> %[[LU5]]], {{\[}}%[[LU_KEY6]] -> %[[LU6]]], {{\[}}%[[LU_KEY7]] -> %[[LU7]]], {{\[}}%[[LU_KEY8]] -> %[[LU8]]], {{\[}}%[[LU_KEY9]] -> %[[LU9]]], {{\[}}%[[LU_KEY10]] -> %[[LU10]]], {{\[}}%[[LU_KEY11]] -> %[[LU11]]], {{\[}}%[[LU_KEY12]] -> %[[LU12]]], {{\[}}%[[LU_KEY13]] -> %[[LU13]]], {{\[}}%[[LU_KEY14]] -> %[[LU14]]], {{\[}}%[[LU_KEY15]] -> %[[LU15]]], {{\[}}%[[LU_KEY16]] -> %[[LU16]]], {{\[}}%[[LU_KEY17]] -> %[[LU17]]], {{\[}}%[[LU_KEY18]] -> %[[LU18]]], {{\[}}%[[LU_KEY19]] -> %[[LU19]]], {{\[}}%[[LU_KEY20]] -> %[[LU20]]], {{\[}}%[[LU_KEY21]] -> %[[LU21]]], {{\[}}%[[LU_KEY22]] -> %[[LU22]]], {{\[}}%[[LU_KEY23]] -> %[[LU23]]], {{\[}}%[[LU_KEY24]] -> %[[LU24]]], {{\[}}%[[LU_KEY25]] -> %[[LU25]]], {{\[}}%[[LU_KEY26]] -> %[[LU26]]], {{\[}}%[[LU_KEY27]] -> %[[LU27]]], {{\[}}%[[LU_KEY28]] -> %[[LU28]]], {{\[}}%[[LU_KEY29]] -> %[[LU29]]], {{\[}}%[[LU_KEY30]] -> %[[LU30]]], {{\[}}%[[LU_KEY31]] -> %[[LU31]]]):index
+// CHECK-NEXT:     %[[LU_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[LU_KEY1]] -> %[[LU1]]], {{\[}}%[[LU_KEY2]] -> %[[LU2]]], {{\[}}%[[LU_KEY3]] -> %[[LU3]]]):index
 // CHECK-NEXT:     %[[LU:.*]] = uniform.query_map(map:%[[LU_MAP]], key:%[[TILE]]) : index
 // CHECK-NEXT:     %[[SRC_KEY1:.*]] = arith.constant 1 : index
 // CHECK-NEXT:     %[[SRC_KEY2:.*]] = arith.constant 2 : index
 // CHECK-NEXT:     %[[SRC_KEY3:.*]] = arith.constant 3 : index
-// CHECK-NEXT:     %[[SRC_KEY4:.*]] = arith.constant 4 : index
-// CHECK-NEXT:     %[[SRC_KEY5:.*]] = arith.constant 5 : index
-// CHECK-NEXT:     %[[SRC_KEY6:.*]] = arith.constant 6 : index
-// CHECK-NEXT:     %[[SRC_KEY7:.*]] = arith.constant 7 : index
-// CHECK-NEXT:     %[[SRC_KEY8:.*]] = arith.constant 8 : index
-// CHECK-NEXT:     %[[SRC_KEY9:.*]] = arith.constant 9 : index
-// CHECK-NEXT:     %[[SRC_KEY10:.*]] = arith.constant 10 : index
-// CHECK-NEXT:     %[[SRC_KEY11:.*]] = arith.constant 11 : index
-// CHECK-NEXT:     %[[SRC_KEY12:.*]] = arith.constant 12 : index
-// CHECK-NEXT:     %[[SRC_KEY13:.*]] = arith.constant 13 : index
-// CHECK-NEXT:     %[[SRC_KEY14:.*]] = arith.constant 14 : index
-// CHECK-NEXT:     %[[SRC_KEY15:.*]] = arith.constant 15 : index
-// CHECK-NEXT:     %[[SRC_KEY16:.*]] = arith.constant 16 : index
-// CHECK-NEXT:     %[[SRC_KEY17:.*]] = arith.constant 17 : index
-// CHECK-NEXT:     %[[SRC_KEY18:.*]] = arith.constant 18 : index
-// CHECK-NEXT:     %[[SRC_KEY19:.*]] = arith.constant 19 : index
-// CHECK-NEXT:     %[[SRC_KEY20:.*]] = arith.constant 20 : index
-// CHECK-NEXT:     %[[SRC_KEY21:.*]] = arith.constant 21 : index
-// CHECK-NEXT:     %[[SRC_KEY22:.*]] = arith.constant 22 : index
-// CHECK-NEXT:     %[[SRC_KEY23:.*]] = arith.constant 23 : index
-// CHECK-NEXT:     %[[SRC_KEY24:.*]] = arith.constant 24 : index
-// CHECK-NEXT:     %[[SRC_KEY25:.*]] = arith.constant 25 : index
-// CHECK-NEXT:     %[[SRC_KEY26:.*]] = arith.constant 26 : index
-// CHECK-NEXT:     %[[SRC_KEY27:.*]] = arith.constant 27 : index
-// CHECK-NEXT:     %[[SRC_KEY28:.*]] = arith.constant 28 : index
-// CHECK-NEXT:     %[[SRC_KEY29:.*]] = arith.constant 29 : index
-// CHECK-NEXT:     %[[SRC_KEY30:.*]] = arith.constant 30 : index
-// CHECK-NEXT:     %[[SRC_KEY31:.*]] = arith.constant 31 : index
-// CHECK-NEXT:     %[[SRC_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[SRC_KEY1]] -> %[[SU0]]], {{\[}}%[[SRC_KEY2]] -> %[[SU0]]], {{\[}}%[[SRC_KEY3]] -> %[[SU0]]], {{\[}}%[[SRC_KEY4]] -> %[[SU1]]], {{\[}}%[[SRC_KEY5]] -> %[[SU1]]], {{\[}}%[[SRC_KEY6]] -> %[[SU1]]], {{\[}}%[[SRC_KEY7]] -> %[[SU1]]], {{\[}}%[[SRC_KEY8]] -> %[[SU2]]], {{\[}}%[[SRC_KEY9]] -> %[[SU2]]], {{\[}}%[[SRC_KEY10]] -> %[[SU2]]], {{\[}}%[[SRC_KEY11]] -> %[[SU2]]], {{\[}}%[[SRC_KEY12]] -> %[[SU3]]], {{\[}}%[[SRC_KEY13]] -> %[[SU3]]], {{\[}}%[[SRC_KEY14]] -> %[[SU3]]], {{\[}}%[[SRC_KEY15]] -> %[[SU3]]], {{\[}}%[[SRC_KEY16]] -> %[[SU4]]], {{\[}}%[[SRC_KEY17]] -> %[[SU4]]], {{\[}}%[[SRC_KEY18]] -> %[[SU4]]], {{\[}}%[[SRC_KEY19]] -> %[[SU4]]], {{\[}}%[[SRC_KEY20]] -> %[[SU5]]], {{\[}}%[[SRC_KEY21]] -> %[[SU5]]], {{\[}}%[[SRC_KEY22]] -> %[[SU5]]], {{\[}}%[[SRC_KEY23]] -> %[[SU5]]], {{\[}}%[[SRC_KEY24]] -> %[[SU6]]], {{\[}}%[[SRC_KEY25]] -> %[[SU6]]], {{\[}}%[[SRC_KEY26]] -> %[[SU6]]], {{\[}}%[[SRC_KEY27]] -> %[[SU6]]], {{\[}}%[[SRC_KEY28]] -> %[[SU7]]], {{\[}}%[[SRC_KEY29]] -> %[[SU7]]], {{\[}}%[[SRC_KEY30]] -> %[[SU7]]], {{\[}}%[[SRC_KEY31]] -> %[[SU7]]]):index
+// CHECK-NEXT:     %[[SRC_MAP:.*]] = uniform.def_immutable_mapping({{\[}}%[[SRC_KEY1]] -> %[[SU0]]], {{\[}}%[[SRC_KEY2]] -> %[[SU1]]], {{\[}}%[[SRC_KEY3]] -> %[[SU1]]]):index
 // CHECK-NEXT:     %[[SRC_SU:.*]] = uniform.query_map(map:%[[SRC_MAP]], key:%[[TILE]]) : index
 // CHECK-NEXT:     %[[C0:.*]] = arith.constant 0 : index
 // CHECK-NEXT:     %[[C128:.*]] = arith.constant 128 : index
@@ -179,24 +78,24 @@
 // CHECK-NEXT:       %[[CH:.*]] = ktdf.fifo.allocate() {dataflow_scheduler.groups = #[[$GROUP_DOMAIN]]} -> !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
 // CHECK-NEXT:       %[[TOKEN:.*]] = ktdf.create_token : !ktdf.token
 // CHECK-NEXT:       ktdf_lowering.execute_on %[[SU]] {
-// CHECK-NEXT:         %[[TO_GROUP:.*]] = ktdf_lowering.multicast_group %[[CH]] producer(%[[SU]]) {directions = [#dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>], group_ids = array<i32: 0, 1, 2, 3, 4, 5, 6, 7>, num_consumers = array<i32: 3, 4, 4, 4, 4, 4, 4, 4>, producers = array<i64: 0, 1, 2, 3, 4, 5, 6, 7>} : <"MNISU" -> "MNILU", 64xf16>
+// CHECK-NEXT:         %[[TO_GROUP:.*]] = ktdf_lowering.multicast_group %[[CH]] producer(%[[SU]]) {directions = [#dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>], group_ids = array<i32: 0, 1>, num_consumers = array<i32: 1, 2>, producers = array<i64: 0, 1>} : <"MNISU" -> "MNILU", 64xf16>
 // CHECK-NEXT:         ktdf.data_transfer from %[[SRC]]{{\[}}%[[C0]], %[[C0]]] size [64, 64] to %[[TO_GROUP]] size [64, 64] {dataflow_scheduler.throttle = 64 : i64} : memref<64x64xf16, "L1">, !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>
 // CHECK-NEXT:       }
 // CHECK-NEXT:       ktdf_lowering.execute_on %[[LU]] {
-// CHECK-NEXT:         %[[FROM_GROUP:.*]] = ktdf_lowering.multicast_group %[[CH]] producer(%[[SRC_SU]]) {directions = [#dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>, #dataflow<direction Clockwise>, #dataflow<direction Clockwise>, #dataflow<direction CounterClockwise>], group_ids = array<i32: 0, 1, 2, 3, 4, 5, 6, 7>, num_consumers = array<i32: 3, 4, 4, 4, 4, 4, 4, 4>, producers = array<i64: 0, 1, 2, 3, 4, 5, 6, 7>} : <"MNISU" -> "MNILU", 64xf16>
+// CHECK-NEXT:         %[[FROM_GROUP:.*]] = ktdf_lowering.multicast_group %[[CH]] producer(%[[SRC_SU]]) {directions = [#dataflow<direction CounterClockwise>, #dataflow<direction CounterClockwise>], group_ids = array<i32: 0, 1>, num_consumers = array<i32: 1, 2>, producers = array<i64: 0, 1>} : <"MNISU" -> "MNILU", 64xf16>
 // CHECK-NEXT:         ktdf.data_transfer from %[[FROM_GROUP]] size [64, 64] to %[[DST]]{{\[}}%[[C0]], %[[C0]]] size [64, 64] {dataflow_scheduler.throttle = 64 : i64} : !ktdf.fifo.slot<"MNISU" -> "MNILU", 64xf16>, memref<64x64xf16, "L1">
 // CHECK-NEXT:       }
 // CHECK-NEXT:     }
 // CHECK-NEXT:     return
 // CHECK-NEXT:   }
 
-#groups = affine_set<(g) : (g >= 0, 7 - g >= 0)>
+#groups = affine_set<(g) : (g >= 0, 1 - g >= 0)>
 #producers = affine_set<(c)[g] : (c - g == 0)>
-#consumers = affine_set<(c)[g] : (c - 4 * g >= 0, 4 * g + 3 - c >= 0)>
+#consumers = affine_set<(c)[g] : (c - 2 * g >= 0, 2 * g + 1 - c >= 0)>
 #set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
 module {
-  ktdf_arch.device @ring32_device import("../../../../Dialect/KTDFArch/ring32_device.mlir")
-  func.func @ring_broadcast() attributes {grid = [32]} {
+  ktdf_arch.device @ring_device import("../../../../Dialect/KTDFArch/ring_device.mlir")
+  func.func @ring_broadcast() attributes {grid = [4]} {
     %c0 = arith.constant 0 : index
     %c128 = arith.constant 128 : index
     %0 = ktdp.construct_memory_view %c0, sizes: [64, 64], strides: [64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<ct_local>} : memref<64x64xf16, #ktdp.memory_space<ct_local>>
