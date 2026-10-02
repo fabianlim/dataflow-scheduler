@@ -61,6 +61,14 @@ mlir::Value createQueryMapForComponent(
     mlir::OpBuilder& builder, mlir::dataflow::ProgramUnitOp program_unit,
     const llvm::SmallVector<mlir::Value, 4>& target_units, mlir::Location loc);
 
+/// Gets the region of the uniform.uniformize_regions around @p op that holds
+/// @p op, or nullptr if @p op is not in one.
+mlir::Region* getUnitRegion(mlir::Operation* op);
+
+/// Gets the unit that the uniform.uniformize_regions region around @p op is
+/// for, or nullptr if @p op is not in a region for one unit.
+mlir::dataflow::GetUnitOp getRegionUnit(mlir::Operation* op);
+
 /// For the given program_unit, replace every in-region use of a single-result
 /// ktdp.get_compute_tile_id with a uniform.query_map over a core map (keys =
 /// the unit's operands, values = each operand get_unit's flat 'core' id),
@@ -70,10 +78,6 @@ mlir::Value createQueryMapForComponent(
 /// `const_builder`'s position (function scope, before the units) on first need.
 /// Returns failure if an operand is not a dataflow.get_unit or lacks a 'core'
 /// attribute.
-/// Gets the unit that the uniform.uniformize_regions region around @p op is
-/// for, or nullptr if @p op is not in a region for one unit.
-mlir::dataflow::GetUnitOp getRegionUnit(mlir::Operation* op);
-
 mlir::LogicalResult replaceComputeTileIdWithCoreQuery(
     mlir::dataflow::ProgramUnitOp program_unit,
     llvm::DenseMap<int64_t, mlir::Value>& core_id_consts,

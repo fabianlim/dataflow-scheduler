@@ -159,7 +159,7 @@ mlir::Value scheduler::createQueryMapForComponent(
   return query_op.getResult();
 }
 
-mlir::dataflow::GetUnitOp scheduler::getRegionUnit(mlir::Operation* op) {
+mlir::Region* scheduler::getUnitRegion(mlir::Operation* op) {
   auto regions_op = op->getParentOfType<mlir::uniform::UniformizeRegionsOp>();
   if (!regions_op) return nullptr;
 
@@ -167,8 +167,16 @@ mlir::dataflow::GetUnitOp scheduler::getRegionUnit(mlir::Operation* op) {
   while (region->getParentOp() != regions_op) {
     region = region->getParentOp()->getParentRegion();
   }
+  return region;
+}
+
+mlir::dataflow::GetUnitOp scheduler::getRegionUnit(mlir::Operation* op) {
+  mlir::Region* region = getUnitRegion(op);
+  if (!region) return nullptr;
+
   mlir::ValueRange units =
-      regions_op.getRegionUnitList(region->getRegionNumber());
+      llvm::cast<mlir::uniform::UniformizeRegionsOp>(region->getParentOp())
+          .getRegionUnitList(region->getRegionNumber());
   if (units.size() != 1) return nullptr;
   return units.front().getDefiningOp<mlir::dataflow::GetUnitOp>();
 }

@@ -224,11 +224,15 @@ struct MulticastGroup {
   mlir::dataflow::DataflowRoutingDirectionAttr direction;
 };
 
-/// Create the dataflow.create_multicast_group of `group_op` in the
+/// Get the dataflow.create_multicast_group of `group_op` in the
 /// uniform.uniformize_regions region of one unit around it. The producer
 /// operand, a table keyed by tile, resolves to its entry for that unit's
 /// core, and the attributes are the entry of that producer. A group starts
 /// with no outstanding requests (`count = 0`).
+///
+/// The producer and the attributes are the same throughout the region, so the
+/// region creates each group once, at its top, before any loop, and every
+/// transfer through the group in the region uses that one.
 mlir::FailureOr<MulticastGroup> createMulticastGroup(
     mlir::PatternRewriter& rewriter,
     mlir::ktdf_lowering::MulticastGroupOp group_op) {
@@ -258,16 +262,26 @@ mlir::FailureOr<MulticastGroup> createMulticastGroup(
            << "tile " << producer_core;
   }
   const size_t index = entry - producers.begin();
+  const uint32_t num_consumers = group_op.getNumConsumers()[index];
+  const uint32_t group_id = group_op.getGroupIds()[index];
+  const auto direction =
+      llvm::cast<mlir::dataflow::DataflowRoutingDirectionAttr>(
+          group_op.getDirections()[index]);
 
+  mlir::Block& top = getUnitRegion(group_op)->front();
+  for (auto group : top.getOps<mlir::dataflow::CreateMulticastGroupOp>()) {
+    if (group.getProducer() == producer && group.getConsumers().empty() &&
+        group.getNumConsumers() == num_consumers &&
+        group.getGroupId() == group_id && group.getCount() == 0) {
+      return MulticastGroup{group, direction};
+    }
+  }
   mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPoint(group_op);
+  rewriter.setInsertionPointToStart(&top);
   auto group = mlir::dataflow::CreateMulticastGroupOp::create(
       rewriter, group_op.getLoc(), rewriter.getIndexType(), producer,
-      /*consumers=*/mlir::ValueRange(), group_op.getNumConsumers()[index],
-      group_op.getGroupIds()[index], /*count=*/0);
-  return MulticastGroup{
-      group, llvm::cast<mlir::dataflow::DataflowRoutingDirectionAttr>(
-                 group_op.getDirections()[index])};
+      /*consumers=*/mlir::ValueRange(), num_consumers, group_id, /*count=*/0);
+  return MulticastGroup{group, direction};
 }
 
 /// Emit a self-sync (dataflow.sync_send) before `indirect_transfer`, hoisted as

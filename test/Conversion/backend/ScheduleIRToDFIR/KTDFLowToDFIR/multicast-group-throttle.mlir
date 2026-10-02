@@ -28,8 +28,8 @@
 // CHECK-NEXT:       %[[SU_MEM:.*]] = uniform.query_map(map:%[[SU_MEM_MAP]], key:%[[PU_SU]]) : index
 // CHECK-NEXT:       uniform.uniformize_regions -> () {
 // CHECK-NEXT:         (%{{.*}} -> %[[SU0]]){
-// CHECK-NEXT:           %[[SRC:.*]] = dataflow.get_logical_memory_view %[[SU_MEM]], %[[C0]] {layout_map = #[[$LAYOUT]]} : index, index, memref<64x64xf16>
 // CHECK-NEXT:           %[[GROUP:.*]] = dataflow.create_multicast_group(%[[SU0]] -> ()) {count = 0 : i32, group_id = 0 : i32, num_consumers = 1 : i32} : index
+// CHECK-NEXT:           %[[SRC:.*]] = dataflow.get_logical_memory_view %[[SU_MEM]], %[[C0]] {layout_map = #[[$LAYOUT]]} : index, index, memref<64x64xf16>
 // CHECK-NEXT:           agen.composite_load %[[SRC]]{{\[}}%[[C0]], %[[C0]]]
 // CHECK-NEXT:            time_symbols()(%[[LOADED:.*]]:vector<64xf16>)
 // CHECK-NEXT:            {load_order = #[[$ORDER]], load_set = #[[$STICK]], time_addr_map = #[[$NEXT_ROW]], time_order = #[[$TIME_ORDER]], time_set = #[[$ROWS]]}
@@ -48,8 +48,8 @@
 // CHECK-NEXT:       %[[LU_MEM:.*]] = uniform.query_map(map:%[[LU_MEM_MAP]], key:%[[PU_LU]]) : index
 // CHECK-NEXT:       uniform.uniformize_regions -> () {
 // CHECK-NEXT:         (%{{.*}} -> %[[LU1]]){
-// CHECK-NEXT:           %[[DST:.*]] = dataflow.get_logical_memory_view %[[LU_MEM]], %[[C4096]] {layout_map = #[[$LAYOUT]]} : index, index, memref<64x64xf16>
 // CHECK-NEXT:           %[[JOIN:.*]] = dataflow.create_multicast_group(%[[SU0]] -> ()) {count = 0 : i32, group_id = 0 : i32, num_consumers = 1 : i32} : index
+// CHECK-NEXT:           %[[DST:.*]] = dataflow.get_logical_memory_view %[[LU_MEM]], %[[C4096]] {layout_map = #[[$LAYOUT]]} : index, index, memref<64x64xf16>
 // CHECK-NEXT:           agen.composite_store %[[DST]]{{\[}}%[[C0]], %[[C0]]]
 // CHECK-NEXT:            time_symbols()
 // CHECK-NEXT:            {store_order = #[[$ORDER]], store_set = #[[$STICK]], time_addr_map = #[[$NEXT_ROW]], time_order = #[[$TIME_ORDER]], time_set = #[[$ROWS]]}
