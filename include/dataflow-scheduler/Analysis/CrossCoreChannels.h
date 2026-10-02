@@ -45,7 +45,8 @@
 // grid. The analysis resolves the groups of a channel from its group domain
 // and its two stage domains, and derives from them the tiles of each stage,
 // the ring consumers, the producer of each consumer and the self-deliveries,
-// and gives the direction around the ring each producer sends in.
+// and reads from the device the direction around the ring each producer
+// sends in.
 //
 //===----------------------------------------------------------------------===//
 
@@ -63,6 +64,8 @@
 #include <mlir/IR/IntegerSet.h>
 #include <mlir/IR/Value.h>
 #include <mlir/Support/LLVM.h>
+
+#include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 
 namespace scheduler {
 
@@ -166,20 +169,28 @@ auto getSelfDeliveries(llvm::ArrayRef<ChannelGroup> groups)
 /// A direction around the ring.
 enum class RingDirection { kClockwise, kCounterClockwise };
 
+/// Name of the discardable attribute of a `ktdf_arch.device` that gives the
+/// direction around the ring each core sends in as a producer: an array of
+/// the strings "cw" and "ccw", whose entry k is for core k, the index into
+/// the grid.
+///
+/// The direction is a routing choice, not a property of the hardware. It is
+/// stored in the device as a v0 shortcut, until it is inferred from the
+/// physical order of the ring stops, from the port-level ring graph where
+/// each stop and each direction are separate (for instance, the direction
+/// whose farthest consumer is closest).
+inline constexpr llvm::StringLiteral kRingDirectionsAttrName =
+    "dataflow_scheduler.ring_directions";
+
 /// Gets the direction around the ring in which the producer tile @p producer
-/// sends to the consumers of its group.
+/// sends to the consumers of its group, from the ring directions of
+/// @p device.
 ///
-/// Temporary: these are the directions of the reference DFIR of the
-/// broadcast relayout, for its producers 0..7. They do not follow from the
-/// ring as the device wires it today, with the ring stops in core order, so
-/// the physical ring order must differ. Once the device has the physical ring
-/// order, the direction is to be inferred from the port-level ring graph,
-/// where each stop and each direction are separate (for instance, the
-/// direction whose farthest consumer is closest).
-///
-/// @retval std::nullopt No direction is known for @p producer.
+/// @retval std::nullopt @p device has no ring directions, or none for
+///                      @p producer, or an unknown one.
 [[nodiscard]]
-auto getRingDirection(int64_t producer) -> std::optional<RingDirection>;
+auto getRingDirection(const mlir::ktdf_arch::Device& device, int64_t producer)
+    -> std::optional<RingDirection>;
 
 }  // namespace scheduler
 

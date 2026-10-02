@@ -15,6 +15,10 @@
 // eject}). Injected traffic leaves in either direction but never ejects
 // locally, and nothing turns around.
 //
+// The device gives the direction each core sends in around the ring as a
+// producer, entry K for core K: a routing choice that stands in for one
+// inferred from the physical order of the ring stops.
+//
 // The corelet group has a kind, like the core group, so that views that
 // flatten groups by kind (the routing graph) treat every corelet as an
 // instance of one class rather than as a distinct group of its own.
@@ -128,7 +132,9 @@
 }
 #RING_CW = { kind = "RING_CW" }
 #RING_CCW = { kind = "RING_CCW" }
-ktdf_arch.device @ring_device {
+ktdf_arch.device @ring_device attributes {
+  dataflow_scheduler.ring_directions = ["ccw", "ccw", "cw", "ccw"]
+} {
   %ddr = memory #DDR
 
   // Core 0.

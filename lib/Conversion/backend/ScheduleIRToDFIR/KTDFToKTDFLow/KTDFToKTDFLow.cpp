@@ -305,10 +305,12 @@ static void addScfForPipelineBackEdges(
 // the group, and the stage uses it in place of the fifo. The producer names
 // its own unit, a consumer the producer unit that feeds its tile. Both carry
 // the groups as the same per-producer attributes: the group id g, the number
-// of ring consumers of the group, and the direction the producer sends in.
+// of ring consumers of the group, and the direction the producer sends in,
+// which the device gives.
 // ---------------------------------------------------------------------------
 static mlir::LogicalResult createMulticastGroups(
-    const CrossCoreChannelMap& channels, const StageToUnitsMap& stage_to_units,
+    const mlir::ktdf_arch::Device& device, const CrossCoreChannelMap& channels,
+    const StageToUnitsMap& stage_to_units,
     const QueriedUnitsMap& queried_units) {
   for (const auto& entry : channels) {
     mlir::Value fifo = entry.first;
@@ -327,11 +329,11 @@ static mlir::LogicalResult createMulticastGroups(
           *llvm::find_if(channel.groups, [&](const ChannelGroup& group) {
             return llvm::is_contained(group.producers, producer);
           });
-      const auto direction = getRingDirection(producer);
+      const auto direction = getRingDirection(device, producer);
       if (!direction) {
         return producer_stage.emitError()
-               << "no ring direction is known for the producer tile "
-               << producer << " of the cross-core fifo this stage writes";
+               << "the device gives no ring direction for core " << producer
+               << ", a producer of the cross-core fifo this stage writes";
       }
       group_ids.push_back(static_cast<int32_t>(group.id));
       num_consumers.push_back(
@@ -559,8 +561,8 @@ struct KTDFToKTDFLoweringPass
 
       // Step 8b: Make the multicast group of each cross-core fifo explicit
       // in the stages that write and read it.
-      if (mlir::failed(
-              createMulticastGroups(channels, stage_to_units, queried_units))) {
+      if (mlir::failed(createMulticastGroups(*device, channels, stage_to_units,
+                                             queried_units))) {
         return signalPassFailure();
       }
 

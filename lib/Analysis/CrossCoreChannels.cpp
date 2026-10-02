@@ -18,11 +18,11 @@
 
 #include "dataflow-scheduler/Analysis/CrossCoreChannels.h"
 
-#include <array>
 #include <string>
 
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/STLExtras.h>
+#include <llvm/ADT/StringSwitch.h>
 #include <llvm/Support/raw_ostream.h>
 #include <mlir/Analysis/Presburger/IntegerRelation.h>
 #include <mlir/Dialect/Affine/Analysis/AffineStructures.h>
@@ -305,16 +305,19 @@ auto scheduler::getSelfDeliveries(llvm::ArrayRef<ChannelGroup> groups)
   });
 }
 
-auto scheduler::getRingDirection(int64_t producer)
+auto scheduler::getRingDirection(const mlir::ktdf_arch::Device& device,
+                                 int64_t producer)
     -> std::optional<RingDirection> {
-  // The directions of the reference DFIR, by producer tile.
-  constexpr auto kCW = RingDirection::kClockwise;
-  constexpr auto kCCW = RingDirection::kCounterClockwise;
-  constexpr std::array kReferenceDirections = {kCCW, kCCW, kCW, kCCW,
-                                               kCCW, kCW,  kCW, kCCW};
-  if (producer < 0 ||
-      producer >= static_cast<int64_t>(kReferenceDirections.size())) {
+  auto directions =
+      device.getAttrOfType<mlir::ArrayAttr>(kRingDirectionsAttrName);
+  if (!directions || producer < 0 ||
+      producer >= static_cast<int64_t>(directions.size())) {
     return std::nullopt;
   }
-  return kReferenceDirections[producer];
+  auto direction = llvm::dyn_cast<mlir::StringAttr>(directions[producer]);
+  if (!direction) return std::nullopt;
+  return llvm::StringSwitch<std::optional<RingDirection>>(direction.getValue())
+      .Case("cw", RingDirection::kClockwise)
+      .Case("ccw", RingDirection::kCounterClockwise)
+      .Default(std::nullopt);
 }
