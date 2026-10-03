@@ -1021,8 +1021,13 @@ static void rewriteTransferShape(
   op.erase();
 }
 
-/// Replaces ts.transfer with a new DataTransferOp sized [1,1,1,1] with
-/// transfer_mode set to `mode` ("splat") or empty for FIFO→memref.
+/// Replaces ts.transfer with a new DataTransferOp whose memref side is sized
+/// [1,1,1,1] and whose FIFO side keeps its slot size [E], with transfer_mode
+/// set to `mode`:
+///   - memref→FIFO, "splat": one element is read and broadcast across the
+///     slot.
+///   - FIFO→memref, "lane0": the slot carries a full vector and its lane 0 is
+///     written as the one element at the destination indices.
 /// The two innermost indices on any ct_local memref operand are replaced with
 /// the row and column IVs from the nested scf.for loops inserted by
 /// insertLoopAroundPipeline, giving direct [0, 0, %row, %col] addressing.
@@ -1036,14 +1041,14 @@ static void rewriteTransferShrink(
 
   mlir::OpFoldResult one = mlir::IntegerAttr::get(mlir::IndexType::get(ctx), 1);
 
-  // Splat: 1 source element broadcast to fill the FIFO (E elements).
-  // Collapse the source to [1,1,1,1] — one scalar element —
-  // and keep the FIFO destination at its natural size [E] so the hardware
-  // knows to broadcast that scalar across the full slot.
+  // Collapse the memref side to [1,1,1,1], one element, and keep the FIFO side
+  // at its slot size [E].
   auto new_src_sizes = op.getMixedSourceSizes();
   auto new_dst_sizes = op.getMixedDestSizes();
-  for (auto& s : new_src_sizes) s = one;
-  // Leave new_dst_sizes unchanged — the FIFO slot size is already correct.
+  if (op.isSourceMemRef())
+    for (auto& s : new_src_sizes) s = one;
+  if (op.isDestMemRef())
+    for (auto& s : new_dst_sizes) s = one;
 
   // Find the two loop IVs inserted by insertLoopAroundPipeline. Walking out
   // past the enclosing ktdf.pipeline(s) we expect to hit the inner scf.for
@@ -1123,9 +1128,8 @@ static void rewriteTransferShrink(
   for (mlir::NamedAttribute attr : op->getDiscardableAttrs())
     new_op->setDiscardableAttr(attr.getName(), attr.getValue());
 
-  if (!mode.empty())
-    new_op->setDiscardableAttr(mlir::StringAttr::get(ctx, "transfer_mode"),
-                               mlir::StringAttr::get(ctx, mode));
+  new_op->setDiscardableAttr(mlir::StringAttr::get(ctx, "transfer_mode"),
+                             mlir::StringAttr::get(ctx, mode));
 
   LDBG(1) << "  rewriteTransferShrink(" << mode << "): shrunk dim "
           << pa.align_dim << " to 1: " << new_op;
@@ -1169,8 +1173,8 @@ static void insertLoopAroundPipeline(
 
 /// Applies corrective rewrites to the PipelineAnalysis tree: inserts a loop
 /// around nested pipelines, then for each leaf stage adjusts the loop bound
-/// and rewrites every transfer shape (illegal/displaced → widen; FIFO →
-/// splat shrink).
+/// and rewrites every transfer shape (illegal/displaced → widen; memref→FIFO
+/// → splat shrink; FIFO→memref → lane0 shrink).
 static mlir::LogicalResult fixPipeline(
     DataTransferLegality& legality, DataTransferLegality::PipelineAnalysis& pa,
     const mlir::ktdf_arch::ResourceKinds& resource_kinds,
@@ -1221,7 +1225,7 @@ static mlir::LogicalResult fixPipeline(
         if (ts.needs_splat) {
           rewriteTransferShrink(ts, pa, memory_tree, "splat", builder);
         } else if (ts.transfer.isSourceFifo() && ts.transfer.isDestMemRef()) {
-          rewriteTransferShrink(ts, pa, memory_tree, "", builder);
+          rewriteTransferShrink(ts, pa, memory_tree, "lane0", builder);
         }
       }
     }
