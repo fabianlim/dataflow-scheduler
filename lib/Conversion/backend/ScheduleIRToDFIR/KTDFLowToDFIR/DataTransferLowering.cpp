@@ -676,13 +676,16 @@ struct LowerDataTransferPattern
     // For splat/pad transfers the source is smaller than the destination —
     // the hardware replicates or zero-pads to fill the vector. Skip the
     // equality check and use the destination size as the transfer width.
-    auto transfer_mode_attr =
-        data_transfer_op->getDiscardableAttr("transfer_mode");
+    // For lane0 transfers the destination is one element: the sender fills the
+    // full FIFO slot and only its lane 0 is received and stored, so the source
+    // size is the transfer width.
+    auto transfer_mode_attr = llvm::dyn_cast_if_present<mlir::StringAttr>(
+        data_transfer_op->getDiscardableAttr("transfer_mode"));
+    llvm::StringRef transfer_mode =
+        transfer_mode_attr ? transfer_mode_attr.getValue() : "";
     bool is_broadcast_transfer =
-        transfer_mode_attr &&
-        (llvm::cast<mlir::StringAttr>(transfer_mode_attr).getValue() ==
-             "splat" ||
-         llvm::cast<mlir::StringAttr>(transfer_mode_attr).getValue() == "pad");
+        transfer_mode == "splat" || transfer_mode == "pad";
+    bool is_lane0_transfer = transfer_mode == "lane0";
 
     if (is_broadcast_transfer) {
       if (src_total_elements > dst_total_elements) {
@@ -693,7 +696,21 @@ struct LowerDataTransferPattern
       }
     }
 
-    int64_t total_elements = dst_total_elements;
+    if (is_lane0_transfer) {
+      if (!src_is_fifo || dst_is_fifo) {
+        data_transfer_op.emitError(
+            "lane0 transfer must be from a FIFO slot to a memref");
+        return mlir::failure();
+      }
+      if (dst_total_elements != 1) {
+        data_transfer_op.emitError(
+            "lane0 transfer must have a one-element destination");
+        return mlir::failure();
+      }
+    }
+
+    int64_t total_elements =
+        is_lane0_transfer ? src_total_elements : dst_total_elements;
 
     // Get element type (from memref or FIFO slot)
     mlir::Type elem_type;
@@ -766,7 +783,8 @@ struct LowerDataTransferPattern
             llvm::cast<mlir::ktdf::FifoSlotType>(src.getType());
         return lowerAsReceiveAndStore(rewriter, data_transfer_op, dst_memref,
                                       dst_indices, dst_static_sizes, num_dims,
-                                      vector_type, dst_map, src_fifo_slot_type);
+                                      vector_type, dst_map, src_fifo_slot_type,
+                                      is_lane0_transfer, dst_total_elements);
       }
     }
 
@@ -1025,13 +1043,16 @@ struct LowerDataTransferPattern
     return mlir::success();
   }
 
-  /// Lower as receive and vector_store (FIFO to L1)
+  /// Lower as receive and vector_store (FIFO to L1). When is_lane0, only the
+  /// leading dst_total_elements lanes are received, and they are stored at the
+  /// destination indices.
   mlir::LogicalResult lowerAsReceiveAndStore(
       mlir::PatternRewriter& rewriter,
       mlir::ktdf::DataTransferOp data_transfer_op, mlir::Value dst_memref,
       mlir::ValueRange dst_indices, llvm::ArrayRef<int64_t> dst_static_sizes,
       unsigned num_dims, mlir::VectorType vector_type, mlir::AffineMap dst_map,
-      mlir::ktdf::FifoSlotType src_fifo_slot_type) const {
+      mlir::ktdf::FifoSlotType src_fifo_slot_type, bool is_lane0,
+      int64_t dst_total_elements) const {
     // Build store_set from destination sizes
     auto store_set =
         buildIntegerSetFromSizes(rewriter.getContext(), dst_static_sizes);
@@ -1057,9 +1078,15 @@ struct LowerDataTransferPattern
     }
     mlir::Value src_unit = *src_unit_result;
 
-    // Create dataflow.receive operation
+    // Create dataflow.receive operation. For lane0 the receive is only as wide
+    // as the destination: the narrow receive type is what selects the masked
+    // store of the leading lanes.
+    mlir::VectorType receive_type =
+        is_lane0 ? mlir::VectorType::get({dst_total_elements},
+                                         vector_type.getElementType())
+                 : vector_type;
     auto receive_op = mlir::dataflow::ReceiveOp::create(
-        rewriter, data_transfer_op.getLoc(), vector_type, src_unit,
+        rewriter, data_transfer_op.getLoc(), receive_type, src_unit,
         /*dbgName=*/nullptr);
 
     // Create vector_store operation
