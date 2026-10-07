@@ -39,6 +39,7 @@
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchDialect.h"  // IWYU pragma: keep
+#include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchInterfaces.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Transforms/ApplyPatterns.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Transforms/Passes.h"
@@ -302,6 +303,32 @@ class PatternCache : public mlir::ktdf_arch::PatternCache {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PatternCache)
 };
 
+// Keeps the mapping a pattern gave a constant when folding drops the constant.
+//
+// Folding hoists every constant to the entry of its region and keeps one per
+// value, so a constant a rewrite creates is replaced by one already hoisted
+// there whenever the values match -- the literal a kernel compares against,
+// say. The mapping is not part of what makes them the same, so it would go
+// with the one erased, and the register it asks for along with it.
+struct KeepConstantMappings : mlir::RewriterBase::Listener {
+  void notifyOperationReplaced(mlir::Operation* op,
+                               mlir::ValueRange replacement) override {
+    if (!mlir::isa<mlir::arith::ConstantOp>(op) || replacement.size() != 1) {
+      return;
+    }
+    const auto maps_to =
+        mlir::ktdf_arch::getProperty<mlir::ktdf_arch::MapsToAttr>(op);
+    if (!maps_to) return;
+
+    auto hoisted = replacement.front().getDefiningOp<mlir::arith::ConstantOp>();
+    if (!hoisted ||
+        mlir::ktdf_arch::getProperty<mlir::ktdf_arch::MapsToAttr>(hoisted)) {
+      return;
+    }
+    mlir::ktdf_arch::setProperty(hoisted, maps_to);
+  }
+};
+
 struct ApplyDevicePatternsPass
     : impl::ApplyDevicePatternsPassBase<ApplyDevicePatternsPass> {
   using ApplyDevicePatternsPassBase::ApplyDevicePatternsPassBase;
@@ -330,8 +357,11 @@ struct ApplyDevicePatternsPass
 
     // Run all the patterns.
     auto changed = false;
-    if (failed(applyPatternsGreedily(getOperation(), patterns,
-                                     mlir::GreedyRewriteConfig(), &changed))) {
+    KeepConstantMappings keep_mappings;
+    if (failed(applyPatternsGreedily(
+            getOperation(), patterns,
+            mlir::GreedyRewriteConfig().setListener(&keep_mappings),
+            &changed))) {
       signalPassFailure();
       return;
     }

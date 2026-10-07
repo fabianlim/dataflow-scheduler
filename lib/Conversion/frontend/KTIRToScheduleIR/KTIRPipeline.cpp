@@ -115,17 +115,6 @@ struct KTIRPipelinePass : public impl::KTIRPipelinePassBase<KTIRPipelinePass> {
 };
 
 template <class OpType>
-[[nodiscard]] auto getUserOfType(mlir::Value value) -> OpType {
-  for (auto* user : value.getUsers()) {
-    if (auto typed = llvm::dyn_cast<OpType>(user); typed) {
-      return typed;
-    }
-  }
-
-  return nullptr;
-}
-
-template <class OpType>
 [[nodiscard]] auto getSingleUserOfType(mlir::Value value) -> OpType {
   auto* const use = getSingleUse(value);
   return use ? mlir::dyn_cast<OpType>(use->getOwner()) : nullptr;

@@ -28,6 +28,7 @@
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchDialect.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
+#include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/Process.h"
@@ -98,6 +99,9 @@ auto getDeviceName(const std::filesystem::path& path) -> StringRef {
   // A device's patterns may match an attribute the scheduler's own ops carry,
   // such as #ktdf.splat<...>, which is only an attribute here if ktdf is too.
   registry.insert<ktdf::KTDFDialect>();
+  // Likewise a pattern may match an attribute a spyreop op carries, such as
+  // #spyreop.compare_predicate<...>.
+  registry.insert<mlir::spyreop::SpyreOpDialect>();
   MLIRContext context(registry);
 
   std::string error_message;
