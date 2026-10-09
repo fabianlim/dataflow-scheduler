@@ -1779,6 +1779,15 @@ static mlir::LogicalResult retypeFifosBetweenOriginalStages(
         TransferSide& fifo_side = transfer->side(/*source_side=*/is_consumer);
         fifo_side.resource = fifo_spec;
         fifo_side.slot_index = slot.slot_idx;
+        // A data_transfer's FIFO side is sized by the slot it moves, flat, as
+        // on every hop stage: the input IR sizes it like the tile, and later
+        // passes (e.g. reduction-loop-exposure) divide a FIFO-side size as an
+        // element count.
+        if (mlir::isa<mlir::ktdf::DataTransferOp>(endpoint.op)) {
+          mlir::Builder b(endpoint.op->getContext());
+          fifo_side.sizes = {
+              b.getI64IntegerAttr(fifo_spec->elements_per_slot[slot.slot_idx])};
+        }
 
         // The materializer only rewrites read_from_fifo / write_to_fifo in
         // kAdaptFifoKinds stages; DataTransferOps are rewritten in either
