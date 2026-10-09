@@ -67,6 +67,13 @@ class MemoryTracker {
   /// @param memory_resources The memory resources to make available again
   void reset(llvm::ArrayRef<ResourceType> memory_resources);
 
+  /// @brief Keeps addresses below \p address of a memory resource out of
+  /// allocate's reach, now and after every reset
+  /// @param memory_resource The memory resource attribute (e.g., L1)
+  /// @param address First address allocate may hand out from now on
+  /// @return An error if \p address exceeds the resource's capacity
+  llvm::Error reserveBelow(ResourceType memory_resource, size_t address);
+
  private:
   /// Memory resource capacities (total bytes per resource)
   llvm::DenseMap<ResourceType, size_t> capacities_;
