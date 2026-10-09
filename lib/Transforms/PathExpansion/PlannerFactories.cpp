@@ -242,6 +242,50 @@ TransferMaterializationInfo* TransferInfoFactory::createFromTemplateWithBuffer(
   return result;
 }
 
+TransferMaterializationInfo* TransferInfoFactory::createFromTemplateWithFifo(
+    mlir::Operation* template_op,
+    const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,
+    ResourceType fifo_resource, ResourceType current_resource,
+    bool fifo_is_source, const PrivateResourceSpec* fifo_spec,
+    size_t slot_index, mlir::MLIRContext* context) {
+  assert(mlir::isa<mlir::ktdf::DataTransferOp>(template_op) &&
+         "template_op must be a DataTransferOp");
+  assert(fifo_spec && fifo_spec->kind == PrivateResourceSpec::Kind::kFifo &&
+         "fifo_spec must be a FIFO");
+
+  auto sides = extractTemplateSides(template_op);
+
+  auto transfer = std::make_unique<TransferMaterializationInfo>();
+  transfer->template_op = template_op;
+  transfer->hop = edge;
+  transfer->source_resource = fifo_is_source ? fifo_resource : current_resource;
+  transfer->dest_resource = fifo_is_source ? current_resource : fifo_resource;
+
+  // The FIFO side has no indices and no map; its size is the flat slot
+  // capacity. The memory side is copied from the template.
+  if (fifo_is_source) {
+    transfer->source_private_resource = fifo_spec;
+    transfer->source_slot_index = slot_index;
+    deriveSizesFromResourceSpec(fifo_spec, slot_index, context,
+                                transfer->source_sizes);
+    transfer->dest_indices = sides.dst_indices;
+    transfer->dest_sizes = sides.dst_sizes;
+    transfer->dest_map = sides.dst_map;
+  } else {
+    transfer->source_indices = sides.src_indices;
+    transfer->source_sizes = sides.src_sizes;
+    transfer->source_map = sides.src_map;
+    transfer->dest_private_resource = fifo_spec;
+    transfer->dest_slot_index = slot_index;
+    deriveSizesFromResourceSpec(fifo_spec, slot_index, context,
+                                transfer->dest_sizes);
+  }
+
+  TransferMaterializationInfo* result = transfer.get();
+  transfers_.push_back(std::move(transfer));
+  return result;
+}
+
 TransferMaterializationInfo* TransferInfoFactory::createFromFifoOp(
     mlir::Operation* fifo_op,
     const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,

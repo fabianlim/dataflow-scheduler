@@ -739,9 +739,13 @@ static llvm::FailureOr<llvm::SmallVector<StageNode*>> buildExpandedStageList(
 //===----------------------------------------------------------------------===//
 
 /// Step 2: Walk the expanded stage list; for each original stage that is
-/// adjacent to at least one intermediate (synthetic) stage, determine its
-/// materialization kind and create PrivateResourceSpec objects:
-///   - Transfer stages (kAdaptTransfer): memref ↔ intermediate buffer
+/// adjacent to at least one intermediate (synthetic) stage, or to a transfer
+/// stage given a unit FIFO, determine its materialization kind and create
+/// PrivateResourceSpec objects:
+///   - Transfer stages (kAdaptTransfer): memref ↔ intermediate buffer, or
+///     memref ↔ unit FIFO when the FIFO names the stage's memory and faces the
+///     compute stage directly (one load/store unit on the route, e.g.
+///     SFU -> L1SU -> L1, so no intermediate stage is inserted)
 ///   - Compute stages (kAdaptFifoKinds): read_from_fifo / write_to_fifo
 static mlir::LogicalResult classifyOriginalStages(
     llvm::ArrayRef<StageNode*> expanded_stages,
@@ -750,6 +754,122 @@ static mlir::LogicalResult classifyOriginalStages(
   using FifoKey = std::pair<mlir::Attribute, mlir::Attribute>;
   llvm::DenseMap<FifoKey, PrivateResourceSpec*> fifo_specs;
   llvm::DenseMap<FifoKey, size_t> fifo_next_slot;
+  // Spec and slot assigned to each original FIFO value, so that both ends of a
+  // FIFO between a transfer stage and the compute stage use the same slot.
+  using FifoSlot = std::pair<PrivateResourceSpec*, size_t>;
+  llvm::DenseMap<mlir::Value, FifoSlot> fifo_slots;
+
+  auto assignFifoSlot = [&](mlir::Value orig_fifo, ResourceType fifo_src,
+                            ResourceType fifo_dest) -> FifoSlot {
+    auto it = fifo_slots.find(orig_fifo);
+    if (it != fifo_slots.end()) {
+      assert(it->second.first->fifo_src == fifo_src &&
+             it->second.first->fifo_dest == fifo_dest &&
+             "Both ends of a FIFO must agree on its endpoints");
+      return it->second;
+    }
+
+    auto fifo_slot_type =
+        mlir::cast<mlir::ktdf::FifoSlotType>(orig_fifo.getType());
+    mlir::Type element_type = fifo_slot_type.getElementType();
+    assert(!fifo_slot_type.isDynamicNumElements() &&
+           "Dynamic FIFO sizes not supported in path expansion");
+    int64_t num_elements = fifo_slot_type.getStaticNumElements();
+
+    FifoKey fifo_key = {fifo_src, fifo_dest};
+    if (fifo_specs.find(fifo_key) == fifo_specs.end()) {
+      PrivateResourceSpec* spec = plan->resource_factory.createFifo(
+          fifo_src, fifo_dest, {num_elements}, element_type);
+      fifo_specs[fifo_key] = spec;
+      fifo_next_slot[fifo_key] = 0;
+    } else {
+      fifo_specs[fifo_key]->elements_per_slot.push_back(num_elements);
+    }
+
+    size_t slot_idx = fifo_next_slot[fifo_key]++;
+    validateFifoSlotIndex(orig_fifo, slot_idx, fifo_specs[fifo_key]);
+
+    FifoSlot slot = {fifo_specs[fifo_key], slot_idx};
+    fifo_slots[orig_fifo] = slot;
+    return slot;
+  };
+
+  // --- Transfer stage (kAdaptTransfer): memref ↔ unit FIFO ---
+  // The frontend names the memory a transfer stage moves to or from on its
+  // FIFO (e.g. "SFU" -> "L1"). When the other end of that FIFO is the compute
+  // stage itself, no intermediate stage takes over the memory side, so the
+  // FIFO is retyped here to name this stage's unit instead. Done before the
+  // walk below so that the compute stage finds the slot on either side.
+  llvm::SmallPtrSet<StageNode*, 4> unit_fifo_stages;
+  for (size_t i = 0; i < expanded_stages.size(); ++i) {
+    StageNode* current_stage = expanded_stages[i];
+    if (isIntermediateStage(current_stage)) continue;
+
+    StageMaterializationInfo& stage_info = plan->stage_info[current_stage];
+
+    StageNode* prev_stage = (i > 0) ? expanded_stages[i - 1] : nullptr;
+    StageNode* next_stage =
+        (i + 1 < expanded_stages.size()) ? expanded_stages[i + 1] : nullptr;
+
+    auto stage_op =
+        mlir::cast<mlir::ktdf::StageOp>(current_stage->getOperation());
+
+    stage_op.walk([&](mlir::ktdf::DataTransferOp transfer) {
+      bool src_is_memref =
+          mlir::isa<mlir::MemRefType>(transfer.getSource().getType());
+      mlir::Value fifo_value =
+          src_is_memref ? transfer.getDestination() : transfer.getSource();
+      auto fifo_slot_type =
+          mlir::dyn_cast<mlir::ktdf::FifoSlotType>(fifo_value.getType());
+      if (!fifo_slot_type) return mlir::WalkResult::advance();
+      bool fifo_is_source = !src_is_memref;
+
+      // The FIFO endpoint on this stage's side must name the stage's memory,
+      // and the other end must be the (original) compute stage.
+      mlir::Attribute endpoint =
+          fifo_is_source ? fifo_slot_type.getDest() : fifo_slot_type.getSrc();
+      StageNode* compute_stage = fifo_is_source ? prev_stage : next_stage;
+      if (endpoint != stage_info.stage_resource || !compute_stage ||
+          isIntermediateStage(compute_stage))
+        return mlir::WalkResult::advance();
+
+      ResourceType compute_resource =
+          plan->stage_info[compute_stage].stage_resource;
+      ResourceType unit = stage_info.applicable_unit.value_or(nullptr);
+      assert(compute_resource && unit &&
+             "Expected the compute stage's resource and this stage's unit");
+
+      auto [fifo_spec, slot_idx] =
+          assignFifoSlot(fifo_value, fifo_is_source ? compute_resource : unit,
+                         fifo_is_source ? unit : compute_resource);
+
+      // Use a dummy edge between the compute and memory nodes, as the compute
+      // stage does for the same FIFO (an LS unit may map to several nodes).
+      scheduler::arch_view::RoutingGraph::NodeId compute_node_id =
+          arch_graph.getNodeIdForResource(compute_resource);
+      scheduler::arch_view::RoutingGraph::NodeId memory_node_id =
+          arch_graph.getNodeIdForResource(stage_info.stage_resource);
+      scheduler::arch_view::RoutingGraph::EdgeInfo edge{
+          fifo_is_source ? compute_node_id : memory_node_id,
+          fifo_is_source ? memory_node_id : compute_node_id, 1};
+
+      TransferMaterializationInfo* transfer_info =
+          plan->transfer_factory.createFromTemplateWithFifo(
+              transfer.getOperation(), edge, unit, stage_info.stage_resource,
+              fifo_is_source, fifo_spec, slot_idx, transfer.getContext());
+
+      stage_info.transfers.push_back(transfer_info);
+      stage_info.kind = StageMaterializationInfo::Kind::kAdaptTransfer;
+      unit_fifo_stages.insert(current_stage);
+
+      LDBG(1) << "  Stage " << current_stage->getStageId()
+              << ": data_transfer - FIFO src=" << fifo_spec->fifo_src
+              << ", dest=" << fifo_spec->fifo_dest << ", slot " << slot_idx
+              << ", elements=" << fifo_spec->elements_per_slot[slot_idx]
+              << "\n";
+      return mlir::WalkResult::advance();
+    });
+  }
 
   for (size_t i = 0; i < expanded_stages.size(); ++i) {
     StageNode* current_stage = expanded_stages[i];
@@ -763,8 +883,12 @@ static mlir::LogicalResult classifyOriginalStages(
 
     bool prev_is_intermediate = prev_stage && isIntermediateStage(prev_stage);
     bool next_is_intermediate = next_stage && isIntermediateStage(next_stage);
+    bool next_to_unit_fifo_stage = unit_fifo_stages.contains(prev_stage) ||
+                                   unit_fifo_stages.contains(next_stage);
 
-    if (!prev_is_intermediate && !next_is_intermediate) continue;
+    if (!prev_is_intermediate && !next_is_intermediate &&
+        !next_to_unit_fifo_stage)
+      continue;
 
     auto stage_op =
         mlir::cast<mlir::ktdf::StageOp>(current_stage->getOperation());
@@ -826,7 +950,11 @@ static mlir::LogicalResult classifyOriginalStages(
     // slot that gets replaced by the L1 staging buffer.
     // Run this walk first so the stage is classified before the DataTransferOp
     // walk below, preventing double-classification when both op types coexist.
+    // Both walks stage through an intermediate buffer, so need an intermediate
+    // neighbour.
     stage_op.walk([&](mlir::ktdf::IndDataTransferOp ind_transfer) {
+      if (!prev_is_intermediate && !next_is_intermediate)
+        return mlir::WalkResult::interrupt();
       bool is_gather = ind_transfer.isGather();
       mlir::Value fifo_side =
           is_gather ? ind_transfer.getDirDst() : ind_transfer.getDirSrc();
@@ -850,7 +978,8 @@ static mlir::LogicalResult classifyOriginalStages(
     // Direct transfer: exactly one side is a memref (the other is a FIFO).
     // The IBR-fill DataTransferOp (both sides memref) is skipped by the guard.
     // Skip entirely if an IndDataTransferOp already classified this stage.
-    if (stage_info.kind != StageMaterializationInfo::Kind::kAdaptTransfer) {
+    if (stage_info.kind != StageMaterializationInfo::Kind::kAdaptTransfer &&
+        (prev_is_intermediate || next_is_intermediate)) {
       stage_op.walk([&](mlir::ktdf::DataTransferOp transfer) {
         mlir::Type src_type = transfer.getSource().getType();
         mlir::Type dest_type = transfer.getDestination().getType();
@@ -890,7 +1019,10 @@ static mlir::LogicalResult classifyOriginalStages(
       bool adjacent_is_intermediate =
           is_read ? prev_is_intermediate : next_is_intermediate;
 
-      if (!adjacent_is_intermediate) return mlir::WalkResult::advance();
+      // An original neighbour faces this FIFO op only if it was given a unit
+      // FIFO above; this op then takes the same slot.
+      if (!adjacent_is_intermediate && !fifo_slots.count(fifo_slot))
+        return mlir::WalkResult::advance();
 
       // fifo_src = applicable_unit of the adjacent LS-unit stage (load side)
       // fifo_dest = applicable_unit of the adjacent LS-unit stage (store side)
@@ -915,23 +1047,9 @@ static mlir::LogicalResult classifyOriginalStages(
       assert(fifo_src && fifo_dest &&
              "Expected valid FIFO endpoint attributes");
 
-      mlir::Type element_type = fifo_slot_type.getElementType();
-      assert(!fifo_slot_type.isDynamicNumElements() &&
-             "Dynamic FIFO sizes not supported in path expansion");
-      int64_t num_elements = fifo_slot_type.getStaticNumElements();
-
-      FifoKey fifo_key = {fifo_src, fifo_dest};
-      if (fifo_specs.find(fifo_key) == fifo_specs.end()) {
-        PrivateResourceSpec* spec = plan->resource_factory.createFifo(
-            fifo_src, fifo_dest, {num_elements}, element_type);
-        fifo_specs[fifo_key] = spec;
-        fifo_next_slot[fifo_key] = 0;
-      } else {
-        fifo_specs[fifo_key]->elements_per_slot.push_back(num_elements);
-      }
-
-      size_t slot_idx = fifo_next_slot[fifo_key]++;
-      validateFifoSlotIndex(fifo_slot, slot_idx, fifo_specs[fifo_key]);
+      auto [fifo_spec, slot_idx] =
+          assignFifoSlot(fifo_slot, fifo_src, fifo_dest);
+      int64_t num_elements = fifo_spec->elements_per_slot[slot_idx];
 
       // Use a dummy edge since the routing graph has no direct edge between
       // stage_resource nodes (they go through LS-unit nodes).
@@ -945,8 +1063,7 @@ static mlir::LogicalResult classifyOriginalStages(
 
       TransferMaterializationInfo* transfer_info =
           plan->transfer_factory.createFromFifoOp(op, edge, fifo_src, fifo_dest,
-                                                  fifo_specs[fifo_key],
-                                                  slot_idx, is_read);
+                                                  fifo_spec, slot_idx, is_read);
 
       stage_info.transfers.push_back(transfer_info);
       stage_info.kind = StageMaterializationInfo::Kind::kAdaptFifoKinds;
@@ -1247,20 +1364,27 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
 
   LLVM_DEBUG(debugPrintFullPath(full_path));
 
-  // PREP 5: Check whether path expansion is needed
-  if (!needsExpansion(endpoint_path, full_path, arch_graph)) {
-    plan->changed = false;
-    LDBG(1) << "Pipeline already legal";
-    return plan;
-  }
-
-  plan->changed = true;
+  // PREP 5: Report whether the route needs stages inserted. Planning runs
+  // either way: a route that already matches the stages (e.g. L1 -> SFU -> L1)
+  // may still have transfer stages whose FIFOs name a memory.
+  LDBG(1) << (needsExpansion(endpoint_path, full_path, arch_graph)
+                  ? "Route needs intermediate stages"
+                  : "Route already matches the stages");
 
   int next_stage_id = static_cast<int>(sorted_stages.size());
   if (mlir::failed(applyPathExpansion(tree, pipeline, full_path, sorted_stages,
                                       arch_graph, plan.get(), next_stage_id))) {
     return nullptr;
   }
+
+  // The pipeline changes iff a stage was inserted or an original stage is
+  // adapted; otherwise it is already legal and is left untouched.
+  plan->changed = llvm::any_of(plan->stage_info, [](const auto& entry) {
+    return isIntermediateStage(entry.first) ||
+           entry.second.kind !=
+               StageMaterializationInfo::Kind::kPreserveOriginal;
+  });
+  if (!plan->changed) LDBG(1) << "Pipeline already legal";
 
   return plan;
 }

@@ -139,6 +139,28 @@ class TransferInfoFactory {
       bool intermediate_is_source, const PrivateResourceSpec* buffer_spec,
       mlir::OpBuilder& builder);
 
+  /// Create transfer from template with a physical FIFO.
+  /// Used when adapting an existing transfer whose FIFO side names a memory
+  /// (e.g. "SFU" -> "L1") and faces the compute stage directly, with no
+  /// intermediate stage in between. The memory side is kept from the template;
+  /// the FIFO side is replaced by \p fifo_spec, which names the stage's unit.
+  /// \p template_op must be a DataTransferOp.
+  /// @param template_op The original transfer operation to adapt
+  /// @param edge The architecture edge this transfer implements
+  /// @param fifo_resource The resource on the FIFO side (the stage's unit)
+  /// @param current_resource The current stage's resource (the memory)
+  /// @param fifo_is_source Whether the FIFO is the source or the dest
+  /// @param fifo_spec The FIFO spec shared with the compute stage
+  /// @param slot_index The slot index to use
+  /// @param context MLIR context for creating attributes
+  /// @return Pointer to created transfer info (owned by factory)
+  TransferMaterializationInfo* createFromTemplateWithFifo(
+      mlir::Operation* template_op,
+      const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,
+      ResourceType fifo_resource, ResourceType current_resource,
+      bool fifo_is_source, const PrivateResourceSpec* fifo_spec,
+      size_t slot_index, mlir::MLIRContext* context);
+
   /// Create transfer for FIFO operation
   /// Used when adapting FIFO read/write operations to work with path expansion
   /// @param fifo_op The FIFO operation (read or write)
