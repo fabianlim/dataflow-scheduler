@@ -109,6 +109,16 @@ class PathExpansionMaterializer {
   mlir::ktdf::PipelineOp materializePipelineNode(
       const PipelineNode& pipeline_node);
 
+  /// Order the data transfers of each stage in \p pipeline that write to or
+  /// read from FIFOs shared with one other stage the way that stage uses those
+  /// FIFOs. A send and a receive name only the peer unit, not the FIFO, so all
+  /// FIFOs between two units form one in-order stream: the transfers that feed
+  /// another stage must come in the order it reads them, and the transfers
+  /// that drain it in the order it writes them. Nothing else fixes this order:
+  /// an original stage that also moves data for a path keeps its own
+  /// transfers first and gets the planned ones after them.
+  void orderFifoTransfersByPeer(mlir::ktdf::PipelineOp pipeline);
+
   /// Materialize a private node by creating new ktdf.private with all resources
   void materializePrivateNode(const PrivateNode& private_node);
 
