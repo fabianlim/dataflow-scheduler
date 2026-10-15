@@ -140,6 +140,9 @@ void scheduler::buildSchedulerOptimizationPipeline(
   // consumer as a tensor, so the consumer is rebuilt on buffers here, before
   // addresses are assigned to the buffers themselves.
   pm.addPass(createCustomLinalgBufferizationPass());
+  // Each constant register becomes an allocation and its fill, which is the
+  // form addresses are assigned to.
+  pm.addPass(createLowerInitRegisterPass());
 
   pm.addPass(createAddressAssignmentPass(scheduler_ctx));
   // TODO: position of cross-instance parallelization is TBD

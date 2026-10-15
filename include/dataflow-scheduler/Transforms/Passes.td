@@ -435,6 +435,50 @@ def CustomLinalgBufferizationPass : Pass<"custom-linalg-bufferization", "mlir::M
   ];
 }
 
+def LowerInitRegisterPass : Pass<"lower-init-register", "mlir::ModuleOp"> {
+  let summary = "Lower ktdf.init_register to an allocation and its fill";
+  let description = [{
+    Replaces every `ktdf.init_register` with a `memref.alloc` of its result
+    type, and fills that allocation with an `arith.constant` of its value.
+
+    Where the fill goes depends on the scope of the `ktdf.init_register`:
+
+      - Outside any `ktdf.stage`, the fill is placed in a new `ktdf.pipeline`
+        right after the allocation. The pipeline holds a single stage whose
+        `applicable_units` is the unit of the `ktdf.init_register`.
+      - Inside a `ktdf.stage`, the fill is placed right after the allocation,
+        in that stage. A stage that declares `applicable_units` must list the
+        unit of the `ktdf.init_register`.
+
+    A `ktdf.init_register` inside a `ktdf.pipeline` but not inside one of its
+    stages is an error.
+
+    Example:
+    ```mlir
+    %reg = ktdf.init_register 0.000000e+00 : f16 on "SFU"
+        -> memref<64xf16, "SFU_REG">
+    ```
+
+    Is transformed into:
+    ```mlir
+    %cst = arith.constant 0.000000e+00 : f16
+    %reg = memref.alloc() : memref<64xf16, "SFU_REG">
+    ktdf.pipeline {
+      ktdf.stage depends_in(none) depends_out(none) {
+        linalg.fill ins(%cst : f16) outs(%reg : memref<64xf16, "SFU_REG">)
+      } {applicable_units = ["SFU"]}
+    }
+    ```
+  }];
+
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::ktdf::KTDFDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
 def EnsureDeviceDeclarationPass
     : Pass<"ensure-device-declaration", "mlir::ModuleOp"> {
   let summary = "Ensure that there is a ktdf_arch.device declaration";

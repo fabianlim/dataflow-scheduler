@@ -16,6 +16,7 @@ add_dataflow_scheduler_library(DataflowSchedulerTransforms
     HoistConstantStorage.cpp
     HoistInvariants.cpp
     IndirectAddrBufFillLegalization.cpp
+    LowerInitRegister.cpp
     MaterializeRegisters.cpp
     NormalizeGridTo1D.cpp
     NormalizeSCFForLoops.cpp
