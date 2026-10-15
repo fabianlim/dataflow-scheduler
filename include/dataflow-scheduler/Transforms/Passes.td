@@ -462,8 +462,15 @@ def MaterializeRegistersPass : Pass<"materialize-registers", "mlir::ModuleOp"> {
   let description = [{
     Visits every nested `linalg.generic` and makes the registers it uses real
     in front of it: an allocation the body carries, and an `arith.constant`
-    with a `ktdf_arch.maps_to` attribute, which needs an allocation and a fill
-    of its own.
+    the body reads that needs an allocation and a fill of its own.
+
+    A constant needs a register if it has a `ktdf_arch.maps_to` attribute, or
+    if an `arith` or `math` operation in the body reads it and its type is not
+    `index`. The register is in the memory `ktdf_arch.maps_to` names, or else
+    in the memory local to the execution unit the `linalg.generic` is mapped
+    to; it is an error if there is no such memory. A `ktdf.opaque` in the body
+    reads the register, an `arith` or `math` operation reads its first element,
+    and any other reader keeps the constant.
 
     This requires the cardinality of the `linalg.generic` iteration domain to
     be statically known, and all consumers of the registers to be either
