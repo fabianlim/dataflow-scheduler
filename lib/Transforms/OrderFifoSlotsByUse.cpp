@@ -26,6 +26,7 @@
 #include <mlir/Interfaces/SideEffectInterfaces.h>
 
 #include <cassert>
+#include <limits>
 #include <optional>
 #include <tuple>
 #include <utility>
@@ -49,6 +50,9 @@ namespace scheduler {
 using namespace scheduler;
 
 namespace {
+
+/// The rank of a slot whose reader does not say when it is consumed.
+constexpr unsigned kUnconstrained = std::numeric_limits<unsigned>::max();
 
 /// A FIFO slot with the one op writing it and the one op reading it.
 struct SlotAccess {
@@ -95,14 +99,16 @@ struct SlotAccess {
 /// Where in its block the value a slot is read into is first consumed, as an
 /// ordered key: the position of the consuming op in the block, then, when that
 /// op is a linalg.generic, the position in its body of the first op using the
-/// operand. A read transferring the slot into memory consumes it where it is.
+/// operand. A read transferring the slot into memory does not constrain the
+/// order: it stands wherever it was put, and ranks after the slots a consumer
+/// uses, leaving its place among its peers to the order of the producer.
 [[nodiscard]] auto getConsumptionKey(
     mlir::Operation* reader,
     const llvm::DenseMap<mlir::Operation*, unsigned>& positions)
     -> std::optional<std::pair<unsigned, unsigned>> {
   auto* block = reader->getBlock();
   if (llvm::isa<mlir::ktdf::DataTransferOp>(reader)) {
-    return std::make_pair(positions.lookup(reader), 0U);
+    return std::make_pair(kUnconstrained, 0U);
   }
 
   std::optional<std::pair<unsigned, unsigned>> key;
@@ -133,6 +139,40 @@ struct SlotAccess {
     }
   }
   return key;
+}
+
+/// For each slot, the place of the value written into it in the order its
+/// producer yields them. For a slot written by `write_to_fifo %r#k, %slot`:
+///   1. take the written value, `%r#k`;
+///   2. find the op defining it, in the writer's block;
+///   3. the order is (position of that op, result number k).
+/// Two results of one op share a position and order by `k`. The entry is empty
+/// when there is no such op: the slot is filled by a transfer, or the value is
+/// not a result of an op in the block.
+[[nodiscard]] auto getYieldOrder(llvm::ArrayRef<SlotAccess> accesses)
+    -> llvm::SmallVector<std::optional<std::pair<unsigned, unsigned>>> {
+  auto* block = accesses.front().writer->getBlock();
+  llvm::DenseMap<mlir::Operation*, unsigned> positions;
+  for (auto [index, op] : llvm::enumerate(*block)) {
+    positions[&op] = index;
+  }
+
+  return llvm::map_to_vector(accesses, [&](const SlotAccess& access) {
+    std::optional<std::pair<unsigned, unsigned>> order;
+    // 1. The written value.
+    auto write = llvm::dyn_cast<mlir::ktdf::WriteToFifoOp>(access.writer);
+    auto result =
+        write ? llvm::dyn_cast<mlir::OpResult>(write.getData()) : nullptr;
+    // 2. The op defining it; one nested in an op of the block counts as that
+    // op.
+    auto* defining =
+        result ? block->findAncestorOpInBlock(*result.getOwner()) : nullptr;
+    // 3. Its position, then which of its results this is.
+    if (defining) {
+      order.emplace(positions.lookup(defining), result.getResultNumber());
+    }
+    return order;
+  });
 }
 
 /// Moves @p ops, all in one block, so that they appear in the given order, all
@@ -237,17 +277,26 @@ struct OrderFifoSlotsByUsePass
       positions[&op] = index;
     }
 
-    // The order the consumer takes the slots in.
-    llvm::SmallVector<std::pair<std::pair<unsigned, unsigned>, SlotAccess>>
-        keyed;
-    for (const auto& access : accesses) {
-      auto key = getConsumptionKey(access.reader, positions);
-      if (!key) {
+    // The order the consumer takes the slots in. A slot whose reader does not
+    // say when it is consumed, a transfer into memory, is left to the order the
+    // producer yields the values in, so that the first result is the first slot
+    // written and the first read. A slot not written from an op result has no
+    // such order and goes last, by where its reader stands.
+    using SortKey = std::tuple<unsigned, unsigned, bool, unsigned, unsigned>;
+    const auto yield_order = getYieldOrder(accesses);
+    llvm::SmallVector<std::pair<SortKey, SlotAccess>> keyed;
+    for (auto [access, yielded] : llvm::zip_equal(accesses, yield_order)) {
+      auto consumed = getConsumptionKey(access.reader, positions);
+      if (!consumed) {
         LDBG() << "slot consumed outside its block, not ordered: "
                << access.slot;
         return;
       }
-      keyed.emplace_back(*key, access);
+      const auto [first, second] =
+          yielded.value_or(std::make_pair(positions.lookup(access.reader), 0U));
+      keyed.emplace_back(SortKey{consumed->first, consumed->second,
+                                 !yielded.has_value(), first, second},
+                         access);
     }
     llvm::stable_sort(keyed, [](const auto& lhs, const auto& rhs) {
       return lhs.first < rhs.first;
