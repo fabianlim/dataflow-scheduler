@@ -18,6 +18,8 @@
 
 #include "dataflow-scheduler/Analysis/MemoryTracker.h"
 
+#include <algorithm>
+
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -130,6 +132,39 @@ void MemoryTracker::reset(llvm::ArrayRef<ResourceType> memory_resources) {
       it->second = reserved_it != reserved_.end() ? reserved_it->second : 0;
     }
   }
+}
+
+llvm::Error MemoryTracker::reserveBelow(ResourceType memory_resource,
+                                        size_t address) {
+  auto capacity_it = capacities_.find(memory_resource);
+  if (capacity_it == capacities_.end()) {
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "Memory resource %s does not have capacity information",
+        resourceToString(memory_resource).c_str());
+  }
+
+  if (address > capacity_it->second) {
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "Reservation of addresses below %zu exceeds %s capacity "
+        "(%zu bytes of capacity)",
+        address, resourceToString(memory_resource).c_str(),
+        capacity_it->second);
+  }
+
+  // Raise the floor reset returns to, and the next address if it is below it.
+  size_t& reserved = reserved_[memory_resource];
+  reserved = std::max(reserved, address);
+  size_t& next_address = next_address_[memory_resource];
+  next_address = std::max(next_address, reserved);
+
+  LDBG(1) << "[" DEBUG_TYPE "] reserveBelow: resource="
+          << resourceToString(memory_resource) << " reserved=" << reserved
+          << "B"
+          << " capacity=" << capacity_it->second << "B";
+
+  return llvm::Error::success();
 }
 
 // Made with Bob

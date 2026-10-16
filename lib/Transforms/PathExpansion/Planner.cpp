@@ -1504,6 +1504,19 @@ static mlir::LogicalResult retypeFifosBetweenOriginalStages(
           transfer->dest_private_resource = fifo_spec;
           transfer->dest_slot_index = slot.slot_idx;
         }
+        // A data_transfer's FIFO side is sized by the slot it moves, flat, as
+        // on every hop stage: the input IR sizes it like the tile, and later
+        // passes (e.g. reduction-loop-exposure) divide a FIFO-side size as an
+        // element count.
+        if (mlir::isa<mlir::ktdf::DataTransferOp>(endpoint.op)) {
+          mlir::Builder b(endpoint.op->getContext());
+          llvm::SmallVector<mlir::OpFoldResult> flat{
+              b.getI64IntegerAttr(fifo_spec->elements_per_slot[slot.slot_idx])};
+          if (is_consumer)
+            transfer->source_sizes = flat;
+          else
+            transfer->dest_sizes = flat;
+        }
 
         // The materializer only rewrites read_from_fifo / write_to_fifo in
         // kAdaptFifoKinds stages; DataTransferOps are rewritten in either
@@ -1823,20 +1836,27 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
     return nullptr;
   }
 
-  // PREP 5: Check whether path expansion is needed
-  if (!needsExpansion(segments, arch_graph)) {
-    plan->changed = false;
-    LDBG(1) << "Pipeline already legal";
-    return plan;
-  }
-
-  plan->changed = true;
+  // PREP 5: Report whether the route needs stages inserted. Planning runs
+  // either way: a route that already matches the stages (e.g. L1 -> SFU -> L1)
+  // may still have transfer stages whose FIFOs name a memory.
+  LDBG(1) << (needsExpansion(segments, arch_graph)
+                  ? "Route needs intermediate stages"
+                  : "Route already matches the stages");
 
   int next_stage_id = static_cast<int>(sorted_stages.size());
   if (mlir::failed(buildExpansionPlan(tree, pipeline, segments, sorted_stages,
                                       arch_graph, plan.get(), next_stage_id))) {
     return nullptr;
   }
+
+  // The pipeline changes iff a stage was inserted or an original stage is
+  // adapted; otherwise it is already legal and is left untouched.
+  plan->changed = llvm::any_of(plan->stage_info, [](const auto& entry) {
+    return isIntermediateStage(entry.first) ||
+           entry.second.kind !=
+               StageMaterializationInfo::Kind::kPreserveOriginal;
+  });
+  if (!plan->changed) LDBG(1) << "Pipeline already legal";
 
   return plan;
 }

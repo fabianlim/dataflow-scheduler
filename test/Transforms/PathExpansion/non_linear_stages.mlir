@@ -10,6 +10,8 @@
 // One load stage reads DDR and needs an L1 hop on L1LU. The other load stage
 // already runs on L1LU, so the hop is folded into it instead of adding a
 // second stage on L1LU.
+// Both of its transfers now feed the compute stage's unit, so they come in the
+// order the compute stage reads them, the folded hop's first.
 // CHECK-LABEL: func.func @mixed_branches(
 // CHECK:         %[[P:.+]]:9 = ktdf.private
 // CHECK-NEXT:    memref.alloc() : memref<64xf16, "L1">
@@ -21,8 +23,8 @@
 // CHECK-NEXT:    ktdf.data_transfer from %arg0[0] size [64] to %[[P]]#0[0] size [64] : memref<64xf16, "DDR">, memref<64xf16, "L1">
 // CHECK-NEXT:    } {applicable_units = ["MNILU"]}
 // CHECK-NEXT:    ktdf.stage depends_in(%[[P]]#5) depends_out(%[[P]]#6) {
-// CHECK-NEXT:    ktdf.data_transfer from %arg1[0] size [64] to %[[P]]#4 size [64] : memref<64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
 // CHECK-NEXT:    ktdf.data_transfer from %[[P]]#0[0] size [64] to %[[P]]#1 size [64] : memref<64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+// CHECK-NEXT:    ktdf.data_transfer from %arg1[0] size [64] to %[[P]]#4 size [64] : memref<64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
 // CHECK-NEXT:    } {applicable_units = ["L1LU"]}
 // CHECK-NEXT:    ktdf.stage depends_in(%[[P]]#6) depends_out(%[[P]]#7) {
 // CHECK-NEXT:    ktdf.read_from_fifo %[[P]]#1 : <"L1LU" -> "SFU", 64xf16> -> tensor<64xf16>
@@ -78,6 +80,9 @@ module {
 // hop on L1SU; the other is stored to L1 by a stage that already runs on L1SU,
 // so the hop is folded into that stage. The load needs an L1 hop on L1LU,
 // which no stage runs on yet, so a new stage is added for it.
+// Both transfers of the folded stage now drain the compute stage's unit, so
+// they come in the order the compute stage writes them, the folded hop's
+// first.
 // CHECK-LABEL: func.func @store_fold(
 // CHECK:         %[[P:.+]]:9 = ktdf.private
 // CHECK-NEXT:    memref.alloc() : memref<64xf16, "L1">
@@ -97,8 +102,8 @@ module {
 // CHECK-NEXT:    ktdf.write_to_fifo %{{.*}}, %[[P]]#4 : tensor<64xf16>, <"SFU" -> "L1SU", 64xf16>
 // CHECK-NEXT:    } {applicable_units = ["SFU"]}
 // CHECK-NEXT:    ktdf.stage depends_in(%[[P]]#7) depends_out(%[[P]]#8) {
-// CHECK-NEXT:    ktdf.data_transfer from %[[P]]#4 size [64] to %arg2[0] size [64] : !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, memref<64xf16, "L1">
 // CHECK-NEXT:    ktdf.data_transfer from %[[P]]#2 size [64] to %[[P]]#3[0] size [64] : !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, memref<64xf16, "L1">
+// CHECK-NEXT:    ktdf.data_transfer from %[[P]]#4 size [64] to %arg2[0] size [64] : !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, memref<64xf16, "L1">
 // CHECK-NEXT:    } {applicable_units = ["L1SU"]}
 // CHECK-NEXT:    ktdf.stage depends_in(%[[P]]#8) depends_out(none) {
 // CHECK-NEXT:    ktdf.data_transfer from %[[P]]#3[0] size [64] to %arg1[0] size [64] : memref<64xf16, "L1">, memref<64xf16, "DDR">
