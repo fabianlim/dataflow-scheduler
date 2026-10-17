@@ -481,6 +481,12 @@ def MaterializeRegistersPass : Pass<"materialize-registers", "mlir::ModuleOp"> {
     the first element of the allocated segment. A store of a value the body
     does not compute per element fills every element instead.
 
+    Such a fill stays where the allocation is. A constant a pattern stores into
+    an `alloca` of the body is therefore written in the stage, inside any loop
+    around it, and `hoist-constant-storage` does not move it: only a constant
+    the body reads directly gets an `alloc` that is filled once, outside the
+    loop.
+
     Example:
     ```mlir
     linalg.generic ins(%in: tensor<1x64xf16>) ... {
