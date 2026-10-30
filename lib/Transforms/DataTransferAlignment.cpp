@@ -179,6 +179,24 @@ struct SlotP {
 };
 SlotP slotPOf(mlir::ktdf::DataTransferOp load, int64_t p);
 
+/// The loops over dim p that walk it one element at a time: the one indexing
+/// slot p of the load and, when that loop is inside the pipeline, each
+/// stage's copy of it, found as the loop indexing the same buffer dim of A or
+/// B. A re-stick tile covers the whole stick, so widening removes them all.
+struct PointLoops {
+  llvm::SetVector<mlir::scf::ForOp> loops;
+  std::optional<int64_t> buffer_dim;  // A's and B's dim they index, if any
+};
+mlir::FailureOr<PointLoops> pointLoops(Restick plan);
+
+/// A staging-buffer index lists the stage's point loops first, then one dim
+/// per view dim: view dim d is buffer dim leadDims + d.
+int64_t leadDims(Restick plan) {
+  return mlir::cast<mlir::MemRefType>(plan.load.getDestination().getType())
+             .getRank() -
+         plan.rank;
+}
+
 /// The ktdf.data_transfer ops directly inside `stage`, outside any nested
 /// pipeline.
 llvm::SmallVector<mlir::ktdf::DataTransferOp> stageTransfers(
@@ -207,10 +225,10 @@ OpT soleOtherUser(mlir::Value value, mlir::Operation* user) {
   return other;
 }
 
-/// The slot `load` moves its elements along, the last one whose size is not
-/// 1, when x's stride in it is not 1: the load needs re-sticking. nullopt
-/// otherwise.
-std::optional<int64_t> restickSlot(mlir::ktdf::DataTransferOp load) {
+/// When `load` needs re-sticking, the index slot it moves its elements along:
+/// the last slot of its source indices whose size is not 1, if x's stride in
+/// that dim is not 1. nullopt when the load already moves a contiguous stick.
+std::optional<int64_t> stridedStickSlot(mlir::ktdf::DataTransferOp load) {
   std::optional<int64_t> q;
   for (auto [slot, size] : llvm::enumerate(load.getMixedSourceSizes()))
     if (mlir::getConstantIntValue(size) != 1) q = slot;
@@ -252,7 +270,7 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
           isScratchpad(transfer.getSource(), memory_tree) ||
           !isScratchpad(transfer.getDestination(), memory_tree))
         continue;
-      std::optional<int64_t> slot = restickSlot(transfer);
+      std::optional<int64_t> slot = stridedStickSlot(transfer);
       if (!slot) continue;  // already moves contiguous sticks
       if (load)
         return fail(transfer, "a second load in the pipeline needs "
@@ -369,8 +387,30 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
     return fail(load, "dim ")
            << *p << " is walked by an untiled loop over " << extent
            << " elements; only one stick (" << block << ") is supported";
-  return std::optional<Restick>(
-      Restick{load, from_a, into_b, store, *p, q, rank});
+  Restick plan{load, from_a, into_b, store, *p, q, rank};
+
+  // Widening removes the point loops over dim p, which is right only if they
+  // move no data but the copy's. Any other data reaches a stage through a
+  // transfer or a FIFO, so those are what is checked.
+  auto loops = pointLoops(plan);
+  if (mlir::failed(loops)) return mlir::failure();
+  for (mlir::scf::ForOp loop : loops->loops) {
+    mlir::Operation* other = nullptr;
+    loop->walk([&](mlir::Operation* op) {
+      bool ours = true;
+      if (auto t = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op))
+        ours = t == load || t == from_a || t == into_b || t == store;
+      else if (auto r = mlir::dyn_cast<mlir::ktdf::ReadFromFifoOp>(op))
+        ours = r.getFifoSlot() == from_a.getDestination();
+      else if (auto w = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(op))
+        ours = w.getFifoSlot() == into_b.getSource();
+      if (!ours) other = op;
+    });
+    if (other)
+      return fail(other, "this op shares a point loop over the stick dim "
+                         "with a re-stick, which removes the loop");
+  }
+  return std::optional<Restick>(plan);
 }
 
 SlotP slotPOf(mlir::ktdf::DataTransferOp load, int64_t p) {
@@ -386,6 +426,47 @@ SlotP slotPOf(mlir::ktdf::DataTransferOp load, int64_t p) {
       lin.getStrides()[0].getDefiningOp<mlir::ktdf::TilingReserveSizeOp>();
   if (!tile) return {};
   return {lin.getIvs()[1], tile};
+}
+
+mlir::FailureOr<PointLoops> pointLoops(Restick plan) {
+  mlir::Value a = plan.load.getDestination(), b = plan.store.getSource();
+  const int64_t lead = leadDims(plan);
+  if (lead < 0 ||
+      mlir::cast<mlir::MemRefType>(b.getType()).getRank() - plan.rank != lead)
+    return plan.load->emitError(PASS_NAME
+                                ": staging buffers must have the view rank "
+                                "plus the same number of loop dims");
+
+  PointLoops result;
+  mlir::Value point_iv = slotPOf(plan.load, plan.p).point_iv;
+  result.loops.insert(mlir::scf::getForInductionVarOwner(point_iv));
+  for (int64_t k = 0; k < lead; ++k)
+    if (indexAt(plan.load.getDestMap().value(), plan.load.getDestIndices(),
+                k) == point_iv)
+      result.buffer_dim = k;
+  if (!result.buffer_dim) return result;
+
+  // Every stage indexes that buffer dim with its own copy of the loop.
+  llvm::SmallVector<mlir::ktdf::DataTransferOp> on_buffers;
+  plan.load->getParentOfType<mlir::ktdf::PipelineOp>()->walk(
+      [&](mlir::ktdf::DataTransferOp op) { on_buffers.push_back(op); });
+  for (auto op : on_buffers) {
+    for (bool source : {true, false}) {
+      mlir::Value side = source ? op.getSource() : op.getDestination();
+      if (side != a && side != b) continue;
+      auto map = source ? op.getSourceMap() : op.getDestMap();
+      mlir::Value iv =
+          indexAt(*map, source ? op.getSourceIndices() : op.getDestIndices(),
+                  *result.buffer_dim);
+      auto loop =
+          iv ? mlir::scf::getForInductionVarOwner(iv) : mlir::scf::ForOp();
+      if (!loop)
+        return op->emitError(PASS_NAME ": staging-buffer dim ")
+               << *result.buffer_dim << " is not indexed by a loop";
+      result.loops.insert(loop);
+    }
+  }
+  return result;
 }
 
 //===----------------------------------------------------------------------===//
@@ -465,76 +546,16 @@ mlir::LogicalResult widenRestick(Restick plan,
     return plan.load->emitError(PASS_NAME
                                 ": a staging buffer is not a ktdf.private "
                                 "alloc");
-  // A buffer index lists the stage's point loops first, then one dim per view
-  // dim: view dim d is buffer dim lead + d.
-  const int64_t lead = a->alloc.getType().getRank() - plan.rank;
-  if (lead < 0 || b->alloc.getType().getRank() - plan.rank != lead)
-    return plan.load->emitError(PASS_NAME
-                                ": staging buffers must have the view rank "
-                                "plus the same number of loop dims");
+  const int64_t lead = leadDims(plan);
 
   mlir::ktdf::DataTransferOp from_a = plan.from_a, into_b = plan.into_b;
   auto hop = from_a->getParentOfType<mlir::ktdf::PipelineOp>();
 
   SlotP slot_p = slotPOf(plan.load, p);
-
-  // The buffer dim that holds the point loop over dim p, if the point loop
-  // is inside the pipeline. Every stage indexes it with its own copy of that
-  // loop.
-  std::optional<int64_t> kp;
-  for (int64_t k = 0; k < lead; ++k)
-    if (indexAt(plan.load.getDestMap().value(), plan.load.getDestIndices(),
-                k) == slot_p.point_iv)
-      kp = k;
-
-  // 1. The point loops over dim p: the one indexing slot p of the load and, in
-  //    each stage, the one indexing buffer dim kp. The widened transfers cover
-  //    the whole stick, so step 6 removes them.
-  llvm::SetVector<mlir::scf::ForOp> point_loops;
-  point_loops.insert(mlir::scf::getForInductionVarOwner(slot_p.point_iv));
-  if (kp) {
-    llvm::SmallVector<mlir::ktdf::DataTransferOp> on_buffers;
-    plan.load->getParentOfType<mlir::ktdf::PipelineOp>()->walk(
-        [&](mlir::ktdf::DataTransferOp op) { on_buffers.push_back(op); });
-    for (auto op : on_buffers) {
-      for (bool source : {true, false}) {
-        mlir::Value side = source ? op.getSource() : op.getDestination();
-        if (side != a->value && side != b->value) continue;
-        auto map = source ? op.getSourceMap() : op.getDestMap();
-        mlir::Value iv =
-            indexAt(*map, source ? op.getSourceIndices() : op.getDestIndices(),
-                    *kp);
-        auto loop = iv ? mlir::scf::getForInductionVarOwner(iv)
-                       : mlir::scf::ForOp();
-        if (!loop)
-          return op->emitError(PASS_NAME ": staging-buffer dim ")
-                 << *kp << " is not indexed by a loop";
-        point_loops.insert(loop);
-      }
-    }
-  }
-
-  // The point loops run their body once per element along dim p; removing
-  // them is right only if they move no data but the copy's. Any other data
-  // reaches a stage through a transfer or a FIFO, so those are what is
-  // checked. Checked before anything is changed.
-  for (mlir::scf::ForOp loop : point_loops) {
-    mlir::Operation* other = nullptr;
-    loop->walk([&](mlir::Operation* op) {
-      bool ours = true;
-      if (auto t = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op))
-        ours = t == plan.load || t == from_a || t == into_b || t == plan.store;
-      else if (auto r = mlir::dyn_cast<mlir::ktdf::ReadFromFifoOp>(op))
-        ours = r.getFifoSlot() == from_a.getDestination();
-      else if (auto w = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(op))
-        ours = w.getFifoSlot() == into_b.getSource();
-      if (!ours) other = op;
-    });
-    if (other)
-      return other->emitError(PASS_NAME
-                              ": this op shares a point loop over the stick "
-                              "dim with a re-stick, which removes the loop");
-  }
+  auto loops = pointLoops(plan);
+  if (mlir::failed(loops)) return mlir::failure();
+  std::optional<int64_t> kp = loops->buffer_dim;
+  auto& point_loops = loops->loops;
 
   // 2. A re-stick tile is one stick along dim p, so a tiled loop over dim p
   //    has no tile size to choose: its placeholder becomes `block`. Every op
