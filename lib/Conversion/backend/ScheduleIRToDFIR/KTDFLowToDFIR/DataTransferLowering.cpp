@@ -116,18 +116,22 @@ struct TransferTimeDims {
 ///
 /// The last row is a transfer that fits in one vector: the offsets are already
 /// the all-zero map, and the caller supplies the single pinned time step.
-TransferTimeDims describeTransferTimeDims(llvm::ArrayRef<int64_t> sizes,
-                                          int64_t lanes) {
+///
+/// The lanes run along `lane_dim`, the innermost dimension by default.
+TransferTimeDims describeTransferTimeDims(
+    llvm::ArrayRef<int64_t> sizes, int64_t lanes,
+    std::optional<unsigned> lane_dim = std::nullopt) {
+  const unsigned lane = lane_dim.value_or(sizes.size() - 1);
   TransferTimeDims dims(sizes.size());
   auto addDim = [&](unsigned pos, int64_t extent, int64_t index_step) {
     dims.steps.push_back({pos, index_step});
     dims.extents.push_back(extent);
   };
-  for (unsigned i = 0; i + 1 < sizes.size(); ++i) {
-    if (sizes[i] != 1) addDim(i, sizes[i], /*index_step=*/1);
+  for (unsigned i = 0; i < sizes.size(); ++i) {
+    if (i != lane && sizes[i] != 1) addDim(i, sizes[i], /*index_step=*/1);
   }
-  if (const int64_t vectors = sizes.back() / lanes; vectors > 1) {
-    addDim(sizes.size() - 1, vectors, /*index_step=*/lanes);
+  if (const int64_t vectors = sizes[lane] / lanes; vectors > 1) {
+    addDim(lane, vectors, /*index_step=*/lanes);
   }
   return dims;
 }
@@ -212,6 +216,19 @@ mlir::FailureOr<llvm::SmallVector<int64_t>> getElementStrides(
     return mlir::failure();
   }
   return strides;
+}
+
+/// The dimension whose elements fill a vector's lanes when `sizes` of
+/// `memref` are moved: the one with stride 1, so a vector is contiguous in
+/// memory. That is the innermost dimension for a memref whose strides
+/// decrease, and whenever the strides are not known.
+unsigned getLaneDim(mlir::Value memref, llvm::ArrayRef<int64_t> sizes) {
+  const unsigned innermost = sizes.size() - 1;
+  auto strides = getElementStrides(memref);
+  if (mlir::failed(strides) || strides->back() == 1) return innermost;
+  for (auto [dim, stride] : llvm::enumerate(*strides))
+    if (stride == 1 && sizes[dim] != 1) return dim;
+  return innermost;
 }
 
 /// Extend `map` with one trailing dimension that advances `step.memref_dim` by
@@ -787,19 +804,24 @@ struct LowerDataTransferPattern
         return mlir::failure();
       }
 
-      if (src_static_sizes.back() % *throttle != 0 ||
-          dst_static_sizes.back() % *throttle != 0) {
+      const unsigned src_lane = getLaneDim(src_memref, src_static_sizes);
+      const unsigned dst_lane = getLaneDim(dst_memref, dst_static_sizes);
+      if (src_static_sizes[src_lane] % *throttle != 0 ||
+          dst_static_sizes[dst_lane] % *throttle != 0) {
         data_transfer_op.emitError()
             << "data transfer of " << total
             << " elements exceeds the throttle of " << *throttle
             << "; splitting requires the innermost source and destination "
                "sizes to be a multiple of the throttle, but they are "
-            << src_static_sizes.back() << " and " << dst_static_sizes.back();
+            << src_static_sizes[src_lane] << " and "
+            << dst_static_sizes[dst_lane];
         return mlir::failure();
       }
 
-      src_time_dims = describeTransferTimeDims(src_static_sizes, *throttle);
-      dst_time_dims = describeTransferTimeDims(dst_static_sizes, *throttle);
+      src_time_dims =
+          describeTransferTimeDims(src_static_sizes, *throttle, src_lane);
+      dst_time_dims =
+          describeTransferTimeDims(dst_static_sizes, *throttle, dst_lane);
 
       // Only the extents are compared, not positions or coefficients: the
       // two sides may reach the same walk through different shapes, e.g.
@@ -815,9 +837,9 @@ struct LowerDataTransferPattern
       load_iv_type =
           mlir::VectorType::get({*throttle}, vector_type.getElementType());
       load_sizes.assign(src_static_sizes.size(), 1);
-      load_sizes.back() = *throttle;
+      load_sizes[src_lane] = *throttle;
       store_sizes.assign(dst_static_sizes.size(), 1);
-      store_sizes.back() = *throttle;
+      store_sizes[dst_lane] = *throttle;
 
       // A time dimension is one step count shared by both sides, so it is only
       // realizable when both sides move the same distance per step: one count
