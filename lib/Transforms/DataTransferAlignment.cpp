@@ -61,6 +61,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -129,49 +130,6 @@ mlir::Value indexConstant(mlir::Block* block, int64_t value,
   builder.setInsertionPointToStart(block);
   return mlir::arith::ConstantIndexOp::create(
       builder, builder.getUnknownLoc(), value);
-}
-
-//===----------------------------------------------------------------------===//
-// Transfers
-//===----------------------------------------------------------------------===//
-
-/// The editable operands of a ktdf.data_transfer. `rebuild` replaces the op
-/// with one built from them, keeping its discardable attributes.
-struct TransferParts {
-  mlir::AffineMap src_map, dst_map;
-  llvm::SmallVector<mlir::Value> src_indices, dst_indices;
-  llvm::SmallVector<mlir::OpFoldResult> src_sizes, dst_sizes;
-
-  explicit TransferParts(mlir::ktdf::DataTransferOp op)
-      : src_map(op.getSourceMap().value_or(mlir::AffineMap())),
-        dst_map(op.getDestMap().value_or(mlir::AffineMap())),
-        src_indices(op.getSourceIndices()),
-        dst_indices(op.getDestIndices()),
-        src_sizes(op.getMixedSourceSizes()),
-        dst_sizes(op.getMixedDestSizes()) {}
-
-  mlir::ktdf::DataTransferOp rebuild(mlir::ktdf::DataTransferOp op,
-                                     mlir::OpBuilder& builder) const {
-    builder.setInsertionPoint(op);
-    auto replacement = mlir::ktdf::DataTransferOp::create(
-        builder, op.getLoc(), op.getSource(), src_map, src_indices, src_sizes,
-        op.getDestination(), dst_map, dst_indices, dst_sizes);
-    for (mlir::NamedAttribute attr : op->getDiscardableAttrs())
-      replacement->setDiscardableAttr(attr.getName(), attr.getValue());
-    op.erase();
-    return replacement;
-  }
-};
-
-mlir::OpFoldResult indexAttr(mlir::MLIRContext* ctx, int64_t value) {
-  return mlir::IntegerAttr::get(mlir::IndexType::get(ctx), value);
-}
-
-/// The static value of transfer size `size`; nullopt if it is dynamic.
-std::optional<int64_t> staticSize(mlir::OpFoldResult size) {
-  if (auto attr = mlir::dyn_cast<mlir::Attribute>(size))
-    return mlir::cast<mlir::IntegerAttr>(attr).getInt();
-  return std::nullopt;
 }
 
 //===----------------------------------------------------------------------===//
@@ -246,7 +204,7 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
   auto load_sizes = load.getMixedSourceSizes();
   std::optional<int64_t> q;
   for (auto [slot, size] : llvm::enumerate(load_sizes))
-    if (staticSize(size) != 1) q = slot;
+    if (mlir::getConstantIntValue(size) != 1) q = slot;
   auto x = layoutOf(load.getSource());
   if (!q || mlir::failed(x) || x->strides[*q] == 1)
     return std::optional<Restick>();  // already moves contiguous sticks
@@ -291,7 +249,7 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
            << (element_bytes ? (int64_t)*element_bytes : -1) << " bytes";
 
   // The stick: what the load already moves along dim q.
-  std::optional<int64_t> stick = staticSize(load_sizes[*q]);
+  std::optional<int64_t> stick = mlir::getConstantIntValue(load_sizes[*q]);
   if (!stick || *stick <= 1)
     return fail(load, "the load's size in slot ")
            << *q << " is not a static stick length";
@@ -309,7 +267,7 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
         std::pair{store, store.getMixedDestSizes()}}) {
     for (auto [slot, size] : llvm::enumerate(sizes)) {
       int64_t want = (int64_t)slot == *q ? block : 1;
-      if (staticSize(size) != want)
+      if (mlir::getConstantIntValue(size) != want)
         return fail(transfer, "global-side size in slot ")
                << slot << " is not " << want
                << "; the pass expects one stick per transfer";
@@ -494,15 +452,22 @@ mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
   resizeBuffer(*b, new_sizes, builder);
 
   // 4. The load and store move a whole tile: size `block` in slot p as well
-  //    as in slot q, on both sides.
+  //    as in slot q, on both sides. Only static sizes change, so the dynamic
+  //    size operands stay as they are.
   for (auto [op, global_is_source] :
        {std::pair{plan.load, true}, std::pair{plan.store, false}}) {
-    TransferParts parts(op);
-    (global_is_source ? parts.src_sizes : parts.dst_sizes)[p] =
-        indexAttr(ctx, block);
-    (global_is_source ? parts.dst_sizes : parts.src_sizes)[lead + p] =
-        indexAttr(ctx, block);
-    parts.rebuild(op, builder);
+    auto src = op.getStaticSourceSizes(), dst = op.getStaticDestSizes();
+    if (!src || !dst)
+      return op->emitError(PASS_NAME ": the transfer has no static sizes");
+    llvm::SmallVector<int64_t> global(global_is_source ? *src : *dst);
+    llvm::SmallVector<int64_t> buffer(global_is_source ? *dst : *src);
+    if (mlir::ShapedType::isDynamic(buffer[lead + p]))
+      return op->emitError(PASS_NAME ": the staging-buffer size of dim ")
+             << p << " is dynamic";
+    global[p] = block;
+    buffer[lead + p] = block;
+    op.setStaticSourceSizes(global_is_source ? global : buffer);
+    op.setStaticDestSizes(global_is_source ? buffer : global);
   }
 
   // 5. The nested pipeline transposes each tile one element at a time:
@@ -522,10 +487,9 @@ mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
       bool reads_buffer = op.getSource() == a->value;
       bool writes_buffer = op.getDestination() == b->value;
       if (!reads_buffer && !writes_buffer) continue;
-      TransferParts parts(op);
-      auto& map = reads_buffer ? parts.src_map : parts.dst_map;
-      auto& indices = reads_buffer ? parts.src_indices : parts.dst_indices;
-      auto& sizes = reads_buffer ? parts.src_sizes : parts.dst_sizes;
+      mlir::AffineMap map = reads_buffer ? *op.getSourceMap() : *op.getDestMap();
+      mlir::ValueRange indices =
+          reads_buffer ? op.getSourceIndices() : op.getDestIndices();
       // One index per buffer dim through an identity map: the point-loop
       // indices stay, every view dim is 0 except the two the element is at.
       llvm::SmallVector<mlir::Value> element(lead + plan.rank, c0);
@@ -537,13 +501,22 @@ mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
       }
       element[lead + p] = reads_buffer ? r : c;
       element[lead + q] = reads_buffer ? c : r;
-      map = mlir::AffineMap::getMultiDimIdentityMap(element.size(), ctx);
-      indices = element;
-      llvm::fill(sizes, indexAttr(ctx, 1));
-      parts.rebuild(op, builder)
-          ->setDiscardableAttr(
-              "transfer_mode",
-              mlir::StringAttr::get(ctx, reads_buffer ? "splat" : "extract"));
+      auto identity = mlir::AffineMap::getMultiDimIdentityMap(element.size(), ctx);
+      llvm::SmallVector<int64_t> ones(element.size(), 1);
+      if (reads_buffer) {
+        op.getSourceIndicesMutable().assign(element);
+        op.getSourceSizesMutable().clear();
+        op.setSourceMap(identity);
+        op.setStaticSourceSizes(ones);
+      } else {
+        op.getDestIndicesMutable().assign(element);
+        op.getDestSizesMutable().clear();
+        op.setDestMap(identity);
+        op.setStaticDestSizes(ones);
+      }
+      op->setDiscardableAttr(
+          "transfer_mode",
+          mlir::StringAttr::get(ctx, reads_buffer ? "splat" : "extract"));
     }
   }
   return mlir::success();
