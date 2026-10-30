@@ -22,14 +22,14 @@
 // from a global view x to a global view y through two per-core staging
 // buffers, A and B:
 //
-//   stage L3LU:  x  -> A     one stick of x per transfer
+//   stage L3LU:  x  -> A     one stick of y per transfer
 //   stage ...:   A  -> B     a nested pipeline moving one stick at a time
 //   stage L3SU:  B  -> y     one stick of y per transfer
 //
 // Every transfer carries one index per view dim, and x and y index the same
 // loop dims in the same order. A stick is a run of `block` contiguous elements
-// (128 bytes: 64 fp16). Let p be x's stride-1 dim and q y's. y is row-major,
-// so q is its last dim.
+// (128 bytes: 64 fp16). Each transfer moves one stick along dim q, y's
+// stride-1 dim. Let p be x's stride-1 dim.
 //
 //   - p == q: x's sticks are y's sticks. Each transfer already moves a whole
 //     contiguous stick; nothing is widened.
@@ -39,16 +39,13 @@
 //     transposes each tile element by element (splat out of A, extract into
 //     B). The views are not rewritten.
 //
-// Finally every global view is listed in decreasing-stride order, with the
-// maps of the transfers on it permuted to match. That only relabels which
-// index slot addresses which dim; every address is unchanged. The device
-// compiler requires views in that order.
+// A transfer pairs the elements of its two sides in stride order, stride-1
+// dim fastest. The widened load from x then fills A with the tile transposed,
+// and the splat/extract transposes it back.
 //
 // Ordering: after stage-coarsening + canonicalize, before double-buffering.
 //
 //===----------------------------------------------------------------------===//
-
-#include <limits>
 
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Analysis/Utils.h"
@@ -187,9 +184,10 @@ struct Restick {
   mlir::ktdf::DataTransferOp load;   // x -> A, in the first stage
   mlir::ktdf::DataTransferOp store;  // B -> y, in the last stage
   mlir::ktdf::PipelineOp nested;     // the A -> B per-stick pipeline
-  int64_t p = 0;      // x's stride-1 dim; never the last dim
+  int64_t p = 0;      // x's stride-1 dim; never q
+  int64_t q = 0;      // y's stride-1 dim, the one each transfer moves along
   int64_t rank = 0;   // rank of x's and y's views
-  int64_t block = 0;  // elements in one stick: the load's last size
+  int64_t block = 0;  // elements in one stick: the load's size in slot q
   /// The induction variable of the loop that walks dim p one element at a
   /// time (the point loop). It indexes slot p of the load either directly or
   /// through `linearize_index [tile_iv : tile], [point_iv : 1]`.
@@ -213,26 +211,6 @@ llvm::SmallVector<mlir::ktdf::DataTransferOp> stageTransfers(
   return transfers;
 }
 
-/// Whether the non-unit strides decrease from left to right. A size-1 dim is
-/// skipped: its index is always 0.
-bool stridesDecrease(llvm::ArrayRef<int64_t> sizes,
-                     llvm::ArrayRef<int64_t> strides) {
-  int64_t prev = std::numeric_limits<int64_t>::max();
-  for (auto [size, stride] : llvm::zip(sizes, strides)) {
-    if (size == 1) continue;
-    if (stride > prev) return false;
-    prev = stride;
-  }
-  return true;
-}
-
-/// Whether `layout` is row-major: its non-unit strides decrease and its last
-/// dim has stride 1.
-bool isRowMajor(const Layout& layout) {
-  return stridesDecrease(layout.sizes, layout.strides) &&
-         !layout.strides.empty() && layout.strides.back() == 1;
-}
-
 /// The index value at memref dim `dim` of one transfer side, when the side's
 /// map gives that dim a plain loop index; null otherwise.
 mlir::Value indexAt(mlir::AffineMap map, mlir::ValueRange indices,
@@ -242,7 +220,8 @@ mlir::Value indexAt(mlir::AffineMap map, mlir::ValueRange indices,
 }
 
 /// Looks in `pipeline` for a copy that needs re-sticking: a transfer from a
-/// global view x whose last stride is not 1 into a scratchpad buffer.
+/// global view x into a scratchpad buffer that moves its elements along a dim
+/// of x whose stride is not 1.
 /// Returns nullopt when there is none (nothing to do), failure after emitting
 /// an error when there is one this pass cannot handle.
 mlir::FailureOr<std::optional<Restick>> findRestick(
@@ -262,8 +241,14 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
     }
   }
   if (!load) return std::optional<Restick>();
+  // q: the slot the load moves its elements along, the last one whose size
+  // is not 1.
+  auto load_sizes = load.getMixedSourceSizes();
+  std::optional<int64_t> q;
+  for (auto [slot, size] : llvm::enumerate(load_sizes))
+    if (staticSize(size) != 1) q = slot;
   auto x = layoutOf(load.getSource());
-  if (mlir::failed(x) || x->strides.empty() || x->strides.back() == 1)
+  if (!q || mlir::failed(x) || x->strides[*q] == 1)
     return std::optional<Restick>();  // already moves contiguous sticks
 
   // From here on this is a re-stick: every unmet expectation is an error.
@@ -289,11 +274,12 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
   if (!store)
     return fail(load, "no transfer in the last stage stores to a global view");
   auto y = layoutOf(store.getDestination());
-  if (mlir::failed(y) || !isRowMajor(*y))
-    return fail(store, "the destination view is not row-major");
-  if ((int64_t)y->sizes.size() != rank)
-    return fail(store, "the source and destination views differ in rank (")
-           << rank << " vs " << y->sizes.size() << ")";
+  if (mlir::failed(y) || (int64_t)y->sizes.size() != rank)
+    return fail(store, "the destination view is not a static view of rank ")
+           << rank;
+  if (y->strides[*q] != 1)
+    return fail(store, "the destination view's dim ")
+           << *q << ", which each transfer moves along, does not have stride 1";
 
   // Only fp16 sticks have been run on the device; other element sizes need
   // their own block size and transfer modes checked first.
@@ -304,11 +290,11 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
     return fail(load, "only 2-byte elements are supported, got ")
            << (element_bytes ? (int64_t)*element_bytes : -1) << " bytes";
 
-  // The stick: what the load already moves along x's last dim.
-  auto load_sizes = load.getMixedSourceSizes();
-  std::optional<int64_t> stick = staticSize(load_sizes.back());
+  // The stick: what the load already moves along dim q.
+  std::optional<int64_t> stick = staticSize(load_sizes[*q]);
   if (!stick || *stick <= 1)
-    return fail(load, "the load's last size is not a static stick length");
+    return fail(load, "the load's size in slot ")
+           << *q << " is not a static stick length";
   int64_t block = *stick;
 
   int64_t extent = x->sizes[*p];
@@ -317,12 +303,12 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
                               << ", not a multiple of the stick size "
                               << block;
 
-  // Each transfer moves one stick: size `block` in the last slot, 1 elsewhere.
+  // Each transfer moves one stick: size `block` in slot q, 1 elsewhere.
   for (auto [transfer, sizes] :
        {std::pair{load, load.getMixedSourceSizes()},
         std::pair{store, store.getMixedDestSizes()}}) {
     for (auto [slot, size] : llvm::enumerate(sizes)) {
-      int64_t want = (int64_t)slot == rank - 1 ? block : 1;
+      int64_t want = (int64_t)slot == *q ? block : 1;
       if (staticSize(size) != want)
         return fail(transfer, "global-side size in slot ")
                << slot << " is not " << want
@@ -336,7 +322,7 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
   if (!nested)
     return fail(pipeline, "no nested pipeline moves sticks from A to B");
 
-  Restick plan{load, store, nested, *p, rank, block, {}, {}};
+  Restick plan{load, store, nested, *p, *q, rank, block, {}, {}};
 
   // The loop over dim p, from what indexes slot p of the load.
   mlir::Value slot_p = indexAt(load.getSourceMap().value(),
@@ -428,7 +414,7 @@ void resizeBuffer(StagingBuffer& buffer,
 /// comment for the shape of the result.
 mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
   mlir::MLIRContext* ctx = plan.load.getContext();
-  const int64_t p = plan.p, last = plan.rank - 1, block = plan.block;
+  const int64_t p = plan.p, q = plan.q, block = plan.block;
   mlir::Location loc = plan.load.getLoc();
 
   // The constants every step uses, once each, at the top of the function so
@@ -508,7 +494,7 @@ mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
   resizeBuffer(*b, new_sizes, builder);
 
   // 4. The load and store move a whole tile: size `block` in slot p as well
-  //    as in the last slot, on both sides.
+  //    as in slot q, on both sides.
   for (auto [op, global_is_source] :
        {std::pair{plan.load, true}, std::pair{plan.store, false}}) {
     TransferParts parts(op);
@@ -522,7 +508,7 @@ mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
   // 5. The nested pipeline transposes each tile one element at a time:
   //    element (r, c) of A goes to (c, r) of B. Wrap it in loops r, c over
   //    [0, block). Its read from A becomes a one-element splat at
-  //    (lead + p, last) = (r, c); its write to B a one-element extract at
+  //    (lead + p, lead + q) = (r, c); its write to B a one-element extract at
   //    (c, r).
   builder.setInsertionPoint(plan.nested);
   auto r_loop = mlir::scf::ForOp::create(builder, loc, c0, c_block, c1);
@@ -550,7 +536,7 @@ mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
                  << k << " is not indexed by a loop";
       }
       element[lead + p] = reads_buffer ? r : c;
-      element[lead + last] = reads_buffer ? c : r;
+      element[lead + q] = reads_buffer ? c : r;
       map = mlir::AffineMap::getMultiDimIdentityMap(element.size(), ctx);
       indices = element;
       llvm::fill(sizes, indexAttr(ctx, 1));
