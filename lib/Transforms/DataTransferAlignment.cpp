@@ -44,6 +44,11 @@
 // dim fastest. The widened load from x then fills A with the tile transposed,
 // and the splat/extract transposes it back.
 //
+// Only a pure copy is widened in place: A, B and the FIFOs between them must
+// have no other reader. A strided load that feeds anything else (x + y^T)
+// needs its own transpose stage, which this pass does not build; it is an
+// error.
+//
 // Ordering: after stage-coarsening + canonicalize, before double-buffering.
 //
 //===----------------------------------------------------------------------===//
@@ -143,8 +148,10 @@ mlir::Value indexConstant(mlir::Block* block, int64_t value,
 /// One strided copy x -> y found in a ktdf.pipeline, and what widening it
 /// changes. Built by `findRestick`, consumed by `widenRestick`.
 struct Restick {
-  mlir::ktdf::DataTransferOp load;   // x -> A, in the first stage
-  mlir::ktdf::DataTransferOp store;  // B -> y, in the last stage
+  mlir::ktdf::DataTransferOp load;    // x -> A
+  mlir::ktdf::DataTransferOp from_a;  // A -> FIFO, in a nested pipeline
+  mlir::ktdf::DataTransferOp into_b;  // FIFO -> B, in the same one
+  mlir::ktdf::DataTransferOp store;   // B -> y
   int64_t p = 0;      // x's stride-1 dim; never q
   int64_t q = 0;      // y's stride-1 dim, the one each transfer moves along
   int64_t rank = 0;   // rank of x's and y's views
@@ -186,6 +193,32 @@ llvm::SmallVector<mlir::ktdf::DataTransferOp> stageTransfers(
   return transfers;
 }
 
+/// The one user of `value` other than `user`, if it is an `OpT`; null when
+/// there is none, more than one, or it is another op.
+template <typename OpT>
+OpT soleOtherUser(mlir::Value value, mlir::Operation* user) {
+  OpT other;
+  for (mlir::Operation* op : value.getUsers()) {
+    if (op == user) continue;
+    if (other && op != other.getOperation()) return {};
+    other = mlir::dyn_cast<OpT>(op);
+    if (!other) return {};
+  }
+  return other;
+}
+
+/// The slot `load` moves its elements along, the last one whose size is not
+/// 1, when x's stride in it is not 1: the load needs re-sticking. nullopt
+/// otherwise.
+std::optional<int64_t> restickSlot(mlir::ktdf::DataTransferOp load) {
+  std::optional<int64_t> q;
+  for (auto [slot, size] : llvm::enumerate(load.getMixedSourceSizes()))
+    if (mlir::getConstantIntValue(size) != 1) q = slot;
+  auto x = layoutOf(load.getSource());
+  if (!q || mlir::failed(x) || x->strides[*q] == 1) return std::nullopt;
+  return q;
+}
+
 /// The index value at memref dim `dim` of one transfer side, when the side's
 /// map gives that dim a plain loop index; null otherwise.
 mlir::Value indexAt(mlir::AffineMap map, mlir::ValueRange indices,
@@ -203,59 +236,89 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
     mlir::ktdf::PipelineOp pipeline,
     const scheduler::arch_view::MemoryTree& memory_tree,
     mlir::ktdf_arch::ExecutionUnitOp compute) {
-  auto stages = llvm::to_vector(pipeline.getStages());
-  if (stages.empty()) return std::optional<Restick>();
-
-  // The load: x -> A in the first stage.
-  mlir::ktdf::DataTransferOp load;
-  for (auto transfer : stageTransfers(stages.front())) {
-    if (transfer.isSourceMemRef() &&
-        !isScratchpad(transfer.getSource(), memory_tree) &&
-        isScratchpad(transfer.getDestination(), memory_tree)) {
-      load = transfer;
-      break;
-    }
-  }
-  if (!load) return std::optional<Restick>();
-  // q: the slot the load moves its elements along, the last one whose size
-  // is not 1.
-  auto load_sizes = load.getMixedSourceSizes();
-  std::optional<int64_t> q;
-  for (auto [slot, size] : llvm::enumerate(load_sizes))
-    if (mlir::getConstantIntValue(size) != 1) q = slot;
-  auto x = layoutOf(load.getSource());
-  if (!q || mlir::failed(x) || x->strides[*q] == 1)
-    return std::optional<Restick>();  // already moves contiguous sticks
-
-  // From here on this is a re-stick: every unmet expectation is an error.
   auto fail = [](mlir::Operation* at, const llvm::Twine& msg) {
     mlir::InFlightDiagnostic diag = at->emitError(PASS_NAME ": ");
     diag << msg;
     return diag;
   };
 
+  // The load: a transfer x -> A that moves its elements along a dim of x
+  // whose stride is not 1.
+  mlir::ktdf::DataTransferOp load;
+  int64_t q = 0;
+  for (auto stage : pipeline.getStages()) {
+    for (auto transfer : stageTransfers(stage)) {
+      if (!transfer.isSourceMemRef() ||
+          isScratchpad(transfer.getSource(), memory_tree) ||
+          !isScratchpad(transfer.getDestination(), memory_tree))
+        continue;
+      std::optional<int64_t> slot = restickSlot(transfer);
+      if (!slot) continue;  // already moves contiguous sticks
+      if (load)
+        return fail(transfer, "a second load in the pipeline needs "
+                              "re-sticking; only one per pipeline is "
+                              "supported");
+      load = transfer;
+      q = *slot;
+    }
+  }
+  if (!load) return std::optional<Restick>();
+
+  // From here on this is a re-stick: every unmet expectation is an error.
+  auto x = layoutOf(load.getSource());
   std::optional<int64_t> p = unitStrideDim(*x);
   if (!p) return fail(load, "the source view has no dim with stride 1");
   int64_t rank = x->sizes.size();
 
-  mlir::ktdf::DataTransferOp store;
-  for (auto transfer : stageTransfers(stages.back())) {
-    if (transfer.isDestMemRef() &&
-        !isScratchpad(transfer.getDestination(), memory_tree) &&
-        isScratchpad(transfer.getSource(), memory_tree)) {
-      store = transfer;
-      break;
-    }
+  // The copy A -> FIFO -> FIFO -> B -> y the load feeds. Widening edits each
+  // of these in place, so none may have another reader.
+  auto not_a_copy = [&]() {
+    return fail(load, "the load does not feed a plain copy to a global view "
+                      "(A -> FIFO, read_from_fifo, write_to_fifo, FIFO -> B, "
+                      "B -> y, with nothing else reading A, the FIFOs or B); "
+                      "re-sticking it needs its own transpose stage, which "
+                      "is not supported");
+  };
+  auto from_a = soleOtherUser<mlir::ktdf::DataTransferOp>(
+      load.getDestination(), load);
+  if (!from_a || from_a.getSource() != load.getDestination() ||
+      !from_a.isDestFifo())
+    return not_a_copy();
+  // The FIFO A's sticks go into is either read by B's transfer directly, or
+  // passed on unchanged by read_from_fifo + write_to_fifo.
+  mlir::Value fifo_in = from_a.getDestination(), fifo_out = fifo_in;
+  auto into_b = soleOtherUser<mlir::ktdf::DataTransferOp>(fifo_in, from_a);
+  if (!into_b) {
+    auto read = soleOtherUser<mlir::ktdf::ReadFromFifoOp>(fifo_in, from_a);
+    if (!read || !read->hasOneUse()) return not_a_copy();
+    auto write =
+        mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(*read->getUsers().begin());
+    if (!write || write.getData() != read.getResult()) return not_a_copy();
+    fifo_out = write.getFifoSlot();
+    into_b = soleOtherUser<mlir::ktdf::DataTransferOp>(fifo_out, write);
   }
-  if (!store)
-    return fail(load, "no transfer in the last stage stores to a global view");
+  if (!into_b || into_b.getSource() != fifo_out ||
+      !into_b.isDestMemRef() ||
+      !isScratchpad(into_b.getDestination(), memory_tree))
+    return not_a_copy();
+  auto store = soleOtherUser<mlir::ktdf::DataTransferOp>(
+      into_b.getDestination(), into_b);
+  if (!store || store.getSource() != into_b.getDestination() ||
+      !store.isDestMemRef() || isScratchpad(store.getDestination(), memory_tree))
+    return not_a_copy();
+  auto hop = from_a->getParentOfType<mlir::ktdf::PipelineOp>();
+  if (into_b->getParentOfType<mlir::ktdf::PipelineOp>() != hop ||
+      hop == pipeline)
+    return fail(load, "the copy's A -> B hop is not in a pipeline nested in "
+                      "the re-stick's");
+
   auto y = layoutOf(store.getDestination());
   if (mlir::failed(y) || (int64_t)y->sizes.size() != rank)
     return fail(store, "the destination view is not a static view of rank ")
            << rank;
-  if (y->strides[*q] != 1)
+  if (y->strides[q] != 1)
     return fail(store, "the destination view's dim ")
-           << *q << ", which each transfer moves along, does not have stride 1";
+           << q << ", which each transfer moves along, does not have stride 1";
 
   // Only fp16 sticks have been run on the device; other element sizes need
   // their own transfer modes checked first.
@@ -270,9 +333,9 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
   int64_t block = stickSize(load, compute);
   if (block <= 1)
     return fail(load, "the device has no SIMD lanes for ") << element_type;
-  if (mlir::getConstantIntValue(load_sizes[*q]) != block)
+  if (mlir::getConstantIntValue(load.getMixedSourceSizes()[q]) != block)
     return fail(load, "the load's size in slot ")
-           << *q << " is not one stick (" << block << " elements)";
+           << q << " is not one stick (" << block << " elements)";
 
   int64_t extent = x->sizes[*p];
   if (extent % block != 0)
@@ -285,7 +348,7 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
        {std::pair{load, load.getMixedSourceSizes()},
         std::pair{store, store.getMixedDestSizes()}}) {
     for (auto [slot, size] : llvm::enumerate(sizes)) {
-      int64_t want = (int64_t)slot == *q ? block : 1;
+      int64_t want = (int64_t)slot == q ? block : 1;
       if (mlir::getConstantIntValue(size) != want)
         return fail(transfer, "global-side size in slot ")
                << slot << " is not " << want
@@ -307,7 +370,7 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
            << *p << " is walked by an untiled loop over " << extent
            << " elements; only one stick (" << block << ") is supported";
   return std::optional<Restick>(
-      Restick{load, store, *p, *q, rank});
+      Restick{load, from_a, into_b, store, *p, q, rank});
 }
 
 SlotP slotPOf(mlir::ktdf::DataTransferOp load, int64_t p) {
@@ -410,26 +473,8 @@ mlir::LogicalResult widenRestick(Restick plan,
                                 ": staging buffers must have the view rank "
                                 "plus the same number of loop dims");
 
-  // The copy's A -> B hop: the transfer reading A into a FIFO and the one
-  // writing a FIFO into B, in a pipeline nested in the re-stick's.
-  //
-  // TODO: the transpose replaces these two transfers and keeps whatever runs
-  // between them. That is right only when the hop is a plain copy (read_from_
-  // fifo then write_to_fifo); it is not checked.
-  mlir::ktdf::DataTransferOp from_a, into_b;
-  plan.load->getParentOfType<mlir::ktdf::PipelineOp>()->walk(
-      [&](mlir::ktdf::DataTransferOp op) {
-        if (op.getSource() == a->value && op.isDestFifo()) from_a = op;
-        if (op.getDestination() == b->value && op.isSourceFifo()) into_b = op;
-      });
-  auto hop = from_a ? from_a->getParentOfType<mlir::ktdf::PipelineOp>()
-                    : mlir::ktdf::PipelineOp();
-  if (!from_a || !into_b ||
-      into_b->getParentOfType<mlir::ktdf::PipelineOp>() != hop ||
-      hop == plan.load->getParentOfType<mlir::ktdf::PipelineOp>())
-    return plan.load->emitError(PASS_NAME
-                                ": no pipeline nested in the re-stick moves "
-                                "A into a FIFO and a FIFO into B");
+  mlir::ktdf::DataTransferOp from_a = plan.from_a, into_b = plan.into_b;
+  auto hop = from_a->getParentOfType<mlir::ktdf::PipelineOp>();
 
   SlotP slot_p = slotPOf(plan.load, p);
 
@@ -467,6 +512,28 @@ mlir::LogicalResult widenRestick(Restick plan,
         point_loops.insert(loop);
       }
     }
+  }
+
+  // The point loops run their body once per element along dim p; removing
+  // them is right only if they move no data but the copy's. Any other data
+  // reaches a stage through a transfer or a FIFO, so those are what is
+  // checked. Checked before anything is changed.
+  for (mlir::scf::ForOp loop : point_loops) {
+    mlir::Operation* other = nullptr;
+    loop->walk([&](mlir::Operation* op) {
+      bool ours = true;
+      if (auto t = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op))
+        ours = t == plan.load || t == from_a || t == into_b || t == plan.store;
+      else if (auto r = mlir::dyn_cast<mlir::ktdf::ReadFromFifoOp>(op))
+        ours = r.getFifoSlot() == from_a.getDestination();
+      else if (auto w = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(op))
+        ours = w.getFifoSlot() == into_b.getSource();
+      if (!ours) other = op;
+    });
+    if (other)
+      return other->emitError(PASS_NAME
+                              ": this op shares a point loop over the stick "
+                              "dim with a re-stick, which removes the loop");
   }
 
   // 2. A re-stick tile is one stick along dim p, so a tiled loop over dim p
