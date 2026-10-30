@@ -9,25 +9,23 @@
 // CHECK-DAG:    %[[A1:.*]] = memref.alloc(%{{.*}}) : memref<?x1x1x64x64xf16, "L1">
 // CHECK:        ktdf.private_yield %[[A0]], %[[A1]]
 
-// MNILU Stage: loop bound adjusted to 1, transfer widened to [1, 64, 64]
+// MNILU Stage: point loop removed, transfer widened to [1, 64, 64]
 // CHECK:      ktdf.stage
 // CHECK:        scf.for %[[ARG2:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK:          scf.for %[[ARG3:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK:            ktdf.data_transfer from %{{.*}} size [1, 64, 64] to %[[PRIV]]#0[%[[ARG2]], %[[ARG3]], 0, 0, 0] size [1, 1, 1, 64, 64]
+// CHECK:            ktdf.data_transfer from %{{.*}} size [1, 64, 64] to %[[PRIV]]#0[%[[ARG2]], %c0, 0, 0, 0] size [1, 1, 1, 64, 64]
 
 // Middle Stage: nested pipeline wrapped with element loops for scalar processing
 // CHECK:      ktdf.stage
 // CHECK:        scf.for %[[ARG2:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK:          scf.for %[[ARG3:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:            scf.for %[[ARG4:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:              scf.for %[[ARG5:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:                ktdf.pipeline {
 // CHECK:                  ktdf.stage {{.*}} {
-// CHECK:                    ktdf.data_transfer from %[[PRIV]]#0[%[[ARG2]], %[[ARG3]], %{{.*}}, %[[ARG4]], %[[ARG5]]] size [1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
+// CHECK:                    ktdf.data_transfer from %[[PRIV]]#0[%[[ARG2]], %c0, %{{.*}}, %[[ARG4]], %[[ARG5]]] size [1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
 // CHECK:                  }
 // CHECK:                  ktdf.stage
 // CHECK:                  ktdf.stage {{.*}} {
-// CHECK:                    ktdf.data_transfer from %{{.*}} size [64] to %[[PRIV]]#1[%[[ARG2]], %[[ARG3]], %{{.*}}, %[[ARG5]], %[[ARG4]]] size [1, 1, 1, 1, 1] {transfer_mode = "extract"}
+// CHECK:                    ktdf.data_transfer from %{{.*}} size [64] to %[[PRIV]]#1[%[[ARG2]], %c0, %{{.*}}, %[[ARG5]], %[[ARG4]]] size [1, 1, 1, 1, 1] {transfer_mode = "extract"}
 // CHECK:                  }
 // CHECK:                }
 // CHECK:              }
@@ -35,11 +33,10 @@
 // CHECK:          }
 // CHECK:        }
 
-// MNISU Stage: loop bound adjusted to 1, transfer widened to [1, 64, 64]
+// MNISU Stage: point loop removed, transfer widened to [1, 64, 64]
 // CHECK:      ktdf.stage
 // CHECK:        scf.for %[[ARG2:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK:          scf.for %[[ARG3:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK:            ktdf.data_transfer from %[[PRIV]]#1[%[[ARG2]], %[[ARG3]], 0, 0, 0] size [1, 1, 1, 64, 64] to %{{.*}} size [1, 64, 64]
+// CHECK:            ktdf.data_transfer from %[[PRIV]]#1[%[[ARG2]], %c0, 0, 0, 0] size [1, 1, 1, 64, 64] to %{{.*}} size [1, 64, 64]
 
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 11 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 

@@ -69,6 +69,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IntegerSet.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 
 #define PASS_NAME "data-transfer-alignment"
@@ -148,15 +149,18 @@ struct Restick {
   int64_t q = 0;      // y's stride-1 dim, the one each transfer moves along
   int64_t rank = 0;   // rank of x's and y's views
   int64_t block = 0;  // elements in one stick: the SIMD lanes for x's type
-  /// The induction variable of the loop that walks dim p one element at a
-  /// time (the point loop). It indexes slot p of the load either directly or
-  /// through `linearize_index [tile_iv : tile], [point_iv : 1]`.
-  mlir::Value point_iv;
-  /// The tile size of dim p when its loop is tiled: a reserve_size
-  /// placeholder, which widenRestick constrains to one stick. Null when the
-  /// loop is not tiled.
-  mlir::ktdf::TilingReserveSizeOp tile;
 };
+
+/// What indexes slot p of the load: the IV of the loop that walks dim p one
+/// element at a time (the point loop), either directly or through
+/// `linearize_index [tile_iv : tile], [point_iv : 1]`, whose `tile` is the
+/// reserve_size placeholder of a tiled loop over dim p. Null fields when the
+/// slot has neither form.
+struct SlotP {
+  mlir::Value point_iv;
+  mlir::ktdf::TilingReserveSizeOp tile;  // null when dim p is not tiled
+};
+SlotP slotPOf(mlir::ktdf::DataTransferOp load, int64_t p);
 
 /// The ktdf.data_transfer ops directly inside `stage`, outside any nested
 /// pipeline.
@@ -288,38 +292,35 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
   if (!nested)
     return fail(pipeline, "no nested pipeline moves sticks from A to B");
 
-  Restick plan{load, store, nested, *p, *q, rank, block, {}, {}};
-
   // The loop over dim p, from what indexes slot p of the load.
-  mlir::Value slot_p = indexAt(load.getSourceMap().value(),
-                               load.getSourceIndices(), *p);
-  if (slot_p && mlir::scf::getForInductionVarOwner(slot_p)) {
-    // Not tiled: the slot is the loop's own IV, and the loop walks the whole
-    // dim, so the dim must be one stick.
-    if (extent != block)
-      return fail(load, "dim ")
-             << *p << " is walked by an untiled loop over " << extent
-             << " elements; only one stick (" << block << ") is supported";
-    plan.point_iv = slot_p;
-  } else if (auto lin = slot_p ? slot_p.getDefiningOp<
-                                     mlir::ktdf::TilingLinearizeIndexOp>()
-                               : nullptr;
-             lin && lin.getIvs().size() == 2) {
-    plan.point_iv = lin.getIvs()[1];
-    plan.tile =
-        lin.getStrides()[0].getDefiningOp<mlir::ktdf::TilingReserveSizeOp>();
-    if (!plan.tile)
-      return fail(load, "the tile size of dim ")
-             << *p << " is not a ktdf.tiling.reserve_size placeholder";
-  } else {
+  SlotP slot_p = slotPOf(load, *p);
+  if (!slot_p.point_iv)
     return fail(load, "slot ")
            << *p << " of the load is not indexed by a loop over dim " << *p
            << " (expected a loop IV or `linearize_index [tile_iv : tile], "
-              "[point_iv : 1]`)";
-  }
-  if (!mlir::scf::getForInductionVarOwner(plan.point_iv))
-    return fail(load, "the point index of dim ") << *p << " is not a loop IV";
-  return std::optional<Restick>(plan);
+              "[point_iv : 1]` with a ktdf.tiling.reserve_size tile)";
+  // Not tiled: the loop walks the whole dim, so the dim must be one stick.
+  if (!slot_p.tile && extent != block)
+    return fail(load, "dim ")
+           << *p << " is walked by an untiled loop over " << extent
+           << " elements; only one stick (" << block << ") is supported";
+  return std::optional<Restick>(
+      Restick{load, store, nested, *p, *q, rank, block});
+}
+
+SlotP slotPOf(mlir::ktdf::DataTransferOp load, int64_t p) {
+  mlir::Value index =
+      indexAt(load.getSourceMap().value(), load.getSourceIndices(), p);
+  if (!index) return {};
+  if (mlir::scf::getForInductionVarOwner(index)) return {index, {}};
+  auto lin = index.getDefiningOp<mlir::ktdf::TilingLinearizeIndexOp>();
+  if (!lin || lin.getIvs().size() != 2 ||
+      !mlir::scf::getForInductionVarOwner(lin.getIvs()[1]))
+    return {};
+  auto tile =
+      lin.getStrides()[0].getDefiningOp<mlir::ktdf::TilingReserveSizeOp>();
+  if (!tile) return {};
+  return {lin.getIvs()[1], tile};
 }
 
 //===----------------------------------------------------------------------===//
@@ -405,20 +406,22 @@ mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
                                 ": staging buffers must have the view rank "
                                 "plus the same number of loop dims");
 
+  SlotP slot_p = slotPOf(plan.load, p);
+
   // The buffer dim that holds the point loop over dim p, if the point loop
   // is inside the pipeline. Every stage indexes it with its own copy of that
   // loop.
   std::optional<int64_t> kp;
   for (int64_t k = 0; k < lead; ++k)
     if (indexAt(plan.load.getDestMap().value(), plan.load.getDestIndices(),
-                k) == plan.point_iv)
+                k) == slot_p.point_iv)
       kp = k;
 
-  // 1. Every point loop over dim p runs once: the widened transfers cover the
-  //    whole stick in one go. The loops are the one indexing slot p of the
-  //    load and, in each stage, the one indexing buffer dim kp.
+  // 1. The point loops over dim p: the one indexing slot p of the load and, in
+  //    each stage, the one indexing buffer dim kp. The widened transfers cover
+  //    the whole stick, so step 6 removes them.
   llvm::SetVector<mlir::scf::ForOp> point_loops;
-  point_loops.insert(mlir::scf::getForInductionVarOwner(plan.point_iv));
+  point_loops.insert(mlir::scf::getForInductionVarOwner(slot_p.point_iv));
   if (kp) {
     llvm::SmallVector<mlir::ktdf::DataTransferOp> on_buffers;
     plan.load->getParentOfType<mlir::ktdf::PipelineOp>()->walk(
@@ -441,26 +444,16 @@ mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
     }
   }
 
-  // 2. A tiled loop over dim p gets one stick per tile. Its tile size stays a
-  //    placeholder for tile-size-selection, constrained to a multiple of
-  //    `block` no smaller than `block`.
-  //
-  //    The widening below assumes exactly one stick per tile: every point
-  //    loop over dim p runs once and A and B hold one stick along p. That
-  //    holds because tile-size-selection tries no tile size above
-  //    max(min_value, its largest candidate), which is `block`. If it can
-  //    pick k > 1 sticks, the point loops must walk sticks instead (upper
-  //    bound tile / block, stride `block` in slot p's linearize_index) and A
-  //    and B need a dim of tile / block; constrain-tile-to-one-stick.mlir
-  //    fails until then.
-  if (plan.tile) {
-    auto index_attr = [&](int64_t v) {
-      return mlir::IntegerAttr::get(mlir::IndexType::get(ctx), v);
-    };
-    plan.tile.setMinValueAttr(index_attr(block));
-    plan.tile.setDivisibilityAttr(index_attr(block));
+  // 2. A re-stick tile is one stick along dim p, so a tiled loop over dim p
+  //    has no tile size to choose: its placeholder becomes `block`. Every op
+  //    stage coarsening derived from it (the tile loop's trip count, the
+  //    linearize_index strides, the buffers' sizes) follows. The placeholder
+  //    exists only because loop tiling runs before this pass and tiles every
+  //    loop of a nest alike.
+  if (slot_p.tile) {
+    slot_p.tile.replaceAllUsesWith(c_block);
+    slot_p.tile.erase();
   }
-  for (mlir::scf::ForOp loop : point_loops) loop.setUpperBound(c1);
 
   // 3. The buffers hold one tile per point of the remaining loops: view dim p
   //    grows to `block`, the point dim over p shrinks to 1.
@@ -537,6 +530,16 @@ mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
           "transfer_mode",
           mlir::StringAttr::get(ctx, reads_buffer ? "splat" : "extract"));
     }
+  }
+
+  // 6. Remove the point loops over dim p: their body runs once, at point 0.
+  mlir::IRRewriter rewriter(builder);
+  for (mlir::scf::ForOp loop : point_loops) {
+    loop.setUpperBound(c1);
+    if (mlir::failed(loop.promoteIfSingleIteration(rewriter)))
+      return loop->emitError(PASS_NAME
+                             ": the point loop over the stick dim does not "
+                             "start at 0 with step 1");
   }
   return mlir::success();
 }

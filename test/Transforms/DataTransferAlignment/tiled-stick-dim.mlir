@@ -1,32 +1,29 @@
-// RUN: dataflow-scheduler-opt --data-transfer-alignment --tile-size-selection %s | FileCheck %s
+// RUN: dataflow-scheduler-opt --data-transfer-alignment %s | FileCheck %s
 
-// Pins the assumption that a tiled stick dim gets exactly one stick per tile.
+// A tiled loop over the stick dim. x is 128 x 64 with strides [1, 128], so its
+// stride-1 dim p = 0 holds two sticks, and loop tiling gave the loop over it a
+// ktdf.tiling.reserve_size tile size.
 //
-// data-transfer-alignment leaves the tile size of dim p (x's stride-1 dim) as
-// a ktdf.tiling.reserve_size placeholder constrained to a multiple of one
-// stick (64), and widens the copy assuming the tile is exactly one stick: the
-// point loops over dim p run once and A and B hold one stick along p.
-// tile-size-selection must then pick 64. It does today because it tries no
-// tile size above max(min_value, its largest candidate).
-//
-// If tile-size-selection can pick more than one stick, this test fails:
-// widenRestick must then walk the sticks of a tile with the point loops
-// (upper bound tile / 64, stride 64 in slot p's linearize_index) and give A
-// and B a dim of tile / 64.
-//
-// x is 128 x 64 with strides [1, 128]: dim p = 0 holds two sticks.
+// A re-stick tile is one stick along p, so there is no tile size to choose:
+// the placeholder becomes 64, and the tile loop walks the two sticks. The
+// point loops over p, which would run once, are removed: each stage moves the
+// whole stick at point 0.
 
 // CHECK-LABEL: func.func @tiled
 // CHECK-NOT:     ktdf.tiling.reserve_size
-// CHECK:         ktdp.construct_memory_view
-// The tile size of dim p: 64, one stick.
-// CHECK:         %[[TILE:.*]] = arith.constant 64 : index
-// CHECK-NEXT:    %[[NT:.*]] = arith.ceildivui %c128, %[[TILE]] : index
+// CHECK:         %[[NT:.*]] = arith.ceildivui %c128, %c64 : index
 // CHECK:         scf.for %[[T:.*]] = %c0 to %[[NT]] step %c1 {
-// CHECK:           scf.for %[[I:.*]] = %c0 to %c1 step %c1 {
-// CHECK-NEXT:        %[[ROW:.*]] = ktdf.tiling.linearize_index [%[[T]] : %[[TILE]]], [%[[I]] : %c1] : index
-// CHECK-NEXT:        ktdf.data_transfer from %{{.*}}[%[[ROW]], %c0 * 64] size [64, 64]
-
+// CHECK:           ktdf.stage
+// CHECK-NEXT:        %[[ROW:.*]] = ktdf.tiling.linearize_index [%[[T]] : %c64], [%c0 : %c1] : index
+// CHECK-NEXT:        ktdf.data_transfer from %{{.*}}[%[[ROW]], %c0 * 64] size [64, 64] to %{{.*}}[%c0, 0, 0] size [1, 64, 64]
+// CHECK:           ktdf.stage
+// CHECK-NEXT:        scf.for %[[R:.*]] = %c0 to %c64 step %c1 {
+// CHECK-NEXT:          scf.for %[[C:.*]] = %c0 to %c64 step %c1 {
+// CHECK:                 {transfer_mode = "splat"}
+// CHECK:                 {transfer_mode = "extract"}
+// CHECK:           ktdf.stage
+// CHECK-NEXT:        %[[ROW:.*]] = ktdf.tiling.linearize_index [%[[T]] : %c64], [%c0 : %c1] : index
+// CHECK-NEXT:        ktdf.data_transfer from %{{.*}}[%c0, 0, 0] size [1, 64, 64] to %{{.*}}[%[[ROW]], %c0 * 64] size [64, 64]
 
 #set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>
 ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">} import("../../Dialect/KTDFArch/sample_device.mlir")
