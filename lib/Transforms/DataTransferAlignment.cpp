@@ -27,17 +27,18 @@
 //   stage L3SU:  B  -> y     one stick of y per transfer
 //
 // Every transfer carries one index per view dim, and x and y index the same
-// loop dims in the same order. A stick is a run of `block` contiguous elements
-// (128 bytes: 64 fp16). Each transfer moves one stick along dim q, y's
-// stride-1 dim. Let p be x's stride-1 dim.
+// loop dims in the same order. A stick is a run of `block` contiguous
+// elements, the default compute unit's SIMD lanes for the element type. Each
+// transfer moves one stick along dim q, y's stride-1 dim. Let p be x's
+// stride-1 dim.
 //
 //   - p == q: x's sticks are y's sticks. Each transfer already moves a whole
 //     contiguous stick; nothing is widened.
 //   - p != q: a stick of x runs along p, a stick of y along q. The pass widens
-//     the copy to `block` x `block` tiles: the loop over dim p is pinned to one
-//     stick, the load and store move a whole tile, and the nested pipeline
-//     transposes each tile element by element (splat out of A, extract into
-//     B). The views are not rewritten.
+//     the copy to `block` x `block` tiles, one stick along p and along q: the
+//     load and store move a whole tile, the point loops over dim p are
+//     removed, and the nested pipeline transposes each tile element by
+//     element (splat out of A, extract into B). The views are not rewritten.
 //
 // A transfer pairs the elements of its two sides in stride order, stride-1
 // dim fastest. The widened load from x then fills A with the tile transposed,
@@ -144,12 +145,21 @@ mlir::Value indexConstant(mlir::Block* block, int64_t value,
 struct Restick {
   mlir::ktdf::DataTransferOp load;   // x -> A, in the first stage
   mlir::ktdf::DataTransferOp store;  // B -> y, in the last stage
-  mlir::ktdf::PipelineOp nested;     // the A -> B per-stick pipeline
   int64_t p = 0;      // x's stride-1 dim; never q
   int64_t q = 0;      // y's stride-1 dim, the one each transfer moves along
   int64_t rank = 0;   // rank of x's and y's views
-  int64_t block = 0;  // elements in one stick: the SIMD lanes for x's type
 };
+
+/// Elements in one stick of `transfer`'s element type: the SIMD lanes of
+/// `compute` for it; 0 if it has none.
+int64_t stickSize(mlir::ktdf::DataTransferOp transfer,
+                  mlir::ktdf_arch::ExecutionUnitOp compute) {
+  mlir::Type element_type =
+      mlir::cast<mlir::MemRefType>(transfer.getSource().getType())
+          .getElementType();
+  return compute.getFeature<mlir::ktdf_arch::feature::SIMD>().getLanes(
+      element_type);
+}
 
 /// What indexes slot p of the load: the IV of the loop that walks dim p one
 /// element at a time (the point loop), either directly or through
@@ -256,11 +266,8 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
     return fail(load, "only 2-byte elements are supported, got ")
            << (element_bytes ? (int64_t)*element_bytes : -1) << " bytes";
 
-  // A stick: the compute unit's SIMD lanes for x's element type. The load
-  // must already move one along dim q.
-  int64_t block =
-      compute.getFeature<mlir::ktdf_arch::feature::SIMD>().getLanes(
-          element_type);
+  // The load must already move one stick along dim q.
+  int64_t block = stickSize(load, compute);
   if (block <= 1)
     return fail(load, "the device has no SIMD lanes for ") << element_type;
   if (mlir::getConstantIntValue(load_sizes[*q]) != block)
@@ -286,11 +293,6 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
     }
   }
 
-  mlir::ktdf::PipelineOp nested;
-  for (auto stage : stages)
-    stage->walk([&](mlir::ktdf::PipelineOp inner) { nested = inner; });
-  if (!nested)
-    return fail(pipeline, "no nested pipeline moves sticks from A to B");
 
   // The loop over dim p, from what indexes slot p of the load.
   SlotP slot_p = slotPOf(load, *p);
@@ -305,7 +307,7 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
            << *p << " is walked by an untiled loop over " << extent
            << " elements; only one stick (" << block << ") is supported";
   return std::optional<Restick>(
-      Restick{load, store, nested, *p, *q, rank, block});
+      Restick{load, store, *p, *q, rank});
 }
 
 SlotP slotPOf(mlir::ktdf::DataTransferOp load, int64_t p) {
@@ -379,9 +381,11 @@ void resizeBuffer(StagingBuffer& buffer,
 
 /// Widens the re-stick `plan` to `block` x `block` tiles. See the file
 /// comment for the shape of the result.
-mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
+mlir::LogicalResult widenRestick(Restick plan,
+                                 mlir::ktdf_arch::ExecutionUnitOp compute,
+                                 mlir::OpBuilder& builder) {
   mlir::MLIRContext* ctx = plan.load.getContext();
-  const int64_t p = plan.p, q = plan.q, block = plan.block;
+  const int64_t p = plan.p, q = plan.q, block = stickSize(plan.load, compute);
   mlir::Location loc = plan.load.getLoc();
 
   // The constants every step uses, once each, at the top of the function so
@@ -405,6 +409,27 @@ mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
     return plan.load->emitError(PASS_NAME
                                 ": staging buffers must have the view rank "
                                 "plus the same number of loop dims");
+
+  // The copy's A -> B hop: the transfer reading A into a FIFO and the one
+  // writing a FIFO into B, in a pipeline nested in the re-stick's.
+  //
+  // TODO: the transpose replaces these two transfers and keeps whatever runs
+  // between them. That is right only when the hop is a plain copy (read_from_
+  // fifo then write_to_fifo); it is not checked.
+  mlir::ktdf::DataTransferOp from_a, into_b;
+  plan.load->getParentOfType<mlir::ktdf::PipelineOp>()->walk(
+      [&](mlir::ktdf::DataTransferOp op) {
+        if (op.getSource() == a->value && op.isDestFifo()) from_a = op;
+        if (op.getDestination() == b->value && op.isSourceFifo()) into_b = op;
+      });
+  auto hop = from_a ? from_a->getParentOfType<mlir::ktdf::PipelineOp>()
+                    : mlir::ktdf::PipelineOp();
+  if (!from_a || !into_b ||
+      into_b->getParentOfType<mlir::ktdf::PipelineOp>() != hop ||
+      hop == plan.load->getParentOfType<mlir::ktdf::PipelineOp>())
+    return plan.load->emitError(PASS_NAME
+                                ": no pipeline nested in the re-stick moves "
+                                "A into a FIFO and a FIFO into B");
 
   SlotP slot_p = slotPOf(plan.load, p);
 
@@ -482,54 +507,50 @@ mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
     op.setStaticDestSizes(global_is_source ? buffer : global);
   }
 
-  // 5. The nested pipeline transposes each tile one element at a time:
-  //    element (r, c) of A goes to (c, r) of B. Wrap it in loops r, c over
-  //    [0, block). Its read from A becomes a one-element splat at
-  //    (lead + p, lead + q) = (r, c); its write to B a one-element extract at
-  //    (c, r).
-  builder.setInsertionPoint(plan.nested);
+  // 5. The copy's A -> B hop transposes each tile one element at a time:
+  //    element (r, c) of A goes to (c, r) of B. Wrap the pipeline holding the
+  //    hop in loops r, c over [0, block). Its read from A becomes a
+  //    one-element splat at (lead + p, lead + q) = (r, c); its write to B a
+  //    one-element extract at (c, r).
+  builder.setInsertionPoint(hop);
   auto r_loop = mlir::scf::ForOp::create(builder, loc, c0, c_block, c1);
   builder.setInsertionPoint(r_loop.getBody()->getTerminator());
   auto c_loop = mlir::scf::ForOp::create(builder, loc, c0, c_block, c1);
-  plan.nested->moveBefore(c_loop.getBody()->getTerminator());
+  hop->moveBefore(c_loop.getBody()->getTerminator());
   mlir::Value r = r_loop.getInductionVar(), c = c_loop.getInductionVar();
 
-  for (mlir::ktdf::StageOp stage : plan.nested.getStages()) {
-    for (mlir::ktdf::DataTransferOp op : stageTransfers(stage)) {
-      bool reads_buffer = op.getSource() == a->value;
-      bool writes_buffer = op.getDestination() == b->value;
-      if (!reads_buffer && !writes_buffer) continue;
-      mlir::AffineMap map = reads_buffer ? *op.getSourceMap() : *op.getDestMap();
-      mlir::ValueRange indices =
-          reads_buffer ? op.getSourceIndices() : op.getDestIndices();
-      // One index per buffer dim through an identity map: the point-loop
-      // indices stay, every view dim is 0 except the two the element is at.
-      llvm::SmallVector<mlir::Value> element(lead + plan.rank, c0);
-      for (int64_t k = 0; k < lead; ++k) {
-        element[k] = indexAt(map, indices, k);
-        if (!element[k])
-          return op->emitError(PASS_NAME ": staging-buffer dim ")
-                 << k << " is not indexed by a loop";
-      }
-      element[lead + p] = reads_buffer ? r : c;
-      element[lead + q] = reads_buffer ? c : r;
-      auto identity = mlir::AffineMap::getMultiDimIdentityMap(element.size(), ctx);
-      llvm::SmallVector<int64_t> ones(element.size(), 1);
-      if (reads_buffer) {
-        op.getSourceIndicesMutable().assign(element);
-        op.getSourceSizesMutable().clear();
-        op.setSourceMap(identity);
-        op.setStaticSourceSizes(ones);
-      } else {
-        op.getDestIndicesMutable().assign(element);
-        op.getDestSizesMutable().clear();
-        op.setDestMap(identity);
-        op.setStaticDestSizes(ones);
-      }
-      op->setDiscardableAttr(
-          "transfer_mode",
-          mlir::StringAttr::get(ctx, reads_buffer ? "splat" : "extract"));
+  for (mlir::ktdf::DataTransferOp op : {from_a, into_b}) {
+    bool reads_buffer = op == from_a;
+    mlir::AffineMap map = reads_buffer ? *op.getSourceMap() : *op.getDestMap();
+    mlir::ValueRange indices =
+        reads_buffer ? op.getSourceIndices() : op.getDestIndices();
+    // One index per buffer dim through an identity map: the point-loop
+    // indices stay, every view dim is 0 except the two the element is at.
+    llvm::SmallVector<mlir::Value> element(lead + plan.rank, c0);
+    for (int64_t k = 0; k < lead; ++k) {
+      element[k] = indexAt(map, indices, k);
+      if (!element[k])
+        return op->emitError(PASS_NAME ": staging-buffer dim ")
+               << k << " is not indexed by a loop";
     }
+    element[lead + p] = reads_buffer ? r : c;
+    element[lead + q] = reads_buffer ? c : r;
+    auto identity = mlir::AffineMap::getMultiDimIdentityMap(element.size(), ctx);
+    llvm::SmallVector<int64_t> ones(element.size(), 1);
+    if (reads_buffer) {
+      op.getSourceIndicesMutable().assign(element);
+      op.getSourceSizesMutable().clear();
+      op.setSourceMap(identity);
+      op.setStaticSourceSizes(ones);
+    } else {
+      op.getDestIndicesMutable().assign(element);
+      op.getDestSizesMutable().clear();
+      op.setDestMap(identity);
+      op.setStaticDestSizes(ones);
+    }
+    op->setDiscardableAttr(
+        "transfer_mode",
+        mlir::StringAttr::get(ctx, reads_buffer ? "splat" : "extract"));
   }
 
   // 6. Remove the point loops over dim p: their body runs once, at point 0.
@@ -584,9 +605,9 @@ struct DataTransferAlignmentPass
       auto plan = findRestick(pipeline, memory_tree, compute);
       if (mlir::failed(plan)) return signalPassFailure();
       if (!*plan) continue;
-      LDBG(1) << "re-stick: p = " << (*plan)->p << ", block "
-              << (*plan)->block << " at " << pipeline.getLoc();
-      if (mlir::failed(widenRestick(**plan, builder)))
+      LDBG(1) << "re-stick: p = " << (*plan)->p << ", q = " << (*plan)->q
+              << " at " << pipeline.getLoc();
+      if (mlir::failed(widenRestick(**plan, compute, builder)))
         return signalPassFailure();
     }
 
