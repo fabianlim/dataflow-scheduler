@@ -181,6 +181,17 @@ struct Candidate {
   return result;
 }
 
+/// True iff `loop` counts the tiles of a dimension whose tile size is still a
+/// `ktdf.tiling.reserve_size`: its upper bound is
+/// `arith.ceildivui(%total, %reserve_size)`. Its trip count is not known until
+/// tile-size-selection runs, and that pass finds the loops a reserve_size
+/// governs only through this bound on an scf.for, so the loop must stay one.
+[[nodiscard]] auto isUnresolvedTileCountLoop(mlir::scf::ForOp loop) -> bool {
+  auto ceildiv = loop.getUpperBound().getDefiningOp<mlir::arith::CeilDivUIOp>();
+  return ceildiv &&
+         ceildiv.getRhs().getDefiningOp<mlir::ktdf::TilingReserveSizeOp>();
+}
+
 /// Walk scope_loops outermost-to-innermost; return the first loop matching
 /// the predicate `pred(loop, trip_count_opt)`.
 /// For dynamic loops, trip_count_opt will be std::nullopt.
@@ -188,7 +199,7 @@ template <typename Pred>
 std::optional<mlir::scf::ForOp> firstMatching(
     llvm::ArrayRef<mlir::scf::ForOp> scope_loops_innermost_first, Pred pred) {
   for (mlir::scf::ForOp loop : llvm::reverse(scope_loops_innermost_first)) {
-    if (!mlir::ktdf::isParallelLoop(loop)) {
+    if (!mlir::ktdf::isParallelLoop(loop) || isUnresolvedTileCountLoop(loop)) {
       continue;
     }
     auto trip = getStaticTripCount(loop);

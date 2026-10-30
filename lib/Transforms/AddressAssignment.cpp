@@ -21,6 +21,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/Alignment.h>
 #include <llvm/Support/CommandLine.h>
@@ -31,6 +32,7 @@
 #include <mlir/Dialect/Affine/IR/ValueBoundsOpInterfaceImpl.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
+#include <mlir/Dialect/Utils/StaticValueUtils.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinTypeInterfaces.h>
 #include <mlir/IR/OpDefinition.h>
@@ -50,6 +52,7 @@
 #include "dataflow-scheduler/Dialect/KTDF/KTDFDialect.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
+#include "ktir/Dialect/KTDP/KTDP.h"
 
 #define PASS_NAME "address-assignment"
 #define DEBUG_TYPE PASS_NAME
@@ -252,6 +255,112 @@ struct AllocOp
       .wasInterrupted();
 }
 
+/// Gets the end, in bytes, of what \p view at \p base covers, or an error on
+/// \p view if that is not known statically.
+[[nodiscard]] auto getViewEnd(mlir::ktdp::ConstructMemoryViewOp view,
+                              size_t base) -> llvm::FailureOr<size_t> {
+  // The base counts elements, as the lowering to DFIR reads it, so the largest
+  // element offset adds to it before the sum is scaled to bytes.
+  size_t last = base;
+  for (auto [size, stride] :
+       llvm::zip_equal(view.getStaticSizes(), view.getStaticStrides())) {
+    if (mlir::ShapedType::isDynamic(size) ||
+        mlir::ShapedType::isDynamic(stride) || stride < 0) {
+      return view.emitError()
+             << "memory view outside global memory needs static sizes and "
+                "non-negative static strides to be kept clear of allocations";
+    }
+    // An empty view covers nothing.
+    if (size == 0) {
+      return 0;
+    }
+    size_t temp;
+    if (__builtin_mul_overflow(size - 1, stride, &temp) ||
+        __builtin_add_overflow(last, temp, &last)) {
+      return view.emitError() << "memory view too large";
+    }
+  }
+
+  const auto element_size = tryGetSizeInBytes(
+      llvm::cast<mlir::MemRefType>(view.getType()).getElementType());
+  size_t end;
+  if (!element_size || __builtin_mul_overflow(last + 1, *element_size, &end)) {
+    return view.emitError()
+           << "memory view of unsupported element type or too large";
+  }
+  return end;
+}
+
+/// Keeps every allocation of \p module off the memory views it has outside
+/// global memory, in all programs alike.
+///
+/// Such a view is how one program hands an intermediate to the next in memory
+/// the programs otherwise have to themselves. It is not an allocation, and the
+/// kernel fixed its address, so nothing placed after the first free address
+/// would know to stay clear of it: each memory's first free address is raised
+/// to the end of the highest view in it instead. Where the views sit relative
+/// to each other is owned by whoever chose their addresses, and is not checked
+/// here.
+[[nodiscard]] auto reserveMemoryViews(mlir::ModuleOp module,
+                                      MemoryTrackerAnalysis& tracker)
+    -> mlir::LogicalResult {
+  // The highest end per memory, with the view that reaches it.
+  llvm::MapVector<ResourceType, std::pair<size_t, mlir::Operation*>> ends;
+
+  const auto result = module.walk([&](mlir::ktdp::ConstructMemoryViewOp view) {
+    // The memory a view is in is the one it is cast to, as the lowering to
+    // DFIR reads it.
+    llvm::SmallVector<ResourceType> spaces;
+    for (mlir::Operation* user : view->getUsers()) {
+      auto cast = llvm::dyn_cast<mlir::memref::MemorySpaceCastOp>(user);
+      if (!cast) {
+        continue;
+      }
+      const auto space = llvm::dyn_cast_if_present<ResourceType>(
+          cast.getDest().getType().getMemorySpace());
+      if (space && !tracker.getMemoryTree().isGlobalMemory(space)) {
+        spaces.push_back(space);
+      }
+    }
+    if (spaces.empty()) {
+      return mlir::WalkResult::advance();
+    }
+
+    const auto base = mlir::getConstantIntValue(view.getOffset());
+    if (!base || *base < 0) {
+      view.emitError() << "memory view outside global memory needs a constant "
+                          "base address to be kept clear of allocations";
+      return mlir::WalkResult::interrupt();
+    }
+    const auto end = getViewEnd(view, static_cast<size_t>(*base));
+    if (llvm::failed(end)) {
+      return mlir::WalkResult::interrupt();
+    }
+
+    for (auto space : spaces) {
+      auto& highest = ends[space];
+      if (*end > highest.first) {
+        highest = {*end, view.getOperation()};
+      }
+    }
+    return mlir::WalkResult::advance();
+  });
+  if (result.wasInterrupted()) {
+    return mlir::failure();
+  }
+
+  for (const auto& [space, highest] : ends) {
+    LDBG(1) << "Memory views end at " << highest.first << " bytes in " << space;
+    if (auto err = tracker.reserveBelow(space, highest.first)) {
+      return highest.second->emitError()
+             << "Failed to keep " << space
+             << " memory view clear of allocations: "
+             << llvm::toString(std::move(err));
+    }
+  }
+  return mlir::success();
+}
+
 /// Result of processing a single allocation.
 struct AllocationResult {
   bool success;
@@ -327,9 +436,17 @@ struct AddressAssignmentPass
     auto& tracker = getAnalysis<MemoryTrackerAnalysis>();
     mlir::OpBuilder builder(&getContext());
 
+    // Memory views outside global memory are kept clear of in every program,
+    // so they are surveyed across all of them before any is assigned.
+    if (llvm::failed(reserveMemoryViews(module, tracker))) {
+      signalPassFailure();
+      return;
+    }
+
     // A program has the memories it allocates from to itself: what one puts
-    // there is discarded before the next runs, so each starts at address zero.
-    // Whatever sits outside the programs is a scope of its own.
+    // there is discarded before the next runs, so each starts over from the
+    // first free address. Whatever sits outside the programs is a scope of its
+    // own.
     llvm::SmallVector<mlir::ModuleOp> scopes{module};
     llvm::append_range(scopes, module.getOps<mlir::ModuleOp>());
 

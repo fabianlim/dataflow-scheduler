@@ -23,6 +23,8 @@
 #include "dataflow-scheduler/Transforms/PathExpansion/Materializer.h"
 
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -220,11 +222,55 @@ mlir::ktdf::PipelineOp PathExpansionMaterializer::materializePipelineNode(
   // Materialize all children (private node first, then stages) via pre-order
   // traversal
   materializeChildren(pipeline_node);
+  orderFifoTransfersByPeer(new_pipeline);
 
   builder_.setInsertionPointAfter(new_pipeline);
 
   LDBG(1) << "  Materialized pipeline node";
   return new_pipeline;
+}
+
+void PathExpansionMaterializer::orderFifoTransfersByPeer(
+    mlir::ktdf::PipelineOp pipeline) {
+  // The stage of every op in the pipeline and its position there.
+  llvm::DenseMap<mlir::Operation*, std::pair<mlir::Operation*, unsigned>>
+      positions;
+  for (auto stage : pipeline.getBody()->getOps<mlir::ktdf::StageOp>()) {
+    unsigned position = 0;
+    stage->walk<mlir::WalkOrder::PreOrder>(
+        [&](mlir::Operation* op) { positions[op] = {stage, position++}; });
+  }
+
+  for (auto stage : pipeline.getBody()->getOps<mlir::ktdf::StageOp>()) {
+    // This stage's transfers on FIFOs shared with each other stage, with the
+    // position of the op at the other end of the FIFO.
+    llvm::MapVector<mlir::Operation*,
+                    llvm::SmallVector<std::pair<unsigned, mlir::Operation*>>>
+        by_peer;
+    for (auto transfer :
+         stage.getBody()->getOps<mlir::ktdf::DataTransferOp>()) {
+      for (mlir::Value fifo_slot :
+           {transfer.getSource(), transfer.getDestination()}) {
+        if (!mlir::isa<mlir::ktdf::FifoSlotType>(fifo_slot.getType())) continue;
+        for (mlir::Operation* user : fifo_slot.getUsers()) {
+          auto it = positions.find(user);
+          if (it == positions.end() || it->second.first == stage) continue;
+          by_peer[it->second.first].push_back({it->second.second, transfer});
+        }
+      }
+    }
+
+    for (auto& [peer, transfers] : by_peer) {
+      if (llvm::is_sorted(transfers, llvm::less_first())) continue;
+      // Move them after the last of them, so each still follows the values it
+      // uses.
+      mlir::Block::iterator insert_point =
+          std::next(transfers.back().second->getIterator());
+      llvm::stable_sort(transfers, llvm::less_first());
+      for (mlir::Operation* transfer : llvm::make_second_range(transfers))
+        transfer->moveBefore(stage.getBody(), insert_point);
+    }
+  }
 }
 
 //===----------------------------------------------------------------------===//
