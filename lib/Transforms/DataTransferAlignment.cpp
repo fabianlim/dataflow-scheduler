@@ -51,6 +51,8 @@
 #include "dataflow-scheduler/Analysis/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
+#include "dataflow-scheduler/Dialect/KTDFArch/Analysis/Mapping.h"
+#include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "llvm/ADT/STLExtras.h"
@@ -145,13 +147,14 @@ struct Restick {
   int64_t p = 0;      // x's stride-1 dim; never q
   int64_t q = 0;      // y's stride-1 dim, the one each transfer moves along
   int64_t rank = 0;   // rank of x's and y's views
-  int64_t block = 0;  // elements in one stick: the load's size in slot q
+  int64_t block = 0;  // elements in one stick: the SIMD lanes for x's type
   /// The induction variable of the loop that walks dim p one element at a
   /// time (the point loop). It indexes slot p of the load either directly or
   /// through `linearize_index [tile_iv : tile], [point_iv : 1]`.
   mlir::Value point_iv;
   /// The tile size of dim p when its loop is tiled: a reserve_size
-  /// placeholder. Null when the loop is not tiled.
+  /// placeholder, which widenRestick constrains to one stick. Null when the
+  /// loop is not tiled.
   mlir::ktdf::TilingReserveSizeOp tile;
 };
 
@@ -184,7 +187,8 @@ mlir::Value indexAt(mlir::AffineMap map, mlir::ValueRange indices,
 /// an error when there is one this pass cannot handle.
 mlir::FailureOr<std::optional<Restick>> findRestick(
     mlir::ktdf::PipelineOp pipeline,
-    const scheduler::arch_view::MemoryTree& memory_tree) {
+    const scheduler::arch_view::MemoryTree& memory_tree,
+    mlir::ktdf_arch::ExecutionUnitOp compute) {
   auto stages = llvm::to_vector(pipeline.getStages());
   if (stages.empty()) return std::optional<Restick>();
 
@@ -240,20 +244,24 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
            << *q << ", which each transfer moves along, does not have stride 1";
 
   // Only fp16 sticks have been run on the device; other element sizes need
-  // their own block size and transfer modes checked first.
-  auto element_bytes = scheduler::tryGetSizeInBytes(
-      mlir::cast<mlir::MemRefType>(load.getSource().getType())
-          .getElementType());
+  // their own transfer modes checked first.
+  mlir::Type element_type =
+      mlir::cast<mlir::MemRefType>(load.getSource().getType()).getElementType();
+  auto element_bytes = scheduler::tryGetSizeInBytes(element_type);
   if (!element_bytes || *element_bytes != 2)
     return fail(load, "only 2-byte elements are supported, got ")
            << (element_bytes ? (int64_t)*element_bytes : -1) << " bytes";
 
-  // The stick: what the load already moves along dim q.
-  std::optional<int64_t> stick = mlir::getConstantIntValue(load_sizes[*q]);
-  if (!stick || *stick <= 1)
+  // A stick: the compute unit's SIMD lanes for x's element type. The load
+  // must already move one along dim q.
+  int64_t block =
+      compute.getFeature<mlir::ktdf_arch::feature::SIMD>().getLanes(
+          element_type);
+  if (block <= 1)
+    return fail(load, "the device has no SIMD lanes for ") << element_type;
+  if (mlir::getConstantIntValue(load_sizes[*q]) != block)
     return fail(load, "the load's size in slot ")
-           << *q << " is not a static stick length";
-  int64_t block = *stick;
+           << *q << " is not one stick (" << block << " elements)";
 
   int64_t extent = x->sizes[*p];
   if (extent % block != 0)
@@ -433,13 +441,24 @@ mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
     }
   }
 
-  // 2. A tiled loop over dim p gets one stick per tile: the placeholder
-  //    becomes `block`. Every op stage coarsening derived from it (the tile
-  //    loop's trip count, the linearize_index strides, the buffers' sizes)
-  //    follows.
+  // 2. A tiled loop over dim p gets one stick per tile. Its tile size stays a
+  //    placeholder for tile-size-selection, constrained to a multiple of
+  //    `block` no smaller than `block`.
+  //
+  //    The widening below assumes exactly one stick per tile: every point
+  //    loop over dim p runs once and A and B hold one stick along p. That
+  //    holds because tile-size-selection tries no tile size above
+  //    max(min_value, its largest candidate), which is `block`. If it can
+  //    pick k > 1 sticks, the point loops must walk sticks instead (upper
+  //    bound tile / block, stride `block` in slot p's linearize_index) and A
+  //    and B need a dim of tile / block; constrain-tile-to-one-stick.mlir
+  //    fails until then.
   if (plan.tile) {
-    plan.tile.replaceAllUsesWith(c_block);
-    plan.tile.erase();
+    auto index_attr = [&](int64_t v) {
+      return mlir::IntegerAttr::get(mlir::IndexType::get(ctx), v);
+    };
+    plan.tile.setMinValueAttr(index_attr(block));
+    plan.tile.setDivisibilityAttr(index_attr(block));
   }
   for (mlir::scf::ForOp loop : point_loops) loop.setUpperBound(c1);
 
@@ -539,6 +558,15 @@ struct DataTransferAlignmentPass
     auto& memory_tree =
         device_manager.getOrCreateView<scheduler::arch_view::MemoryTree>(
             *device);
+    const auto& default_device = getAnalysis<mlir::ktdf_arch::DefaultDevice>();
+    if (!default_device) return signalPassFailure();
+    mlir::ktdf_arch::Mapping mapping(default_device.getRef());
+    auto compute = mapping.byKind().getDefaultCompute();
+    if (!compute) {
+      getOperation()->emitError(PASS_NAME
+                                ": no (unambiguous) default compute resource");
+      return signalPassFailure();
+    }
 
     // Outermost pipelines only: a re-stick's nested pipeline is part of it.
     llvm::SmallVector<mlir::ktdf::PipelineOp> pipelines;
@@ -550,7 +578,7 @@ struct DataTransferAlignmentPass
 
     mlir::OpBuilder builder(&getContext());
     for (auto pipeline : pipelines) {
-      auto plan = findRestick(pipeline, memory_tree);
+      auto plan = findRestick(pipeline, memory_tree, compute);
       if (mlir::failed(plan)) return signalPassFailure();
       if (!*plan) continue;
       LDBG(1) << "re-stick: p = " << (*plan)->p << ", block "
