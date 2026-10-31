@@ -104,8 +104,8 @@ mlir::Value indexConstant(mlir::Block* block, int64_t value,
     if (cst.value() == value) return cst;
   mlir::OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(block);
-  return mlir::arith::ConstantIndexOp::create(rewriter, rewriter.getUnknownLoc(),
-                                              value);
+  return mlir::arith::ConstantIndexOp::create(rewriter,
+                                              rewriter.getUnknownLoc(), value);
 }
 
 /// The one user of `value` other than `user`, if it is an `OpT`; null when
@@ -170,7 +170,8 @@ std::optional<StickLoop> tiledPointLoop(mlir::Value value, int64_t extent) {
   if (!derive || derive.getTileSizes().size() != 1 ||
       mlir::getConstantIntValue(derive.getTotalSize()) != extent)
     return std::nullopt;
-  auto tile = derive.getTileSizes().front()
+  auto tile = derive.getTileSizes()
+                  .front()
                   .getDefiningOp<mlir::ktdf::TilingReserveSizeOp>();
   if (!tile) return std::nullopt;
   return StickLoop{value, tile};
@@ -280,11 +281,12 @@ struct RestickLoad : mlir::OpRewritePattern<mlir::ktdf::DataTransferOp> {
 
     // The plain copy A -> FIFO, passed through unchanged, -> B.
     auto not_a_copy = [&]() {
-      return fail(load, "the load does not feed a plain copy (A -> FIFO, "
-                        "read_from_fifo, write_to_fifo, FIFO -> B, with "
-                        "nothing else reading A or the FIFOs); re-sticking it "
-                        "needs its own transpose stage, which is not "
-                        "supported");
+      return fail(load,
+                  "the load does not feed a plain copy (A -> FIFO, "
+                  "read_from_fifo, write_to_fifo, FIFO -> B, with "
+                  "nothing else reading A or the FIFOs); re-sticking it "
+                  "needs its own transpose stage, which is not "
+                  "supported");
     };
     auto from_a =
         soleOtherUser<mlir::ktdf::DataTransferOp>(load.getDestination(), load);
@@ -316,8 +318,7 @@ struct RestickLoad : mlir::OpRewritePattern<mlir::ktdf::DataTransferOp> {
         indexAt(*from_a.getSourceMap(), from_a.getSourceIndices(), *kp);
     std::optional<StickLoop> hop_loop =
         hop_iv ? stickLoop(hop_iv, block) : std::nullopt;
-    if (!a_stick || !b_stick || !hop_loop ||
-        hop_loop->tile != load_loop->tile)
+    if (!a_stick || !b_stick || !hop_loop || hop_loop->tile != load_loop->tile)
       return fail(from_a,
                   "the hop does not move one stick of A per trip of a loop "
                   "from 0 to " +
@@ -329,9 +330,8 @@ struct RestickLoad : mlir::OpRewritePattern<mlir::ktdf::DataTransferOp> {
       LDBG() << "dim " << *p << " of the source has stride 1, so it is one "
              << "stick of " << block << " elements: its tile size is pinned to "
              << block << ", not left to tile size selection";
-      rewriter.modifyOpInPlace(tile, [&] {
-        tile.setMinValueAttr(rewriter.getIndexAttr(block));
-      });
+      rewriter.modifyOpInPlace(
+          tile, [&] { tile.setMinValueAttr(rewriter.getIndexAttr(block)); });
     }
 
     // The load reads stick i of x along p: dim q takes i, dim p starts at 0.
@@ -352,7 +352,8 @@ struct RestickLoad : mlir::OpRewritePattern<mlir::ktdf::DataTransferOp> {
     rewriter.setInsertionPoint(hop);
     auto c_loop = mlir::scf::ForOp::create(
         rewriter, hop.getLoc(), indexConstant(entry, 0, rewriter),
-        indexConstant(entry, block, rewriter), indexConstant(entry, 1, rewriter));
+        indexConstant(entry, block, rewriter),
+        indexConstant(entry, 1, rewriter));
     rewriter.moveOpBefore(hop, c_loop.getBody()->getTerminator());
     mlir::Value c = c_loop.getInductionVar();
 
