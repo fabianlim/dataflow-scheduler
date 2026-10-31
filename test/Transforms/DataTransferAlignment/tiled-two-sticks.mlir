@@ -1,12 +1,13 @@
 // RUN: dataflow-scheduler-opt --data-transfer-alignment %s | FileCheck %s
 
-// A tiled loop over the stick dim. x is 128 x 64 with strides [1, 128], so its
-// stride-1 dim p = 0 holds two sticks, and loop tiling gave the loop over it a
-// ktdf.tiling.reserve_size tile size. Tiling of the stick dim is not supported
-// yet: the load is left strided, and nothing is rewritten.
+// A stride-1 dim of more than one stick. x is 128 x 64 with strides [1, 128],
+// so its stride-1 dim p = 0 holds two sticks, and loop tiling gave the loop
+// over it a ktdf.tiling.reserve_size tile size. The tile size is pinned to one
+// stick only when the dim is one stick. Here it is not: the load is left
+// strided, its tile size stays a placeholder, and nothing is rewritten.
 
 // CHECK-LABEL: func.func @tiled
-// CHECK:         ktdf.tiling.reserve_size
+// CHECK:         ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index}
 // CHECK:         ktdf.data_transfer from %{{.*}}[%{{.*}}, %c0 * 64] size [1, 64] to
 // CHECK-NOT:     transfer_mode
 

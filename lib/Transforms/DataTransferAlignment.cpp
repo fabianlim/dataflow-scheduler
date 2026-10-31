@@ -147,6 +147,49 @@ bool walksOneStick(mlir::Value value, int64_t extent) {
          mlir::isConstantIntValue(loop.getStep(), 1);
 }
 
+/// The loop that walks one stick of a stick dim, as seen from the index of a
+/// transfer into that dim.
+///
+/// `iv` is the loop's induction variable. `tile` is the tile size placeholder
+/// that loop tiling gave the loop; it is null when the loop was never tiled.
+struct StickLoop {
+  mlir::Value iv;
+  mlir::ktdf::TilingReserveSizeOp tile;
+};
+
+/// `value` as the IV of a point loop that tiling cut out of a loop of
+/// `extent` trips: 0 to derive_size(total = extent) under a tile size that is
+/// still a placeholder.
+std::optional<StickLoop> tiledPointLoop(mlir::Value value, int64_t extent) {
+  auto loop = mlir::scf::getForInductionVarOwner(value);
+  if (!loop || !mlir::isConstantIntValue(loop.getLowerBound(), 0) ||
+      !mlir::isConstantIntValue(loop.getStep(), 1))
+    return std::nullopt;
+  auto derive =
+      loop.getUpperBound().getDefiningOp<mlir::ktdf::TilingDeriveSizeOp>();
+  if (!derive || derive.getTileSizes().size() != 1 ||
+      mlir::getConstantIntValue(derive.getTotalSize()) != extent)
+    return std::nullopt;
+  auto tile = derive.getTileSizes().front()
+                  .getDefiningOp<mlir::ktdf::TilingReserveSizeOp>();
+  if (!tile) return std::nullopt;
+  return StickLoop{value, tile};
+}
+
+/// The loop that walks one stick of `extent` elements as seen through `index`:
+/// the IV of a loop from 0 to `extent`, or the linearized index of such a loop
+/// that tiling has cut into an outer loop and a point loop.
+std::optional<StickLoop> stickLoop(mlir::Value index, int64_t extent) {
+  if (walksOneStick(index, extent)) return StickLoop{index, {}};
+  if (auto linear = index.getDefiningOp<mlir::ktdf::TilingLinearizeIndexOp>()) {
+    if (linear.getIvs().size() != 2 ||
+        !mlir::isConstantIntValue(linear.getStrides().back(), 1))
+      return std::nullopt;
+    return tiledPointLoop(linear.getIvs().back(), extent);
+  }
+  return tiledPointLoop(index, extent);
+}
+
 /// One trip of the hop as a single element: dim `stick` of the A or B side
 /// takes the index of `from` (or 0), dim `from` takes `c`, every size is 1.
 /// `indices` gains `c` as a new last operand.
@@ -211,15 +254,19 @@ struct RestickLoad : mlir::OpRewritePattern<mlir::ktdf::DataTransferOp> {
                               llvm::Twine(block) + " elements along dim " +
                               llvm::Twine(*q));
 
-    // The loop over p must walk exactly one stick.
+    // The loop over p must walk exactly one stick. If loop tiling has tiled
+    // it, the tile is pinned to the stick below, once the rewrite is certain.
     mlir::AffineMap x_map = *load.getSourceMap();
-    mlir::Value iv = indexAt(x_map, load.getSourceIndices(), *p);
-    if (!iv || !walksOneStick(iv, block)) {
+    mlir::Value x_index = indexAt(x_map, load.getSourceIndices(), *p);
+    std::optional<StickLoop> load_loop =
+        x_index ? stickLoop(x_index, block) : std::nullopt;
+    if (!load_loop) {
       LDBG() << "skipping a strided load: dim " << *p
-             << " is not walked by a loop from 0 to " << block
-             << " (tiling of the stick dim is not supported yet): " << load;
+             << " is not walked by a loop over one stick of " << block
+             << " elements: " << load;
       return mlir::failure();
     }
+    mlir::Value iv = load_loop->iv;
 
     // A's loop dim the loop over p indexes.
     std::optional<int64_t> kp;
@@ -267,11 +314,25 @@ struct RestickLoad : mlir::OpRewritePattern<mlir::ktdf::DataTransferOp> {
     std::optional<int64_t> b_stick = movingDim(into_b.getMixedDestSizes());
     mlir::Value hop_iv =
         indexAt(*from_a.getSourceMap(), from_a.getSourceIndices(), *kp);
-    if (!a_stick || !b_stick || !hop_iv || !walksOneStick(hop_iv, block))
+    std::optional<StickLoop> hop_loop =
+        hop_iv ? stickLoop(hop_iv, block) : std::nullopt;
+    if (!a_stick || !b_stick || !hop_loop ||
+        hop_loop->tile != load_loop->tile)
       return fail(from_a,
                   "the hop does not move one stick of A per trip of a loop "
                   "from 0 to " +
                       llvm::Twine(block));
+
+    // The stick dim is one stick: a tile smaller than it would cut A short of
+    // the stick the hop reads, so the tile is the stick.
+    if (mlir::ktdf::TilingReserveSizeOp tile = load_loop->tile) {
+      LDBG() << "dim " << *p << " of the source has stride 1, so it is one "
+             << "stick of " << block << " elements: its tile size is pinned to "
+             << block << ", not left to tile size selection";
+      rewriter.modifyOpInPlace(tile, [&] {
+        tile.setMinValueAttr(rewriter.getIndexAttr(block));
+      });
+    }
 
     // The load reads stick i of x along p: dim q takes i, dim p starts at 0.
     llvm::SmallVector<mlir::AffineExpr> x_results(x_map.getResults());
