@@ -105,6 +105,8 @@ void scheduler::buildSchedulerOptimizationPipeline(
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createLoopInvariantCodeMotionPass());
   pm.addPass(mlir::ktdf::createStageCoarseningPass());
+  pm.addPass(mlir::createCanonicalizerPass());
+  pm.addPass(createDataTransferAlignmentPass());
   pm.addPass(mlir::ktdf::createReductionDimChunkingPass());
   pm.addPass(mlir::ktdf::createSplitReductionInnerOuterDimPass());
   pm.addPass(mlir::ktdf::createReductionLoopExposurePass());
