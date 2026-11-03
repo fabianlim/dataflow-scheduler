@@ -81,6 +81,12 @@ class StageCoarseningBufferCloner : public BufferCloner {
                                          OpBuilder& builder,
                                          IRMapping& value_map) override;
 
+  /// Same for indirect transfers: the expansion indices are prepended to
+  /// dir_src / dir_dst; the ind_src / ind_dst subscript is unchanged.
+  ktdf::IndDataTransferOp cloneIndDataTransfer(
+      ktdf::IndDataTransferOp transfer_op, OpBuilder& builder,
+      IRMapping& value_map) override;
+
  private:
   SmallVector<const BufferExpansionInfo*> expansion_infos_;
   DenseMap<Value, const BufferExpansionInfo*> buffer_to_info_;

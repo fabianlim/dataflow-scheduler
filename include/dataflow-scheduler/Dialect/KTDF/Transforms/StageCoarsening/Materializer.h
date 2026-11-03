@@ -77,6 +77,15 @@ class BufferCloner {
   virtual ktdf::DataTransferOp cloneDataTransfer(
       ktdf::DataTransferOp orig_transfer, OpBuilder& builder,
       IRMapping& value_map) = 0;
+
+  /// Called when materializing an indirect data transfer operation.
+  /// Same contract as cloneDataTransfer: return a replacement operation, or
+  /// nullptr to use default cloning behavior.
+  virtual ktdf::IndDataTransferOp cloneIndDataTransfer(
+      ktdf::IndDataTransferOp orig_transfer, OpBuilder& builder,
+      IRMapping& value_map) {
+    return nullptr;
+  }
 };
 
 //===----------------------------------------------------------------------===//

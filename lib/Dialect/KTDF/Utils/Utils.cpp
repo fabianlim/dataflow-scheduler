@@ -60,10 +60,18 @@ auto mlir::ktdf::isTransferTarget(Value memref, Operation* root_op) -> bool {
   }
 
   return root_op
-      ->walk([&](DataTransferOp transfer) {
-        // Check if memref is the destination
-        if (transfer.getDestination() == memref) {
-          return WalkResult::interrupt();
+      ->walk([&](Operation* op) {
+        // Check if memref is the destination. A gather writes its dir_dst; a
+        // scatter writes through ind_dst into dir_dst's memory, so dir_dst is
+        // the written buffer in both cases.
+        if (auto transfer = dyn_cast<DataTransferOp>(op)) {
+          if (transfer.getDestination() == memref) {
+            return WalkResult::interrupt();
+          }
+        } else if (auto ind = dyn_cast<IndDataTransferOp>(op)) {
+          if (ind.getDirDst() == memref) {
+            return WalkResult::interrupt();
+          }
         }
         return WalkResult::advance();
       })

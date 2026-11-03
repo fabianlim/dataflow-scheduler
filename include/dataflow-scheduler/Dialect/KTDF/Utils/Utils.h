@@ -45,8 +45,8 @@ void collectQueriedUnits(Operation* root,
                          SmallVectorImpl<Operation*>& query_ops);
 
 /// Check if a memref value is written to within the given operation's region.
-/// Returns true if any ktdf.data_transfer operation writes to the memref as a
-/// destination.
+/// Returns true if any ktdf.data_transfer or ktdf.ind_data_transfer operation
+/// writes to the memref as a destination.
 /// \param memref The memref value to check
 /// \param root_op The root operation to search within
 /// \return true if the memref is written to, false otherwise

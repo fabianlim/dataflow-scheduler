@@ -96,6 +96,14 @@ void StageCoarseningMaterializer::cloneStageBody(StageOp orig_stage) {
       }
     }
 
+    if (auto ind_op = dyn_cast<ktdf::IndDataTransferOp>(&op)) {
+      if (buffer_cloner_) {
+        Operation* new_op =
+            buffer_cloner_->cloneIndDataTransfer(ind_op, builder_, value_map_);
+        if (new_op) continue;
+      }
+    }
+
     // Default: clone the operation
     builder_.clone(op, value_map_);
   }
