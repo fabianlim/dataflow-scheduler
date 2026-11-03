@@ -442,6 +442,99 @@ ktdf::DataTransferOp StageCoarseningBufferCloner::cloneDataTransfer(
   return new_transfer;
 }
 
+
+ktdf::IndDataTransferOp StageCoarseningBufferCloner::cloneIndDataTransfer(
+    IndDataTransferOp transfer_op, OpBuilder& builder, IRMapping& value_map) {
+  Value dir_src = transfer_op.getDirSrc();
+  Value dir_dst = transfer_op.getDirDst();
+  if (value_map.contains(dir_src)) dir_src = value_map.lookup(dir_src);
+  if (value_map.contains(dir_dst)) dir_dst = value_map.lookup(dir_dst);
+
+  // Only dir_src / dir_dst can be expansion buffers: ind_src / ind_dst are the
+  // indirect address buffer, which is not a private staging buffer.
+  const BufferExpansionInfo* src_info = nullptr;
+  const BufferExpansionInfo* dst_info = nullptr;
+  for (const BufferExpansionInfo* info : expansion_infos_) {
+    Value mapped_buffer = info->buffer;
+    if (value_map.contains(mapped_buffer)) {
+      mapped_buffer = value_map.lookup(mapped_buffer);
+    }
+    if (mapped_buffer == dir_src) src_info = info;
+    if (mapped_buffer == dir_dst) dst_info = info;
+  }
+  if (!src_info && !dst_info) return nullptr;
+
+  LDBG(1) << "  Adjusting indirect data transfer indices for expanded buffer(s)";
+
+  // Same normalization as cloneDataTransfer: (iv - lower_bound) / step.
+  Location loc = transfer_op.getLoc();
+  auto mapped = [&](Value value) {
+    return value_map.contains(value) ? value_map.lookup(value) : value;
+  };
+  auto prepend_expanded_indices = [&](const BufferExpansionInfo* info,
+                                      llvm::SmallVector<Value>& indices) {
+    if (!info) return;
+    for (size_t i = 0; i < info->loop_ivs.size(); ++i) {
+      Value offset = arith::SubIOp::create(builder, loc, mapped(info->loop_ivs[i]),
+                                           mapped(info->loop_lower_bounds[i]))
+                         .getResult();
+      indices.push_back(
+          arith::DivSIOp::create(builder, loc, offset,
+                                 mapped(info->loop_steps[i]))
+              .getResult());
+    }
+  };
+
+  llvm::SmallVector<Value> new_src_indices;
+  llvm::SmallVector<Value> new_dst_indices;
+  prepend_expanded_indices(src_info, new_src_indices);
+  for (Value idx : transfer_op.getDirSrcIndices()) {
+    new_src_indices.push_back(mapped(idx));
+  }
+  prepend_expanded_indices(dst_info, new_dst_indices);
+  for (Value idx : transfer_op.getDirDstIndices()) {
+    new_dst_indices.push_back(mapped(idx));
+  }
+
+  llvm::SmallVector<OpFoldResult> src_sizes = transfer_op.getMixedDirSrcSizes();
+  llvm::SmallVector<OpFoldResult> dst_sizes = transfer_op.getMixedDirDstSizes();
+  unsigned src_prepend = src_info ? src_info->loop_ivs.size() : 0;
+  unsigned dst_prepend = dst_info ? dst_info->loop_ivs.size() : 0;
+  MLIRContext* ctx = transfer_op->getContext();
+  OpFoldResult one = IntegerAttr::get(IndexType::get(ctx), 1);
+  src_sizes.insert(src_sizes.begin(), src_prepend, one);
+  dst_sizes.insert(dst_sizes.begin(), dst_prepend, one);
+
+  AffineMap new_src_map;
+  if (transfer_op.getDirSrcMapAttr()) {
+    new_src_map = prependIdentityDims(transfer_op.getDirSrcMapAttr().getValue(),
+                                      src_prepend, ctx);
+  }
+  AffineMap new_dst_map;
+  if (transfer_op.getDirDstMapAttr()) {
+    new_dst_map = prependIdentityDims(transfer_op.getDirDstMapAttr().getValue(),
+                                      dst_prepend, ctx);
+  }
+
+  Value ind_src_memref = transfer_op.getIndSrcMemref();
+  Value ind_src_index = transfer_op.getIndSrcIndex();
+  Value ind_dst_memref = transfer_op.getIndDstMemref();
+  Value ind_dst_index = transfer_op.getIndDstIndex();
+  if (ind_src_memref) ind_src_memref = mapped(ind_src_memref);
+  if (ind_src_index) ind_src_index = mapped(ind_src_index);
+  if (ind_dst_memref) ind_dst_memref = mapped(ind_dst_memref);
+  if (ind_dst_index) ind_dst_index = mapped(ind_dst_index);
+
+  auto new_transfer = IndDataTransferOp::create(
+      builder, loc, ind_src_memref, ind_src_index, dir_src, new_src_map,
+      new_src_indices, src_sizes, ind_dst_memref, ind_dst_index, dir_dst,
+      new_dst_map, new_dst_indices, dst_sizes);
+  for (NamedAttribute attr : transfer_op->getDiscardableAttrs()) {
+    new_transfer->setDiscardableAttr(attr.getName(), attr.getValue());
+  }
+  return new_transfer;
+}
+
 //===----------------------------------------------------------------------===//
 // Buffer Expansion Analysis - Helper Functions
 //===----------------------------------------------------------------------===//
@@ -545,6 +638,29 @@ mlir::ktdf::analyzeLoopDependencies(llvm::ArrayRef<Value> candidate_buffers,
   for (Value buffer : candidate_buffers) {
     llvm::SmallVector<Value> dependent_ivs;
 
+    // An indirect transfer that fills this buffer delivers different data in
+    // each iteration of any loop its source (direct or indirect) subscripts
+    // depend on, even though its destination subscripts are constant, so the
+    // buffer depends on those loops.
+    pipeline.walk([&](ktdf::IndDataTransferOp ind) {
+      if (ind.getDirDst() != buffer && ind.getDirSrc() != buffer) {
+        return;
+      }
+      llvm::SmallVector<Value> subscripts;
+      llvm::append_range(subscripts, ind.getDirSrcIndices());
+      llvm::append_range(subscripts, ind.getDirDstIndices());
+      if (ind.getIndSrcIndex()) subscripts.push_back(ind.getIndSrcIndex());
+      if (ind.getIndDstIndex()) subscripts.push_back(ind.getIndDstIndex());
+      for (Value idx : subscripts) {
+        for (Value loop_iv : candidate_loop_ivs) {
+          if (isValueDependentOn(idx, loop_iv) &&
+              llvm::find(dependent_ivs, loop_iv) == dependent_ivs.end()) {
+            dependent_ivs.push_back(loop_iv);
+          }
+        }
+      }
+    });
+
     // Find all data transfer operations that use this buffer
     pipeline.walk([&](ktdf::DataTransferOp transfer) {
       // Check if this transfer uses the buffer
@@ -630,9 +746,9 @@ void mlir::ktdf::calculateExpansionInfo(
       // If other operations use a buffer that is a candidate for expansion,
       // we would likely require custom cloners for them as well.
       for (Operation* user : buffer.getUsers()) {
-        assert(isa<ktdf::DataTransferOp>(user) &&
+        assert((isa<ktdf::DataTransferOp, ktdf::IndDataTransferOp>(user)) &&
                "Expected all users of buffers marked for expansion to be "
-               "ktdf::DataTransferOp.");
+               "ktdf::DataTransferOp or ktdf::IndDataTransferOp.");
       }
 
       expansion_infos.push_back(std::move(info));
