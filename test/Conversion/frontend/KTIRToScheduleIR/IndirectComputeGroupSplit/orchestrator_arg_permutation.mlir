@@ -16,7 +16,7 @@
 // but that computation is no longer cloned into the orchestrator at all: the
 // orchestrator only forwards the raw block-argument dependency (child
 // argument 0, i.e. %base), and @local_schedule_0_idx_to_addr rebuilds the
-// arith.addi internally from its own forwarded argument.
+// sum internally from its own forwarded argument, in bytes.
 //
 // RUN: dataflow-scheduler-opt --indirect-compute-group-split %s | FileCheck %s
 
@@ -40,10 +40,13 @@
 // CHECK-LABEL: module @local_schedule_0_idx_to_addr
 // CHECK:         func.func @local_schedule_0_idx_to_addr
 // CHECK-SAME:        (%[[FBASE_ARG:.*]]: index, %[[FSTRIDE_ELEMS:.*]]: index)
-// CHECK:           %[[C500:.*]] = arith.constant 500 : index
-// CHECK:           %[[FBASE_ELEMS:.*]] = arith.addi %[[FBASE_ARG]], %[[C500]] : index
-// -- base and stride in 64-byte words: a runtime f16 count is divided by 32
-// CHECK:           %[[FBASE:.*]] = arith.divsi %[[FBASE_ELEMS]], %{{.*}} : index
+// -- base and stride in 64-byte words: the base argument is a byte address
+//    and the 500 f16 elements added to it are 1000 bytes; the stride counts
+//    f16 elements, so it is divided by 32
+// CHECK:           %[[C1000:.*]] = arith.constant 1000 : index
+// CHECK:           %[[FBASE_BYTES:.*]] = arith.addi %[[FBASE_ARG]], %[[C1000]] : index
+// CHECK:           %[[C64:.*]] = arith.constant 64 : index
+// CHECK:           %[[FBASE:.*]] = arith.divsi %[[FBASE_BYTES]], %[[C64]] : index
 // CHECK:           %[[FSTRIDE:.*]] = arith.divsi %[[FSTRIDE_ELEMS]], %{{.*}} : index
 // CHECK:           linalg.generic
 // CHECK:             arith.index_castui %[[FBASE]] : index to i32

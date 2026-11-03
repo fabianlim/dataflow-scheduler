@@ -32,10 +32,11 @@
 
 // CHECK-LABEL: module @local_schedule_0_idx_to_addr
 // CHECK:         func.func @local_schedule_0_idx_to_addr
-// CHECK-SAME:        (%[[FBASE_ELEMS:.*]]: index)
-// -- base and stride in 64-byte words: a runtime f16 count is divided by 32
-// CHECK:           %[[C32:.*]] = arith.constant 32 : index
-// CHECK:           %[[FBASE:.*]] = arith.divsi %[[FBASE_ELEMS]], %[[C32]] : index
+// CHECK-SAME:        (%[[FBASE_BYTES:.*]]: index)
+// -- base and stride in 64-byte words: the base is a run input, which is a
+//    byte address, so it is divided by the word size
+// CHECK:           %[[C64:.*]] = arith.constant 64 : index
+// CHECK:           %[[FBASE:.*]] = arith.divsi %[[FBASE_BYTES]], %[[C64]] : index
 // CHECK:           %[[FSTRIDE:.*]] = arith.constant 2 : index
 // CHECK:           linalg.generic
 // CHECK:             arith.index_castui %[[FBASE]] : index to i32

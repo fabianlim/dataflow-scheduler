@@ -758,6 +758,48 @@ static SmallVector<Value> collectForwardedArgs(
   return collected.takeVector();
 }
 
+/// Whether @p value's defining chain reaches one of @p run_inputs.
+static bool reachesRunInput(Value value, const DenseSet<Value>& run_inputs) {
+  SmallVector<Value> pending{value};
+  DenseSet<Value> seen;
+  while (!pending.empty()) {
+    Value current = pending.pop_back_val();
+    if (!seen.insert(current).second) continue;
+    if (run_inputs.contains(current)) return true;
+    if (Operation* op = current.getDefiningOp())
+      llvm::append_range(pending, op->getOperands());
+  }
+  return false;
+}
+
+/// Splits @p base into the one run input among @p run_inputs it is rooted at,
+/// returned, and the terms added to it, appended to @p offset_terms with
+/// whether each is subtracted.  Returns a null value when @p base reaches no
+/// run input.  Only sums and differences that add a single input are split:
+/// anything else over an input has no unit to give it and fails.
+static FailureOr<Value> splitBaseApart(
+    Value base, const DenseSet<Value>& run_inputs,
+    SmallVectorImpl<std::pair<Value, bool>>& offset_terms,
+    bool negated = false) {
+  if (run_inputs.contains(base)) {
+    if (negated) return failure();
+    return base;
+  }
+  if (!reachesRunInput(base, run_inputs)) {
+    offset_terms.push_back({base, negated});
+    return Value();
+  }
+  Operation* op = base.getDefiningOp();
+  if (!op || !isa<arith::AddIOp, arith::SubIOp>(op)) return failure();
+  const bool subtract = isa<arith::SubIOp>(op);
+  FailureOr<Value> lhs =
+      splitBaseApart(op->getOperand(0), run_inputs, offset_terms, negated);
+  FailureOr<Value> rhs = splitBaseApart(op->getOperand(1), run_inputs,
+                                        offset_terms, negated != subtract);
+  if (failed(lhs) || failed(rhs) || (*lhs && *rhs)) return failure();
+  return *lhs ? *lhs : *rhs;
+}
+
 /// Validates @p indirect_op and derives everything splitCandidate() will need.
 ///
 /// Mutates nothing, so a candidate the pass cannot handle is diagnosed with its
@@ -879,6 +921,18 @@ static FailureOr<SplitCandidate> analyzeCandidate(
              << "-byte word the indirect transfer addresses memory in";
   }
 
+  // A base rooted at a run input is that input's byte address plus element
+  // offsets; anything else over an input cannot be given a unit.
+  {
+    DenseSet<Value> run_inputs(candidate.func.getArguments().begin(),
+                               candidate.func.getArguments().end());
+    SmallVector<std::pair<Value, bool>> offset_terms;
+    if (failed(splitBaseApart(candidate.base_addr, run_inputs, offset_terms)))
+      return candidate.func->emitError(
+          PASS_NAME ": the base address of the indirect access is not a run "
+                    "input plus or minus an offset in elements");
+  }
+
   candidate.call_site = orchestrator.getCallSite(candidate.func.getNameAttr());
 
   // The last check reads attributes and operand chains without cloning
@@ -921,6 +975,44 @@ static Value convertElementsToWords(OpBuilder& builder, Location loc,
     words = arith::DivSIOp::create(
         builder, loc, words, arith::ConstantIndexOp::create(builder, loc, div));
   return words;
+}
+
+/// Converts @p base, the $base view's start address, into words of
+/// @p word_size bytes.  A run input among @p run_inputs is the run's byte
+/// address for a tensor, while everything else in the address counts
+/// @p elem_bytes-byte elements, so those terms are scaled to bytes before they
+/// are added to it, as the direct path does (see LogicalMemoryViewBuilder).  A
+/// base that reaches no run input is in elements throughout.
+///
+/// analyzeCandidate() has checked that @p base splits apart.
+static Value convertBaseToWords(OpBuilder& builder, Location loc, Value base,
+                                const DenseSet<Value>& run_inputs,
+                                int64_t elem_bytes, int64_t word_size) {
+  SmallVector<std::pair<Value, bool>> offset_terms;
+  FailureOr<Value> input = splitBaseApart(base, run_inputs, offset_terms);
+  assert(succeeded(input) && "analyzeCandidate checks the base splits apart");
+  if (!*input)
+    return convertElementsToWords(builder, loc, base, elem_bytes, word_size);
+
+  Value bytes = *input;
+  Value elem_size = arith::ConstantIndexOp::create(builder, loc, elem_bytes);
+  for (auto [term, subtract] : offset_terms) {
+    Value term_bytes =
+        getConstantIntValue(term)
+            ? arith::ConstantIndexOp::create(
+                  builder, loc, *getConstantIntValue(term) * elem_bytes)
+                  .getResult()
+            : arith::MulIOp::create(builder, loc, term, elem_size).getResult();
+    bytes = subtract
+                ? arith::SubIOp::create(builder, loc, bytes, term_bytes)
+                      .getResult()
+                : arith::AddIOp::create(builder, loc, bytes, term_bytes)
+                      .getResult();
+  }
+  if (elem_size.use_empty()) elem_size.getDefiningOp()->erase();
+  return arith::DivSIOp::create(
+      builder, loc, bytes,
+      arith::ConstantIndexOp::create(builder, loc, word_size));
 }
 
 /// Builds the @<name>_idx_to_addr child module and inserts it just before
@@ -1027,13 +1119,17 @@ static std::string buildIdxToAddrModule(ModuleOp child_module,
   materializeChain(stride_value);
   for (Value operand : idx_view->getOperands()) materializeChain(operand);
 
-  // The element-unit base and stride stay alive until the clone of idx_view
-  // below, which may share their constants through `mapper`; whichever of them
-  // the word conversion leaves unused is dropped once that clone exists.
+  // The base and stride as cloned stay alive until the clone of idx_view below,
+  // which may share their constants through `mapper`; whatever the word
+  // conversion leaves unused is dropped once that clone exists.  The stride
+  // counts elements; the base is rooted at a run input where it reaches one,
+  // and each of those is one of this function's arguments.
   Value elem_base = mapper.lookupOrDefault(base_addr);
   Value elem_stride = mapper.lookupOrDefault(stride_value);
-  Value arg_base =
-      convertElementsToWords(builder, loc, elem_base, elem_bytes, word_size);
+  DenseSet<Value> run_inputs(new_func.getArguments().begin(),
+                             new_func.getArguments().end());
+  Value arg_base = convertBaseToWords(builder, loc, elem_base, run_inputs,
+                                      elem_bytes, word_size);
   Value arg_stride =
       convertElementsToWords(builder, loc, elem_stride, elem_bytes, word_size);
 
@@ -1044,10 +1140,30 @@ static std::string buildIdxToAddrModule(ModuleOp child_module,
   unsigned idx_rank = idx_shape.size();
   IntegerSet coordinate_set = idx_view_clone.getCoordinateSetAttr().getValue();
 
+  // Erase what of the cloned base and stride nothing reads any more: the
+  // constants a word conversion folded away and, where the base was rebuilt in
+  // bytes, the element-unit sum it was cloned as.  The candidates are all
+  // gathered first, so nothing is looked at after it has been erased.
+  SetVector<Operation*> unused;
   for (Value elems : {elem_base, elem_stride}) {
-    Operation* def = elems.getDefiningOp();
-    if (def && isa<arith::ConstantOp>(def) && def->use_empty()) def->erase();
-    if (elem_base == elem_stride) break;
+    SmallVector<Value> chain{elems};
+    while (!chain.empty()) {
+      Operation* def = chain.pop_back_val().getDefiningOp();
+      if (!def || !isa<arith::ConstantOp, arith::AddIOp, arith::SubIOp>(def) ||
+          !unused.insert(def))
+        continue;
+      llvm::append_range(chain, def->getOperands());
+    }
+  }
+  for (bool erased = true; erased;) {
+    erased = false;
+    for (Operation* def : unused.getArrayRef()) {
+      if (!isOpTriviallyDead(def)) continue;
+      unused.remove(def);
+      def->erase();
+      erased = true;
+      break;
+    }
   }
 
   Value addr_buf_base_const = arith::ConstantIndexOp::create(

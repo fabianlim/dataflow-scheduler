@@ -15,9 +15,9 @@
 // Expected:
 //   - Orchestrator: forwards %offset_arg verbatim to @_idx_to_addr — it no
 //     longer materializes arith.addi/arith.constant itself.
-//   - @_idx_to_addr: receives (%offset_arg: index) and reconstructs
-//     arith.addi(%c_base, %offset_arg) internally to use as %base in the
-//     linalg.generic body.
+//   - @_idx_to_addr: receives (%offset_arg: index) and rebuilds the base
+//     internally in bytes: %offset_arg is a run input, a byte address, and
+//     %c_base counts elements, so it is scaled to bytes before the add.
 //   - @local_schedule_0: zero-offset CMV replacing the original addi-based offset.
 //
 // RUN: dataflow-scheduler-opt --indirect-compute-group-split %s | FileCheck %s
@@ -38,11 +38,12 @@
 // CHECK-LABEL: module @local_schedule_0_idx_to_addr
 // CHECK:         func.func @local_schedule_0_idx_to_addr
 // CHECK-SAME:        (%[[FOFFARG:.*]]: index)
-// CHECK:           %[[CBASE:.*]] = arith.constant 1024 : index
-// CHECK:           %[[FBASE_ELEMS:.*]] = arith.addi %[[CBASE]], %[[FOFFARG]]
-// -- base and stride in 64-byte words: a runtime f16 count is divided by 32
-// CHECK:           %[[C32:.*]] = arith.constant 32 : index
-// CHECK:           %[[FBASE:.*]] = arith.divsi %[[FBASE_ELEMS]], %[[C32]] : index
+// -- base and stride in 64-byte words: %offset_arg is a run input, a byte
+//    address; the constant 1024 f16 elements it is offset by is 2048 bytes
+// CHECK:           %[[CBASE_BYTES:.*]] = arith.constant 2048 : index
+// CHECK:           %[[FBASE_BYTES:.*]] = arith.addi %[[FOFFARG]], %[[CBASE_BYTES]]
+// CHECK:           %[[C64:.*]] = arith.constant 64 : index
+// CHECK:           %[[FBASE:.*]] = arith.divsi %[[FBASE_BYTES]], %[[C64]] : index
 // CHECK:           %[[FSTRIDE:.*]] = arith.constant 2 : index
 // CHECK:           linalg.generic
 // CHECK:             arith.index_castui %[[FBASE]] : index to i32
