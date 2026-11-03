@@ -918,7 +918,7 @@ static Value convertElementsToWords(OpBuilder& builder, Location loc,
     words = arith::MulIOp::create(
         builder, loc, words, arith::ConstantIndexOp::create(builder, loc, mul));
   if (div != 1)
-    words = arith::DivUIOp::create(
+    words = arith::DivSIOp::create(
         builder, loc, words, arith::ConstantIndexOp::create(builder, loc, div));
   return words;
 }

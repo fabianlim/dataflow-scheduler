@@ -42,7 +42,7 @@
 // CHECK:           %[[FBASE_ELEMS:.*]] = arith.addi %[[CBASE]], %[[FOFFARG]]
 // -- base and stride in 64-byte words: a runtime f16 count is divided by 32
 // CHECK:           %[[C32:.*]] = arith.constant 32 : index
-// CHECK:           %[[FBASE:.*]] = arith.divui %[[FBASE_ELEMS]], %[[C32]] : index
+// CHECK:           %[[FBASE:.*]] = arith.divsi %[[FBASE_ELEMS]], %[[C32]] : index
 // CHECK:           %[[FSTRIDE:.*]] = arith.constant 2 : index
 // CHECK:           linalg.generic
 // CHECK:             arith.index_castui %[[FBASE]] : index to i32
