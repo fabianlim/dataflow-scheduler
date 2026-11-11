@@ -407,16 +407,17 @@ scheduler::takeSymbolicAddressApart(mlir::Value address,
 namespace {
 
 /// Gets the key identifying the address \p taken, \p terms, \p displacement and
-/// \p word_size describe, over the first \p through steps of the expression --
-/// a step of it rather than the whole, where the step needs a symbol of its
-/// own.
+/// \p elements_per_word describe, over the first \p through steps of the
+/// expression -- a step of it rather than the whole, where the step needs a
+/// symbol of its own.
 DerivedKey keyFor(const SymbolicAddress& taken, llvm::ArrayRef<int64_t> terms,
-                  int64_t displacement, int64_t word_size, size_t through) {
+                  int64_t displacement, int64_t elements_per_word,
+                  size_t through) {
   DerivedKey key;
   key.root = taken.root;
   key.offset = displacement;
   key.terms.assign(terms.begin(), terms.end());
-  key.word_size = word_size;
+  key.elements_per_word = elements_per_word;
   for (mlir::Operation* op :
        llvm::ArrayRef<mlir::Operation*>(taken.expression).take_front(through)) {
     llvm::SmallVector<std::optional<int64_t>, 2> operands;
@@ -428,15 +429,16 @@ DerivedKey keyFor(const SymbolicAddress& taken, llvm::ArrayRef<int64_t> terms,
 }
 
 /// Rebuilds \p taken's expression with each per-grid leaf replaced by the
-/// constant \p terms gives it, adds \p displacement, declares the result as a
-/// symbol of its own and returns that symbol's id.
+/// constant \p terms gives it, adds \p displacement, divides by
+/// \p elements_per_word, declares the result as a symbol of its own and returns
+/// that symbol's id.
 ///
 /// Where the expression is empty and nothing is displaced the address is the
 /// input itself, so there is nothing to derive and the input's own id is the
 /// answer.
 int64_t declareDerived(const SymbolicAddress& taken,
                        llvm::ArrayRef<int64_t> terms, int64_t displacement,
-                       int64_t word_size, SymbolAllocator& symbols,
+                       int64_t elements_per_word, SymbolAllocator& symbols,
                        mlir::OpBuilder& builder, mlir::Location loc) {
   // Whether the expression comes back to the input itself is only known once it
   // has been folded, and the id is only known to be new after that, so some of
@@ -484,7 +486,7 @@ int64_t declareDerived(const SymbolicAddress& taken,
     const bool last = index + 1 == taken.expression.size();
     const bool read_by_what_follows =
         displacement == 0 &&
-        (word_size == 1 ||
+        (elements_per_word == 1 ||
          mlir::isa<mlir::arith::AddIOp, mlir::arith::SubIOp>(clone));
     if (last && read_by_what_follows) continue;
 
@@ -494,7 +496,8 @@ int64_t declareDerived(const SymbolicAddress& taken,
     const int64_t step = symbols
                              .derivedIdFor(keyFor(taken, terms,
                                                   /*displacement=*/0,
-                                                  /*word_size=*/1, index + 1))
+                                                  /*elements_per_word=*/1,
+                                                  index + 1))
                              .first;
     built.push_back(mlir::symbol::CreateIdOp::create(builder, loc, result, step)
                         .getOperation());
@@ -505,18 +508,19 @@ int64_t declareDerived(const SymbolicAddress& taken,
     result = note(mlir::arith::AddIOp::create(builder, loc, result, by));
   }
 
-  // `result` is the byte address now: the input, plus this grid element's
+  // `result` is the element address now: the input, plus this grid element's
   // share, plus whatever displaced it. Where nothing was added to it, it is the
   // input itself and the input's own symbol stands for it.
-  const bool derived_in_bytes = result != taken.root;
+  const bool derived = result != taken.root;
 
-  if (word_size == 1) {
-    if (!derived_in_bytes) {
+  if (elements_per_word == 1) {
+    if (!derived) {
       discardBuilt();
       return taken.input;
     }
     const auto [id, fresh] = symbols.derivedIdFor(
-        keyFor(taken, terms, displacement, word_size, taken.expression.size()));
+        keyFor(taken, terms, displacement, elements_per_word,
+               taken.expression.size()));
     // Declared once. A second declaration of the same id would leave two
     // symbols meaning one address, so what was built to get here is thrown away
     // instead.
@@ -528,26 +532,25 @@ int64_t declareDerived(const SymbolicAddress& taken,
     return id;
   }
 
-  // The unit addresses in words of `word_size` bytes and the run hands its
-  // inputs over as byte addresses, so the symbol a program reads is the byte
-  // address divided by that -- last, after everything else the address is built
-  // from.
-  const auto [id, fresh] = symbols.derivedIdFor(
-      keyFor(taken, terms, displacement, word_size, taken.expression.size()));
+  // The unit addresses in words of `elements_per_word` elements, so the symbol
+  // a program reads is the element address divided by that -- last, after
+  // everything else the address is built from.
+  const auto [id, fresh] = symbols.derivedIdFor(keyFor(
+      taken, terms, displacement, elements_per_word, taken.expression.size()));
   if (!fresh) {
     discardBuilt();
     return id;
   }
 
-  // The byte address stays unnamed, and the definition is the division over the
-  // expression that built it -- `(input + share) / word_size` rather than a
-  // symbol for the sum and a division over that. Whatever reads definitions has
-  // an operator for that shape, and a symbol nothing waits for would be one
-  // more thing for the run to resolve for no reason.
-  mlir::Value bytes_per_word =
-      mlir::arith::ConstantIndexOp::create(builder, loc, word_size);
+  // The element address stays unnamed, and the definition is the division over
+  // the expression that built it -- `(input + share) / elements_per_word`
+  // rather than a symbol for the sum and a division over that. Whatever reads
+  // definitions has an operator for that shape, and a symbol nothing waits for
+  // would be one more thing for the run to resolve for no reason.
+  mlir::Value per_word =
+      mlir::arith::ConstantIndexOp::create(builder, loc, elements_per_word);
   mlir::Value in_words =
-      mlir::arith::DivSIOp::create(builder, loc, result, bytes_per_word);
+      mlir::arith::DivSIOp::create(builder, loc, result, per_word);
   mlir::symbol::CreateIdOp::create(builder, loc, in_words, id);
   return id;
 }
@@ -558,11 +561,6 @@ int64_t scheduler::Displacement::at(mlir::Value unit) const {
   for (const auto& [key, offset] : per_unit)
     if (key == unit) return offset;
   return common_offset;
-}
-
-void scheduler::Displacement::scaleBy(int64_t factor) {
-  common_offset *= factor;
-  for (auto& [unit, offset] : per_unit) offset *= factor;
 }
 
 mlir::FailureOr<scheduler::Displacement> scheduler::takeDisplacementApart(
@@ -614,15 +612,29 @@ mlir::FailureOr<scheduler::Displacement> scheduler::takeDisplacementApart(
 
 mlir::FailureOr<mlir::Value> scheduler::emitSymbolicStartAddress(
     const SymbolicAddress& taken, const Displacement& displacement,
-    int64_t word_size, mlir::dataflow::ProgramUnitOp pu,
+    int64_t element_size, int64_t word_size, mlir::dataflow::ProgramUnitOp pu,
     SymbolAllocator& symbols, mlir::OpBuilder& builder,
     mlir::OpBuilder& definitions_at, mlir::Location loc) {
+  // The address counts elements, and the unit counts words: the data word it
+  // addresses the memory space in, `word_size` bytes, so that address n is byte
+  // n * word_size. An f16 view read in 128-byte words holds 128 / 2 = 64
+  // elements a word, so element address e is word address e / 64; an i32 view
+  // holds 32. A 1-byte word holds no whole f16, and that has no word address.
+  if (element_size <= 0 || word_size % element_size != 0)
+    return mlir::emitError(loc)
+           << "the start address is computed from a run input, which counts "
+           << element_size << "-byte elements, but the unit reading it "
+           << "addresses in " << word_size << "-byte words, which do not hold "
+           << "a whole number of them";
+  const int64_t elements_per_word = word_size / element_size;
+
   // The same everywhere: one symbol, and no map to choose between copies of it.
   // Which is the common case -- a tensor read whole rather than a slab of it
   // per grid element -- and worth not building a map for.
   if (taken.per_unit_terms.empty() && !displacement.varies()) {
     const int64_t id = declareDerived(taken, {}, displacement.common_offset,
-                                      word_size, symbols, definitions_at, loc);
+                                      elements_per_word, symbols,
+                                      definitions_at, loc);
     return createSymbolicStartAddress(builder, loc, id);
   }
 
@@ -642,7 +654,8 @@ mlir::FailureOr<mlir::Value> scheduler::emitSymbolicStartAddress(
   llvm::SmallVector<mlir::Value> values;
   for (const auto& [unit, terms] : per_unit_terms) {
     const int64_t id = declareDerived(taken, terms, displacement.at(unit),
-                                      word_size, symbols, definitions_at, loc);
+                                      elements_per_word, symbols,
+                                      definitions_at, loc);
     keys.push_back(unit);
     values.push_back(createSymbolicStartAddress(builder, loc, id));
   }

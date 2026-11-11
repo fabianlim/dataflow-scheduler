@@ -132,18 +132,19 @@ inline llvm::hash_code hash_value(const ExpressionStep& step) {
 
 /// What identifies a derived address: the input it is rooted at, the expression
 /// over it, the offset added to it, the constants its per-unit operands take,
-/// and the word size it is divided by. The word size is part of it because one
-/// tensor read through units that address in different word sizes is two
-/// different numbers.
+/// and the number of elements a word holds, which it is divided by. That number
+/// is part of it because one tensor read through units that address in
+/// different word sizes is two different numbers.
 struct DerivedKey {
   mlir::Value root;
   int64_t offset = 0;
   llvm::SmallVector<int64_t> terms;
-  int64_t word_size = 1;
+  int64_t elements_per_word = 1;
   /// The steps the address is built from the input by, outermost last. What
-  /// tells two addresses apart that agree in root, offset, terms and word size.
+  /// tells two addresses apart that agree in root, offset, terms and elements
+  /// per word.
   ///
-  /// `(1024 + (tile * 6 + row) * 4096) * 2`, for a row the run hands in taken
+  /// `1024 + (tile * 6 + row) * 4096`, for a row the run hands in taken
   /// to a grid element's slab of a tensor the compiler placed at 1024, is:
   ///
   /// ```
@@ -151,7 +152,6 @@ struct DerivedKey {
   ///   arith.addi  [_, _]      displaced by the row the run hands in
   ///   arith.muli  [_, 4096]   rows to elements
   ///   arith.addi  [1024, _]   the address the compiler picked
-  ///   arith.muli  [_, 2]      elements to bytes
   /// ```
   ///
   /// A second tensor read the same way differs in that 1024 and nothing else.
@@ -159,7 +159,8 @@ struct DerivedKey {
 
   bool operator==(const DerivedKey& other) const {
     return root == other.root && offset == other.offset &&
-           terms == other.terms && word_size == other.word_size &&
+           terms == other.terms &&
+           elements_per_word == other.elements_per_word &&
            expression == other.expression;
   }
 };
@@ -275,10 +276,6 @@ struct Displacement {
 
   /// The offset on \p unit.
   int64_t at(mlir::Value unit) const;
-
-  /// Multiplies by \p factor, covering both `common_offset` and `per_unit`, to
-  /// convert the unit the offsets are counted in.
-  void scaleBy(int64_t factor);
 };
 
 /// Evaluates \p offset -- the offset of the tile a program reads into the view
@@ -315,14 +312,19 @@ mlir::FailureOr<int64_t> declareScalarSymbol(mlir::Value value,
                                              SymbolAllocator& symbols);
 
 /// Emits the start address \p taken describes, displaced by \p displacement and
-/// divided by \p word_size, at \p builder's insertion point, and returns what
-/// the view should read.
+/// converted to words, at \p builder's insertion point, and returns what the
+/// view should read.
 ///
-/// \p word_size is the size in bytes of the word the unit reading the view
-/// addresses in. The run hands its input addresses over as byte addresses, so
-/// the symbol a program reads has to be the byte address divided by it -- the
-/// division goes into the symbol's definition, after everything else, because
-/// the operand the run writes over has to be the symbol alone.
+/// The address counts elements of \p element_size bytes, like the sizes and
+/// strides of the view it starts: the run hands its input addresses over as
+/// element addresses, and \p displacement, taken off a memref, counts elements
+/// too. \p word_size is the size in bytes of the word the unit reading the view
+/// addresses in, so the symbol a program reads is the address divided by the
+/// number of elements a word holds -- the division goes into the symbol's
+/// definition, after everything else, because the operand the run writes over
+/// has to be the symbol alone.
+///
+/// Fails if a word does not hold a whole number of elements.
 ///
 /// One `symbol.create_symbol` where every grid element agrees, or one per
 /// element gathered into a uniform map keyed on the unit -- which is what a
@@ -333,7 +335,7 @@ mlir::FailureOr<int64_t> declareScalarSymbol(mlir::Value value,
 /// element's program is read from.
 mlir::FailureOr<mlir::Value> emitSymbolicStartAddress(
     const SymbolicAddress& taken, const Displacement& displacement,
-    int64_t word_size, mlir::dataflow::ProgramUnitOp pu,
+    int64_t element_size, int64_t word_size, mlir::dataflow::ProgramUnitOp pu,
     SymbolAllocator& symbols, mlir::OpBuilder& builder,
     mlir::OpBuilder& definitions_at, mlir::Location loc);
 
@@ -358,7 +360,8 @@ struct DenseMapInfo<scheduler::DerivedKey> {
   static unsigned getHashValue(const scheduler::DerivedKey& key) {
     return static_cast<unsigned>(
         hash_combine(key.root, key.offset, hash_combine_range(key.terms),
-                     key.word_size, hash_combine_range(key.expression)));
+                     key.elements_per_word,
+                     hash_combine_range(key.expression)));
   }
   static bool isEqual(const scheduler::DerivedKey& lhs,
                       const scheduler::DerivedKey& rhs) {

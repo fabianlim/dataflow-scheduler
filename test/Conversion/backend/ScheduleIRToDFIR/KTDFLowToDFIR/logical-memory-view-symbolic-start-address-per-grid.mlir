@@ -9,8 +9,9 @@
 // arithmetic beside the program: nothing reads those values, they are there so
 // that whatever resolves the symbols can read what each one is. The core whose
 // slab starts at the tensor's own base adds nothing to the input, but the unit
-// addresses in words of 64 bytes and the run hands the address over in bytes, so
-// even that one is the input divided rather than the input itself.
+// addresses in words of 64 bytes, i.e. of 32 f16 elements, and the run hands the
+// address over in elements, so even that one is the input divided rather than the
+// input itself. The share counts elements too: six rows of 4096 is 24576.
 
 // CHECK-LABEL:   func.func @test(
 // CHECK-SAME:      %[[BASE:.*]]: index)
@@ -21,14 +22,16 @@
 // than to any one core.
 // CHECK-LABEL:   func.func private @sched_0(%{{.*}}: index) attributes {grid = [2]} {
 // CHECK:           %[[C24576:.*]] = arith.constant 24576 : index
+// CHECK:           %[[C32:.*]] = arith.constant 32 : index
 // CHECK:           %[[DDR:.*]] = dataflow.get_unit {name = "ddr", type = "ddr"}
 // CHECK:           symbol.create_id %arg0 {symbol_id = -1 : si64} : index
 // The first core's address in words, and the second core's: the input, plus that
-// core's share of the tensor where there is one, over the unit's word size.
-// CHECK-NEXT:      %[[WORDS_0:.*]] = arith.divsi %arg0, %[[C64:.*]] : index
+// core's share of the tensor where there is one, over the number of elements a
+// word holds.
+// CHECK-NEXT:      %[[WORDS_0:.*]] = arith.divsi %arg0, %[[C32]] : index
 // CHECK-NEXT:      symbol.create_id %[[WORDS_0]] {symbol_id = -2 : si64} : index
 // CHECK-NEXT:      %[[SHIFTED:.*]] = arith.addi %arg0, %[[C24576]] : index
-// CHECK-NEXT:      %[[WORDS_1:.*]] = arith.divsi %[[SHIFTED]], %[[C64]] : index
+// CHECK-NEXT:      %[[WORDS_1:.*]] = arith.divsi %[[SHIFTED]], %[[C32]] : index
 // CHECK-NEXT:      symbol.create_id %[[WORDS_1]] {symbol_id = -3 : si64} : index
 
 // And in the program, a symbol per core gathered into a map keyed on the unit:
