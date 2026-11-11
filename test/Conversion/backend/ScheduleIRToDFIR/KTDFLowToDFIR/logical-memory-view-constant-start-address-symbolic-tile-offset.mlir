@@ -7,56 +7,50 @@
 // view's own address is one the compiler picked.
 //
 // It is the same address either way, and it becomes a symbol the same way: the
-// whole sum, in bytes, one symbol per grid element. Both halves of the sum count
-// elements -- the base because the compiler counted it that way, the offset
-// because it came off a memref -- and a symbol's definition is divided by the
-// word size, which counts bytes, so the sum is scaled by the element size first.
+// whole sum, one symbol per grid element. Both halves of the sum count elements
+// -- the base because the compiler counted it that way, the offset because it
+// came off a memref -- and a symbol's definition is divided by the number of
+// elements a word holds: 64-byte words, 32 f16 each.
 
 // CHECK-LABEL:   func.func @test(
 // CHECK-SAME:      %[[ROW:.*]]: index)
 // CHECK-NEXT:      symbol.create_id %[[ROW]] {symbol_id = -1 : si64} : index
 
 // CHECK-LABEL:   func.func private @sched_0(%{{.*}}: index) attributes {grid = [2]} {
-// CHECK:           %[[C2:.*]] = arith.constant 2 : index
 // CHECK:           %[[C64000:.*]] = arith.constant 64000 : index
 // CHECK:           %[[C4096:.*]] = arith.constant 4096 : index
 // CHECK:           %[[C6:.*]] = arith.constant 6 : index
-// CHECK:           %[[C64:.*]] = arith.constant 64 : index
+// CHECK:           %[[C32:.*]] = arith.constant 32 : index
 // CHECK:           %[[DDR:.*]] = dataflow.get_unit {name = "ddr", type = "ddr"}
 // CHECK:           symbol.create_id %arg0 {symbol_id = -1 : si64} : index
 
 // The first grid element, whose slab starts at the tensor's own base: the row the
-// run hands in, times the rows it strides, plus the base, in bytes, over the word
-// size. A step another step reads is a symbol of its own, because a definition is
-// one operator over symbols and constants.
+// run hands in, times the rows it strides, plus the base, over the elements a
+// word holds. A step another step reads is a symbol of its own, because a
+// definition is one operator over symbols and constants; the last sum is not, as
+// `(x + y) / word` is one definition.
 // CHECK-NEXT:      %[[ROWS_0:.*]] = arith.muli %arg0, %[[C4096]] : index
 // CHECK-NEXT:      symbol.create_id %[[ROWS_0]] {symbol_id = -2 : si64} : index
 // CHECK-NEXT:      %[[ELEMS_0:.*]] = arith.addi %[[ROWS_0]], %[[C64000]] : index
-// CHECK-NEXT:      symbol.create_id %[[ELEMS_0]] {symbol_id = -3 : si64} : index
-// CHECK-NEXT:      %[[BYTES_0:.*]] = arith.muli %[[ELEMS_0]], %[[C2]] : index
-// CHECK-NEXT:      symbol.create_id %[[BYTES_0]] {symbol_id = -4 : si64} : index
-// CHECK-NEXT:      %[[WORDS_0:.*]] = arith.divsi %[[BYTES_0]], %[[C64]] : index
-// CHECK-NEXT:      symbol.create_id %[[WORDS_0]] {symbol_id = -5 : si64} : index
+// CHECK-NEXT:      %[[WORDS_0:.*]] = arith.divsi %[[ELEMS_0]], %[[C32]] : index
+// CHECK-NEXT:      symbol.create_id %[[WORDS_0]] {symbol_id = -3 : si64} : index
 
 // And the second, six rows further in. The six is the grid element's own and is a
 // constant here; the row is not, which is why the sum needs a symbol at all.
 // CHECK-NEXT:      %[[START_1:.*]] = arith.addi %arg0, %[[C6]] : index
-// CHECK-NEXT:      symbol.create_id %[[START_1]] {symbol_id = -6 : si64} : index
+// CHECK-NEXT:      symbol.create_id %[[START_1]] {symbol_id = -4 : si64} : index
 // CHECK-NEXT:      %[[ROWS_1:.*]] = arith.muli %[[START_1]], %[[C4096]] : index
-// CHECK-NEXT:      symbol.create_id %[[ROWS_1]] {symbol_id = -7 : si64} : index
+// CHECK-NEXT:      symbol.create_id %[[ROWS_1]] {symbol_id = -5 : si64} : index
 // CHECK-NEXT:      %[[ELEMS_1:.*]] = arith.addi %[[ROWS_1]], %[[C64000]] : index
-// CHECK-NEXT:      symbol.create_id %[[ELEMS_1]] {symbol_id = -8 : si64} : index
-// CHECK-NEXT:      %[[BYTES_1:.*]] = arith.muli %[[ELEMS_1]], %[[C2]] : index
-// CHECK-NEXT:      symbol.create_id %[[BYTES_1]] {symbol_id = -9 : si64} : index
-// CHECK-NEXT:      %[[WORDS_1:.*]] = arith.divsi %[[BYTES_1]], %[[C64]] : index
-// CHECK-NEXT:      symbol.create_id %[[WORDS_1]] {symbol_id = -10 : si64} : index
+// CHECK-NEXT:      %[[WORDS_1:.*]] = arith.divsi %[[ELEMS_1]], %[[C32]] : index
+// CHECK-NEXT:      symbol.create_id %[[WORDS_1]] {symbol_id = -6 : si64} : index
 
 // In the program, the symbol each grid element reads, chosen by a map keyed on the
 // unit. Neither the offset arithmetic nor the reinterpret_cast it fed survives:
 // the whole start address is the symbol, and arithmetic over the program's own
 // argument left in the body would stop the program being split into two levels.
-// CHECK:           %[[SYM_0:.*]] = symbol.create_symbol {SymbolId = -5 : i64} : index
-// CHECK-NEXT:      %[[SYM_1:.*]] = symbol.create_symbol {SymbolId = -10 : i64} : index
+// CHECK:           %[[SYM_0:.*]] = symbol.create_symbol {SymbolId = -3 : i64} : index
+// CHECK-NEXT:      %[[SYM_1:.*]] = symbol.create_symbol {SymbolId = -6 : i64} : index
 // CHECK-NEXT:      %[[MAP:.*]] = uniform.def_immutable_mapping({{\[}}%{{.*}} -> %[[SYM_0]]], {{\[}}%{{.*}} -> %[[SYM_1]]]):index
 // CHECK-NEXT:      %[[Q:.*]] = uniform.query_map(map:%[[MAP]], key:%{{.*}}) : index
 // CHECK-NEXT:      dataflow.get_logical_memory_view %[[DDR]], %[[Q]]

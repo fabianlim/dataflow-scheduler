@@ -3,29 +3,26 @@
 // Two tensors the compiler placed at addresses of its own, each displaced by the
 // same row the run hands in. What each grid element reads is a different address
 // in each tensor, so each needs a symbol of its own, and what tells them apart is
-// the expression: the input, the offset and the word size are the same for both.
+// the expression: the input, the offset and the elements per word are the same for both.
 //
 // One symbol for two addresses would have the run resolve one of them and the
 // other read whatever the first landed at.
 
 // CHECK-LABEL:   func.func private @sched_0(%{{.*}}: index) attributes {grid = [2]} {
-// CHECK:           %[[C2:.*]] = arith.constant 2 : index
 // CHECK:           %[[C128000:.*]] = arith.constant 128000 : index
 // CHECK:           %[[C64000:.*]] = arith.constant 64000 : index
 // CHECK:           %[[C4096:.*]] = arith.constant 4096 : index
-// CHECK:           %[[C64:.*]] = arith.constant 64 : index
+// CHECK:           %[[C32:.*]] = arith.constant 32 : index
 // CHECK:           symbol.create_id %arg0 {symbol_id = -1 : si64} : index
 
 // The first tensor: the row the run hands in times the rows it strides, plus the
-// base the compiler picked, in bytes, over the word size.
+// base the compiler picked, over the elements a word holds (64-byte words, 32
+// f16 each).
 // CHECK-NEXT:      %[[ROWS_A:.*]] = arith.muli %arg0, %[[C4096]] : index
 // CHECK-NEXT:      symbol.create_id %[[ROWS_A]] {symbol_id = -2 : si64} : index
 // CHECK-NEXT:      %[[ELEMS_A:.*]] = arith.addi %[[ROWS_A]], %[[C64000]] : index
-// CHECK-NEXT:      symbol.create_id %[[ELEMS_A]] {symbol_id = -3 : si64} : index
-// CHECK-NEXT:      %[[BYTES_A:.*]] = arith.muli %[[ELEMS_A]], %[[C2]] : index
-// CHECK-NEXT:      symbol.create_id %[[BYTES_A]] {symbol_id = -4 : si64} : index
-// CHECK-NEXT:      %[[WORDS_A:.*]] = arith.divsi %[[BYTES_A]], %[[C64]] : index
-// CHECK-NEXT:      symbol.create_id %[[WORDS_A]] {symbol_id = -5 : si64} : index
+// CHECK-NEXT:      %[[WORDS_A:.*]] = arith.divsi %[[ELEMS_A]], %[[C32]] : index
+// CHECK-NEXT:      symbol.create_id %[[WORDS_A]] {symbol_id = -3 : si64} : index
 
 // And the second. The displacement is the same one, so it is the same symbol --
 // -2 again -- said over this address's own rebuild of it, which is the value the
@@ -33,16 +30,13 @@
 // CHECK-NEXT:      %[[ROWS_B:.*]] = arith.muli %arg0, %[[C4096]] : index
 // CHECK-NEXT:      symbol.create_id %[[ROWS_B]] {symbol_id = -2 : si64} : index
 // CHECK-NEXT:      %[[ELEMS_B:.*]] = arith.addi %[[ROWS_B]], %[[C128000]] : index
-// CHECK-NEXT:      symbol.create_id %[[ELEMS_B]] {symbol_id = -6 : si64} : index
-// CHECK-NEXT:      %[[BYTES_B:.*]] = arith.muli %[[ELEMS_B]], %[[C2]] : index
-// CHECK-NEXT:      symbol.create_id %[[BYTES_B]] {symbol_id = -7 : si64} : index
-// CHECK-NEXT:      %[[WORDS_B:.*]] = arith.divsi %[[BYTES_B]], %[[C64]] : index
-// CHECK-NEXT:      symbol.create_id %[[WORDS_B]] {symbol_id = -8 : si64} : index
+// CHECK-NEXT:      %[[WORDS_B:.*]] = arith.divsi %[[ELEMS_B]], %[[C32]] : index
+// CHECK-NEXT:      symbol.create_id %[[WORDS_B]] {symbol_id = -4 : si64} : index
 
 // And the two views, each reading its own.
-// CHECK:           %[[SYM_A:.*]] = symbol.create_symbol {SymbolId = -5 : i64} : index
+// CHECK:           %[[SYM_A:.*]] = symbol.create_symbol {SymbolId = -3 : i64} : index
 // CHECK:           dataflow.get_logical_memory_view %{{.*}}, %[[SYM_A]]
-// CHECK:           %[[SYM_B:.*]] = symbol.create_symbol {SymbolId = -8 : i64} : index
+// CHECK:           %[[SYM_B:.*]] = symbol.create_symbol {SymbolId = -4 : i64} : index
 // CHECK:           dataflow.get_logical_memory_view %{{.*}}, %[[SYM_B]]
 
 #set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 11 >= 0, d1 >= 0, -d1 >= 0, d2 >= 0, -d2 + 63 >= 0, d3 >= 0, -d3 + 63 >= 0)>

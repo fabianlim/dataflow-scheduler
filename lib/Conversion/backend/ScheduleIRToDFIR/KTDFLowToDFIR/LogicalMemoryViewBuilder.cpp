@@ -366,17 +366,6 @@ mlir::LogicalResult replaceSourceAChains(
             takeDisplacementApart(reinterpret_offset, pu);
         if (mlir::failed(displacement)) return mlir::failure();
 
-        // The offset came off a memref, so it counts elements; the address it
-        // displaces is one of the run's inputs, which is a byte address (that
-        // is why emitSymbolicStartAddress divides by the word size at the end).
-        // Convert, or every grid element but the first reads at
-        // element_size-th of the distance it should.
-        //
-        // Only on this path: the constant-address path below adds the same
-        // offset to an address the compiler picked, which is itself in
-        // elements, so the two agree there and must not be converted.
-        displacement->scaleBy(*tryGetSizeInBytes(src_type.getElementType()));
-
         auto memory_space = getMemorySpaceAttr(cursor.getType());
         if (!memory_space)
           return cmv.emitError(
@@ -385,9 +374,12 @@ mlir::LogicalResult replaceSourceAChains(
             pu, llvm::cast<ResourceType>(*memory_space), resource_kinds);
         if (mlir::failed(word_size)) return mlir::failure();
 
+        // The start and the offset off the memref both count elements, and
+        // emitSymbolicStartAddress takes them that way.
         mlir::FailureOr<mlir::Value> symbolic = emitSymbolicStartAddress(
-            **taken, *displacement, *word_size, pu, symbols, builder,
-            definitions, cmv.getLoc());
+            **taken, *displacement,
+            *tryGetSizeInBytes(src_type.getElementType()), *word_size, pu,
+            symbols, builder, definitions, cmv.getLoc());
         if (mlir::failed(symbolic)) return mlir::failure();
 
         return emitView(*symbolic);
@@ -421,18 +413,13 @@ mlir::LogicalResult replaceSourceAChains(
 
         // The offset can reach a run input, though, and then the sum is no more
         // a number than an address taken from an input is. It becomes a symbol
-        // the same way, over the sum in bytes: base and offset both count
-        // elements, while a symbol's definition is divided by the word size.
-        mlir::Value element_size = mlir::arith::ConstantIndexOp::create(
-            builder, cmv.getLoc(),
-            *tryGetSizeInBytes(src_type.getElementType()));
-        mlir::Value in_bytes = mlir::arith::MulIOp::create(
-            builder, cmv.getLoc(), start_address, element_size);
-
+        // the same way, over the sum: base and offset both count elements, as
+        // emitSymbolicStartAddress takes them.
+        //
         // Over the whole address, not the offset alone: what the symbol stands
         // for is where the tile starts, and the base is part of that.
         mlir::FailureOr<std::optional<SymbolicAddress>> displaced =
-            takeSymbolicAddressApart(in_bytes, pu, symbols);
+            takeSymbolicAddressApart(start_address, pu, symbols);
         if (mlir::failed(displaced)) return mlir::failure();
 
         if (displaced->has_value()) {
@@ -448,23 +435,17 @@ mlir::LogicalResult replaceSourceAChains(
           // element's share of it is a per-grid term there, so the symbols
           // still come out one per element.
           mlir::FailureOr<mlir::Value> symbolic = emitSymbolicStartAddress(
-              **displaced, Displacement(), *word_size, pu, symbols, builder,
-              definitions, cmv.getLoc());
+              **displaced, Displacement(),
+              *tryGetSizeInBytes(src_type.getElementType()), *word_size, pu,
+              symbols, builder, definitions, cmv.getLoc());
           if (mlir::failed(symbolic)) return mlir::failure();
           if (mlir::failed(emitView(*symbolic))) return mlir::failure();
 
           // After the view, which erases the chain holding the last use of the
           // arithmetic the address was read out of.
-          eraseDeadAncestorOps({in_bytes.getDefiningOp()});
+          eraseDeadAncestorOps({start_address.getDefiningOp()});
           return mlir::success();
         }
-
-        // No run input in it, so the sum stands as the address and the
-        // conversion to bytes is undone. Erased here rather than through
-        // eraseDeadAncestorOps, which would take the sum with it: the view
-        // below is still to read it, so with in_bytes gone it would look dead.
-        in_bytes.getDefiningOp()->erase();
-        element_size.getDefiningOp()->erase();
       }
 
       return emitView(start_address);
