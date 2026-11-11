@@ -89,6 +89,12 @@ class MemoryTrackerAnalysis {
     tracker_.reset(memory_resources);
   }
 
+  /// Keeps addresses below \p address of \p memory_resource out of allocate's
+  /// reach, now and after every reset
+  llvm::Error reserveBelow(ResourceType memory_resource, size_t address) {
+    return tracker_.reserveBelow(memory_resource, address);
+  }
+
   /// Get the underlying MemoryTracker (for advanced use cases)
   MemoryTracker& getTracker() { return tracker_; }
   const MemoryTracker& getTracker() const { return tracker_; }
